@@ -1,0 +1,61 @@
+name: "Ariav_io"
+base_url: https://airav.io/cn
+
+settings:
+
+search:
+  url: "/search_result?kw={number}"
+  detail_xpath: //div[@class="col oneVideo"]//div[@class="oneVideo-body"]/h5[(starts-with(text(), "{number}") or contains(text(), "_{number}")) and not(contains(text(), "克破"))]/../../div[@class="oneVideo-top"]/a/@href
+
+detail:
+  rules:
+    - field: Number
+      xpath: //div[@class="video-info"]//ul[@class="list-group"]/li[contains(text(), "番號：") or contains(text(), "番号：")]/span/text()
+    - field: Title
+      xpath: //div[@class="video-title my-3"]/h1/text()
+      processes:
+        - type: string
+          replace:
+            from:
+              [
+                "第一集",
+                "第二集",
+                " - 上",
+                " - 下",
+                " 上集",
+                " 下集",
+                " -上",
+                " -下",
+                "{number}",
+              ]
+            to: ""
+    - field: Outline
+      xpath: //div[@class="video-info"]/p/text()
+    - field: Actors
+      xpath: //div[@class="video-info"]//ul[@class="list-group"]/li[contains(text(), "女優：") or contains(text(), "女优：")]/a/text()
+      is_array: true
+      processes:
+        - type: string
+          replace:
+            from: "多人"
+            to: ""
+    - field: Tags
+      xpath: //div[@class="video-info"]//ul[@class="list-group"]/li[contains(text(), "標籤：") or contains(text(), "标籤：")]/a/text()
+      is_array: true
+    - field: Studio
+      xpath: //div[@class="video-info"]//ul[@class="list-group"]/li[contains(text(), "廠商：") or contains(text(), "厂商：")]/a/text()
+    - field: Series
+      xpath: //div[@class="video-info"]//ul[@class="list-group"]/li[contains(text(), "系列：")]/a/text()
+    - field: Cover
+      xpath: //meta[@property="og:image"]/@content
+      is_url: true
+      processes:
+        - type: string
+          replace:
+            from: "https://iiooxx.rocks"
+            to: "{base_url}"
+    - field: Release
+      xpath: //div[@class="video-item"]/div[@class="me-4"]/text()
+      processes:
+        - type: date
+          format: "%Y-%m-%d %H:%M:%S"

@@ -1,0 +1,136 @@
+name: Jav321
+base_url: https://www.jav321.com
+
+search:
+  url: /search
+  body: sn={number}
+  detail_xpath: //div[@class="thumbnail"]/a[contains(@href, "video")]/@href
+
+detail:
+  url_match: "/video/"
+  rules:
+    - field: Number
+      xpath: //b[text()="品番"]/following-sibling::text()
+      processes:
+        - type: string
+          replace:
+            from: ": "
+            to: ""
+        - type: string
+          case: upper
+        - type: regex
+          replace:
+            pattern: ^N(\d+)$
+            to: n${1}
+
+    - field: Title
+      xpath: //div[@class="panel-heading"]/h3/text()
+
+    - field: OriginalTitle
+      xpath: //div[@class="panel-heading"]/h3/text()
+
+    - field: Outline
+      xpath: //div[@class="panel-body"]/div[@class="row"][3]/div[@class="col-md-12"]/text()
+
+    - field: Actors
+      xpath: //b[text()="出演者"]/following-sibling::a[contains(@href, "star/")]/text()
+      is_array: true
+      processes:
+        - type: regex
+          extract:
+            pattern: (.*)（.*）
+            group: 1
+
+    - field: Tags
+      xpath: //b[text()="ジャンル"]/following-sibling::a/text()
+      is_array: true
+
+    - field: Series
+      xpath: //div[@class="col-md-9"]/a[contains(@href,"/series/")]/text()
+
+    - field: Studio
+      xpath: //b[text()="メーカー"]/following-sibling::a/text()
+
+    # 从 studio 判断
+    - field: Uncensored
+      xpath: //b[text()="メーカー"]/following-sibling::a/text()
+      processes:
+        - type: string
+          replace:
+            from:
+              [
+                "一本道",
+                "HEYZO",
+                "サムライポルノ",
+                "キャットウォーク",
+                "サイクロン",
+                "ルチャリブレ",
+                "スーパーモデルメディア",
+                "スタジオテリヤキ",
+                "レッドホットコレクション",
+                "スカイハイエンターテインメント",
+                "小天狗",
+                "オリエンタルドリーム",
+                "Climax Zipang",
+                "CATCHEYE",
+                "ファイブスター",
+                "アジアンアイズ",
+                "ゴリラ",
+                "ラフォーレ ガール",
+                "MIKADO",
+                "ムゲンエンターテインメント",
+                "ツバキハウス",
+                "ザーメン二郎",
+                "トラトラトラ",
+                "メルシーボークー",
+                "神風",
+                "Queen 8",
+                "SASUKE",
+                "ファンタドリーム",
+                "マツエンターテインメント",
+                "ピンクパンチャー",
+                "ワンピース",
+                "ゴールデンドラゴン",
+                "Tokyo Hot",
+                "Caribbean",
+              ]
+            to: "无码"
+        - type: regex
+          replace:
+            pattern: "^[^无码]+$"
+            to: ""
+
+    - field: Cover
+      xpath:
+        - //video[@id="vjs_sample_player"]/@poster
+        - //html/body/div[2]/div[2]/div[1]//img/@src
+      is_url: true
+
+    - field: ExtraFanart
+      xpath: /html/body/div[@class='row'][2]/div[@class='col-md-3']/div[@class='col-xs-12 col-md-12']/p/a/img[@class='img-responsive']/@src
+      is_array: true
+      is_url: true
+
+    - field: Release
+      xpath: //b[text()="配信開始日"]/following-sibling::text()
+      processes:
+        - type: date
+          format: "%Y-%m-%d"
+
+    - field: Runtime
+      xpath: //b[text()="収録時間"]/following-sibling::text()
+      processes:
+        - type: string
+          replace:
+            from: [": ", " minutes"]
+            to: ""
+
+    - field: UserRating
+      xpath: //b[text()="平均評価"]/following-sibling::img/@data-original
+      processes:
+        - type: regex
+          extract:
+            pattern: /img/(\d+)\.gif
+            group: 1
+        - type: number
+          divide: 10

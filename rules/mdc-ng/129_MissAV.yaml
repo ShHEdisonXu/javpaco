@@ -1,0 +1,52 @@
+name: "MissAV"
+base_url: https://missav123.com
+
+settings:
+  jav_number_format:
+    fc2_with_ppv: true
+
+search:
+  url: "/ja/{number}"
+
+detail:
+  url_match: "/ja/"
+  rules:
+    - field: Cover
+      xpath: //meta[@property="og:image"]/@content
+    - field: Title
+      xpath: //meta[@property="og:title"]/@content
+      processes:
+        - type: string
+          replace:
+            from: "{number}"
+            to: ""
+    - field: Actors
+      xpath: //meta[@property="og:video:actor"]/@content
+      is_array: true
+    - field: Director
+      xpath: //meta[@property="og:video:director"]/@content
+    - field: Release
+      xpath: //meta[@property="og:video:release_date"]/@content
+    - field: Runtime
+      xpath: //meta[@property="og:video:duration"]/@content
+      processes:
+        - type: number
+          divide: 60
+        - type: regex
+          replace:
+            pattern: \.\d+
+            to: ""
+    - field: Tags
+      xpath: //div[@class="sm:mx-0 mb-8 rounded-0 sm:rounded-lg"]//div[@class="text-secondary"]/span[text()="ジャンル:"]/../a/text() | //div[@class="sm:mx-0 mb-8 rounded-0 sm:rounded-lg"]//div[@class="text-secondary"]/span[text()="タグ:"]/../a/text()
+      is_array: true
+    - field: Publisher
+      xpath: //div[@class="sm:mx-0 mb-8 rounded-0 sm:rounded-lg"]//div[@class="text-secondary"]/span[text()="レーベル:"]/../a/text()
+      processes:
+        - type: string
+          replace:
+            from: "----"
+            to: ""
+    - field: Studio
+      xpath: //div[@class="sm:mx-0 mb-8 rounded-0 sm:rounded-lg"]//div[@class="text-secondary"]/span[text()="メーカー:"]/../a/text()
+    - field: Series
+      xpath: //div[@class="sm:mx-0 mb-8 rounded-0 sm:rounded-lg"]//div[@class="text-secondary"]/span[text()="シリーズ:"]/../a/text()

@@ -1,0 +1,46 @@
+name: "FC2Hub"
+base_url: https://javten.com
+
+# 支持 FC2-PPV, FC2 两种格式
+search:
+  url: "/search?kw={number}"
+  detail_xpath:
+    - //link[@hreflang="ja"]/@href
+    - //link[contains(@href, "id{serial_number}") and not(contains(@href, "/tw/")) and not(contains(@href, "/ko/")) and not(contains(@href, "/en/"))]/@href
+
+detail:
+  url_match: "javten.com/video/"
+  rules:
+    - field: Title
+      xpath: //h1[@class="card-text fc2-title"]/text()
+
+    - field: OriginalTitle
+      xpath: //h1[@class="card-text fc2-title"]/text()
+
+    - field: Cover
+      xpath: //a[@data-fancybox="gallery"]/@href
+      is_url: true
+    - field: Outline
+      xpath: //div[@class="col des"]//text()
+      processes:
+        - type: string
+          replace:
+            from: ["\\n", "'", "・"]
+            to: ""
+    - field: Tags
+      xpath: //p[@class="card-text"]/a[contains(@href, "/tag/")]/text()
+      processes:
+        - type: string
+          replace:
+            from: ", "
+            to: ","
+        - type: string
+          replace:
+            from: "'"
+            to: ""
+    - field: Studio
+      xpath: //div[@class="col-8"]/text()
+
+    - field: ExtraFanart
+      xpath: '//div[@style="padding: 0"]/a/@href'
+      is_array: true

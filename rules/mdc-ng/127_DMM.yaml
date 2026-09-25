@@ -1,0 +1,157 @@
+name: "DMM"
+base_url: https://www.dmm.co.jp
+
+settings:
+  cookies: "uid=abcd786561031111; age_check_done=1;"
+  errors:
+    - pattern: "foreignError"
+      message: "地域限制, 请使用日本节点访问！"
+  jav_number_format:
+    with_dash: false
+    case: lower
+
+search:
+  url:
+    - "/search/=/searchstr={dmm_cid}/sort=ranking/"
+    - "/search/=/searchstr={number_00}/sort=ranking/"
+    - "/search/=/searchstr={number}/sort=ranking/"
+  detail_xpath:
+    - //div[@class='flex-1']//div[contains(@class, 'grid')]//div[contains(@class, 'border-dotted')]/a[contains(@href, "cid={dmm_cid}/") and not(contains(@href, "/monthly/"))]/@href
+    - //div[@class='flex-1']//div[contains(@class, 'grid')]//div[contains(@class, 'border-dotted')]/a[contains(@href, "cid={dmm_cid}") and not(contains(@href, "/monthly/"))]/@href
+    - //div[@class='flex-1']//div[contains(@class, 'grid')]//div[contains(@class, 'border-dotted')]/a[contains(@href, "{number_00}") and not(contains(@href, "/monthly/"))]/@href
+    - //div[@class='flex-1']//div[contains(@class, 'grid')]//div[contains(@class, 'border-dotted')]/a[contains(@href, "{number}") and not(contains(@href, "/monthly/"))]/@href
+  matcher: '^https://(www|video)\.dmm\.co\.jp.*[^a-zA-Z](?:{number}|{number_00})\D'
+
+detail:
+  rules:
+    - field: PublishNumber
+      xpath:
+        - //div[@id="mu"]//table[@class="mg-b20"]/tbody/tr[th/text()="品番："]/td/text()
+        - //td[contains(text(),'品番')]/following-sibling::td/text()
+      add_to_context: true
+
+    - field: Title
+      xpath: //h1[@id="title"]/text()
+
+    - field: OriginalTitle
+      xpath: //h1[@id="title"]/text()
+
+    - field: Outline
+      xpath:
+        - string(//div[@class="mg-b20 lh4"]/p[@class="mg-b20"])
+        - string(//div[@class="mg-b20 lh4"])
+        # - //div[@class="mg-b20 lh4"]/p/text()
+      processes:
+        - type: string
+          replace:
+            from: "「コンビニ受取」対象商品です。詳しくはこちらをご覧ください。"
+            to: ""
+    - field: Actors
+      xpath:
+        - //span[@id='performer']/a/text()
+        - //td[@id='fn-visibleActor']/div/a/text()
+        - //td[contains(text(),'出演者')]/following-sibling::td/a/text()
+      is_array: true
+      processes:
+        - type: string
+          replace:
+            from: "----"
+            to: ""
+
+    - field: OriginalActors
+      xpath:
+        - //span[@id='performer']/a/text()
+        - //td[@id='fn-visibleActor']/div/a/text()
+        - //td[contains(text(),'出演者')]/following-sibling::td/a/text()
+      is_array: true
+
+    - field: Tags
+      xpath:
+        - //td[contains(text(),'ジャンル')]/following-sibling::td/a/text()
+        - //div[@class='info__item']/table/tbody/tr/th[contains(text(),'ジャンル')]/following-sibling::td/a/text()
+      is_array: true
+
+    - field: Studio
+      xpath: //div[@id="mu"]//table[@class="mg-b20"]/tbody/tr[th/text()="メーカー："]/td/span/a/text()
+    - field: Series
+      xpath:
+        - //td[contains(text(),'シリーズ')]/following-sibling::td/a/text()
+        - //th[contains(text(),'シリーズ')]/following-sibling::td/a/text()
+    - field: Director
+      xpath:
+        - //td[contains(text(),'監督')]/following-sibling::td/a/text()
+        - //th[contains(text(),'監督')]/following-sibling::td/a/text()
+    - field: Publisher
+      xpath: //td/a[contains(@href, 'article=label')]/text()
+
+    - field: Cover
+      value:
+        - https://awsimgsrc.dmm.com/dig/mono/movie/{dmm_cid}/{dmm_cid}pl.jpg
+        - https://awsimgsrc.dmm.com/dig/mono/movie/{PublishNumber}/{PublishNumber}pl.jpg
+        - https://awsimgsrc.dmm.com/dig/mono/movie/{number_00}/{number_00}pl.jpg
+        - https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{dmm_cid}/{dmm_cid}pl.jpg
+        - https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{PublishNumber}/{PublishNumber}pl.jpg
+        - https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{number_00}/{number_00}pl.jpg
+      min_size: 30000
+      is_url: true
+      xpath:
+        - //meta[@property="og:image"]/@content
+        - //div[@id="sample-video"]/img/@src
+        - //div[@class="inner-productInfo-column"]/a[@name="package-image"]/@href
+
+    - field: Poster
+      value:
+        - https://awsimgsrc.dmm.com/dig/mono/movie/{dmm_cid}/{dmm_cid}ps.jpg
+        - https://awsimgsrc.dmm.com/dig/mono/movie/{PublishNumber}/{PublishNumber}ps.jpg
+        - https://awsimgsrc.dmm.com/dig/mono/movie/{number_00}/{number_00}ps.jpg
+        - https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{dmm_cid}/{dmm_cid}ps.jpg
+        - https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{PublishNumber}/{PublishNumber}ps.jpg
+        - https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{number_00}/{number_00}ps.jpg
+      min_size: 30000
+      is_url: true
+
+    - field: ExtraFanart
+      xpath:
+        - //a[contains(@id, "sample-image")]/img/@data-lazy
+        - //div[@id='sample-image-block']/a/img/@src
+        - //a[@name='sample-image']/img/@src
+      is_url: true
+      is_array: true
+      processes:
+        - type: regex
+          replace:
+            pattern: ^(.*)-(\d+)\.jpg$
+            to: ${1}jp-${2}.jpg
+    - field: Release
+      xpath:
+        - //td[contains(text(),'発売日')]/following-sibling::td/text()
+        - //th[contains(text(),'発売日')]/following-sibling::td/text()
+        - //td[contains(text(),'配信開始日')]/following-sibling::td/text()
+        - //th[contains(text(),'配信開始日')]/following-sibling::td/text()
+      processes:
+        - type: date
+          format: "%Y/%m/%d"
+    - field: Runtime
+      xpath: //td[contains(text(),'収録時間')]/following-sibling::td/text()
+      processes:
+        - type: regex
+          extract:
+            pattern: \d+
+    - field: UserRating
+      xpath: //p[contains(@class,'d-review__average')]/strong/text()
+      processes:
+        - type: string
+          replace:
+            from: ["\n", "\\n", "点"]
+            to: ""
+    - field: Uncensored
+      xpath: //li[@class="on"]/a/text()
+      processes:
+        - type: string
+          replace:
+            from: アニメ
+            to: "里番"
+        - type: regex
+          replace:
+            pattern: "[^(里番)]+"
+            to: ""

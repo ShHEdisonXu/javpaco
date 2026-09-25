@@ -1,0 +1,65 @@
+name: "FC2PPVDB"
+base_url: https://fc2ppvdb.com
+
+settings:
+  jav_number_format:
+    only_number: true
+
+search:
+  url: "/articles/{number}"
+
+detail:
+  url_match: "/articles/"
+  rules:
+    - field: Number
+      xpath: //div[contains(@class, "container")]//div[text()="ID："]/span/text()
+      processes:
+        - type: regex
+          replace:
+            pattern: ^(.*)$
+            to: FC2-${1}
+
+    - field: Title
+      xpath: //div[contains(@class, "container")]//h2/a/text()
+
+    - field: OriginalTitle
+      xpath: //div[contains(@class, "container")]//h2/a/text()
+
+    - field: Cover
+      xpath: //div[contains(@class, "container")]//a/img/@src
+      is_url: true
+
+    - field: Publisher
+      xpath: //div[contains(@class, "container")]//div[text()="販売者："]/span/a/text()
+    - field: Studio
+      xpath: //div[contains(@class, "container")]//div[text()="販売者："]/span/a/text()
+    - field: Director
+      xpath: //div[contains(@class, "container")]//div[text()="販売者："]/span/a/text()
+
+    - field: Actors
+      xpath: //div[contains(@class, "container")]//div[text()="女優："]/span/a/text()
+      is_array: true
+
+    - field: Uncensored
+      xpath: //div[contains(@class, "container")]//div[text()="モザイク："]/span/text()
+      processes:
+        - type: regex
+          replace:
+            pattern: "[^(無)]+"
+            to: "有码"
+        - type: string
+          replace:
+            from: 無
+            to: "true"
+
+    - field: Release
+      xpath: //div[contains(@class, "container")]//div[text()="販売日："]/span/text()
+
+    - field: Runtime
+      xpath: //div[contains(@class, "container")]//div[text()="収録時間："]/span/text()
+      processes:
+        - type: duration_to_minutes
+
+    - field: Tags
+      xpath: //div[contains(@class, "container")]//div[text()="タグ："]/span/a/text()
+      is_array: true

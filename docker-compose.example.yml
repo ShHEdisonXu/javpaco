@@ -1,0 +1,43 @@
+# JAVPACO 迷你媒体服务 —— 发布模板
+# 用法：改好影片文件夹路径后  docker compose up -d
+services:
+  javpaco:
+    # 官方镜像（已内置影片示例数据 + 女优资料库）。
+    # 想本地自己构建：注释掉 image 行，取消注释 build: .
+    image: edisonxu123/javpaco:latest
+    # build: .
+    container_name: javpaco
+    ports:
+      - "8090:8090"
+    environment:
+      # 可选：访问口令。设置后打开页面需先输口令（本机 localhost 免验证）。
+      # - ACCESS_CODE=换一个你自己的口令
+      # 可选：刮削需要代理时的初始种子值（之后可在 设置 → 网络 里可视化修改）
+      # - HTTP_PROXY=http://192.168.x.x:1082
+      # - HTTPS_PROXY=http://192.168.x.x:1082
+      # - NO_PROXY=localhost,127.0.0.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      # ↓ 影片文件夹路径（改成自己的）。rw 读写：「导入视频整理」需要原地改名/建文件夹。
+      #   挂父目录：/media 下的子文件夹都可以在设置里添加为媒体库。
+      - "/你的影片文件夹:/media"
+      # 应急备份：云盘/移动盘断开时，把这行换成  - "./media-empty:/media:ro"
+      # ↓ 整个项目目录挂进 /app（UI/数据/头像全部热更新）。
+      #   注意：不要单文件挂载（tmp+rename 原子替换后单文件挂载会指向旧 inode）；
+      #   必须读写挂载：详情页「刮削」要写 actresses.json 和 actresses/ 头像。
+      # ↓ 用官方镜像（image: ...）运行时强烈建议加数据持久化：离线数据（刮削成果：meta.json、
+      #   封面、剧照、头像）挂到宿主机文件夹「离线数据」，升级镜像 / 重建容器 / 换机器都不丢；
+      #   任何一台新装的机器把这个「离线数据」文件夹挂到 /app/cache 即可直接读取全部成果
+      #   （也可在「添加影片 → 加载离线数据」里从任意目录导回）。
+      # - "./离线数据:/app/cache"
+      # - "./离线数据/covers:/app/covers"
+      # - "./离线数据/actresses:/app/actresses"
+      #   其余小文件（server-config.json 设置、watch.json 观看记录等）随容器重建会重置，
+      #   升级镜像前可用 设置 → 备份 导出 JSON，装好后导入恢复。
+      #   用官方镜像运行时删掉下面这行 —— 镜像内已自带全部程序文件。
+      # - ".:/app"
+    restart: unless-stopped
