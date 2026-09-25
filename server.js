@@ -5814,10 +5814,11 @@ async function rankUpdateAsync() {
     }
     if (fresh.length) { try { writeExtraRoster(extra.concat(fresh)); RANKUP.added = fresh.length } catch (_) {} }
     const tmp = RANK_FILE + '.tmp'
-    fs.writeFileSync(tmp, JSON.stringify({ updatedAt: Date.now(), day: out.day, week: out.week, month: out.month }))
+    // 走中转时 updatedAt 记中转数据的时间：数据新鲜（当天）就不再重试，过期了每小时自动重试
+    fs.writeFileSync(tmp, JSON.stringify({ updatedAt: viaRelay && relayAt ? relayAt : Date.now(), via: viaRelay ? 'relay' : 'direct', day: out.day, week: out.week, month: out.month }))
     fs.renameSync(tmp, RANK_FILE)   // /rankings.json 是静态直出，替换文件即生效，无需清缓存
     RANKUP.phase = '完成'
-    console.log('[rank] 每日榜单已更新：' + RANKUP.count + ' 条，新增女优 ' + RANKUP.added + ' 人')
+    console.log('[rank] 每日榜单已更新（' + (viaRelay ? '云端中转' : '直连') + '）：' + RANKUP.count + ' 条，新增女优 ' + RANKUP.added + ' 人')
     return { ok: true, count: RANKUP.count, added: RANKUP.added }
   } catch (e) {
     RANKUP.error = e.message; RANKUP.phase = '失败'
