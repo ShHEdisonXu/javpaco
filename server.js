@@ -1265,15 +1265,39 @@ function streamWith(res, rs) {
 const ROSTER = path.join(UI_ROOT, 'actresses.json')
 const AVA_DIR = path.join(UI_ROOT, 'actresses')
 const MN_BASE = 'https://www.minnano-av.com/'
-/* minnano 云端中转：家里宽带对该站是 SNI 阻断（TCP 即 RST），但 raw.githubusercontent.com
- * 直连可达。GitHub Actions 每日抓榜单+头像提交到仓库 relay/ 目录，这里兜底读取。 */
+/* minnano 云端中转：家里宽带对该站是 SNI 阻断（TCP 即 RST），但 api.github.com 直连可达。
+ * GitHub Actions 每日抓榜单+头像提交到仓库 relay/ 目录，这里经 Contents API 兜底读取。
+ * 私有仓库需在 设置→网络 配 githubToken（PAT）；未配 token 时仅公共仓库可用（退回 raw）。 */
+const RELAY_API = 'https://api.github.com/repos/ShHEdisonXu/javpaco/contents/relay/'
 const RELAY_BASE = 'https://raw.githubusercontent.com/ShHEdisonXu/javpaco/main/relay/'
-async function relayJson(p, ms) {
+const relayCache = new Map()   // p → {ts, buf|null}（10 分钟，避开 GitHub API 限频）
+async function relayBuf(p, ms) {
+  const c = relayCache.get(p)
+  if (c && Date.now() - c.ts < 10 * 60 * 1000) return c.buf
+  const b = await relayBufFetch(p, ms)
+  relayCache.set(p, { ts: Date.now(), buf: b })
+  return b
+}
+async function relayBufFetch(p, ms) {
+  const hd = { accept: 'application/vnd.github.raw' }
+  const tk = String(CFG.githubToken || '').trim()
+  if (tk) hd.authorization = 'Bearer ' + tk
   try {
-    const r = await fetch(RELAY_BASE + p, { signal: AbortSignal.timeout(ms || 15000) })
-    if (!r.ok) return null
-    return await r.json()
-  } catch (_) { return null }
+    const r = await fetch(RELAY_API + p, { headers: hd, signal: AbortSignal.timeout(ms || 15000) })
+    if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (b.length > 2) return b }
+  } catch (_) {}
+  if (!tk) {   // 没配 token：退回 raw（仅公共仓库有效）
+    try {
+      const r = await fetch(RELAY_BASE + p, { signal: AbortSignal.timeout(ms || 15000) })
+      if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (b.length > 2) return b }
+    } catch (_) {}
+  }
+  return null
+}
+async function relayJson(p, ms) {
+  const b = await relayBuf(p, ms)
+  if (!b) return null
+  try { return JSON.parse(b.toString('utf8')) } catch (_) { return null }
 }
 const MN_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const dropEmpty = (k, v) => (v === '' || v === null || (Array.isArray(v) && v.length === 0) ? undefined : v)
@@ -1454,14 +1478,19 @@ const isImgBuf = b => !!(b && b.length > 2048 && ((b[0] === 0xFF && b[1] === 0xD
 async function avatarOnline(key) {
   const a = avaOnlineIndex().get(key)
   const urls = []
-  // ① 云端中转（Actions 每日抓的榜上女优头像，raw.githubusercontent 国内直连可达）
-  if (a && a.mnid) urls.push(RELAY_BASE + 'avatars/' + a.mnid + '.jpg')
   if (a && a.mimg) urls.push(String(a.mimg))
   if (a && a.iconRemote) urls.push(String(a.iconRemote))
   if (!urls.length) return null
   if (AVA_ONLINE_FAIL.get(key) > Date.now() - 10 * 60 * 1000) return null
   if (AVA_ONLINE_JOB.has(key)) return AVA_ONLINE_JOB.get(key)
   const job = (async () => {
+    if (a && a.mnid) {   // ① GitHub 云端中转（Actions 每日抓的榜上女优头像，api.github.com 国内直连可达）
+      const rb = await relayBuf('avatars/' + a.mnid + '.jpg')
+      if (isImgBuf(rb)) {
+        try { fs.mkdirSync(path.join(cacheDir(), 'actors'), { recursive: true }); fs.writeFileSync(path.join(cacheDir(), 'actors', key + '.jpg'), rb) } catch (_) {}
+        return rb
+      }
+    }
     for (const u of urls) {
       try {
         // Referer 跟着图源域名走（javbus 校验自家 Referer；minnano 用默认 MN_BASE）
@@ -3736,6 +3765,10 @@ async function handleActorApi(req, res, p) {
     if ('proxyEnabled' in body) {
       CFG.proxyEnabled = !!body.proxyEnabled
       proxyAgents.clear()
+    }
+    if ('githubToken' in body) {   // GitHub PAT：私有仓库的 relay/ 中转数据经 Contents API 读取
+      CFG.githubToken = String(body.githubToken || '').trim()
+      relayCache.clear()
     }
     if ('cacheDir' in body) {
       const cd = String(body.cacheDir || '').trim()
