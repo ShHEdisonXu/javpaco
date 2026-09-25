@@ -1341,6 +1341,25 @@ function proxyUrl() {
 
 /* http CONNECT 隧道 agent：让 https 请求走 http 代理（零依赖，替代 fetch+env 方案，改代理无需重启） */
 const proxyAgents = new Map()
+/* 国内直连白名单：这些源实测无墙（订阅国内线路 / MissAV 镜像 / GitHub 中转 / 115 / 必应）。
+ * 分情况走代理——即使用户配了代理，这些源也坚决直连（代理不稳定时它们照常工作）。 */
+const DIRECT_HOSTS = [
+  'apidd.spthgb.com', 'apidd.czssdgz.com', 'jdforrepam.com', 'tp.spfcas.com',          // 订阅（JavDB 国内线路+图床）
+  'x99dh.cc', 'x99dh.vip', 'x99dh.my', 'x99dh.pro',                                    // MissAV 线路发现
+  'missav.ws', 'missav123.com', 'njavtv.my', 'thisav.my', 'missav888.cc', 'njav01.net', 'missav.watch',
+  'raw.githubusercontent.com', 'api.github.com', 'github.com', 'codeload.github.com',  // 云端中转
+  'cn.bing.com', 'www.bing.com',                                                       // 图片兜底
+  '115.com', 'webapi.115.com', 'clouddownload.115.com'                                 // 115 网盘
+]
+function isDirectHost(hostname) {
+  const h = String(hostname || '').toLowerCase()
+  return DIRECT_HOSTS.some(d => h === d || h.endsWith('.' + d))
+}
+function agentMaybe(u, pUrl) {
+  if (!pUrl) return null
+  try { if (isDirectHost(u.hostname)) return null } catch (_) {}
+  try { return tunnelAgent(pUrl) } catch (_) { return null }
+}
 function tunnelAgent(pUrl) {
   if (proxyAgents.has(pUrl)) return proxyAgents.get(pUrl)
   const u = new URL(pUrl)
@@ -1372,7 +1391,7 @@ async function mnFetch(url, bin, pOverride, referer) {
       host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: 'GET',
       headers: { 'user-agent': MN_UA, referer: referer || MN_BASE, accept: bin ? 'image/jpeg,*/*' : 'text/html,application/xhtml+xml' }
     }
-    if (pUrl) opts.agent = tunnelAgent(pUrl)
+    if (pUrl) { const ag = agentMaybe(u, pUrl); if (ag) opts.agent = ag }
     const rq = https.request(opts, rs => {
       const chunks = []
       rs.on('data', c => chunks.push(c))
@@ -1463,7 +1482,7 @@ function webImgBuf(url, referer) {
       headers: { 'user-agent': WEB_UA, accept: 'image/jpeg,image/png,image/webp,*/*' }
     }
     if (referer) opts.headers.referer = referer
-    const pv = proxyUrl(); if (pv) { try { opts.agent = tunnelAgent(pv) } catch (_) {} }
+    const pv = proxyUrl(); if (pv) { const ag = agentMaybe(u, pv); if (ag) opts.agent = ag }
     const rq = https.request(opts, rs => {
       if (rs.statusCode !== 200) { rs.resume(); return resolve(null) }
       const chunks = []; rs.on('data', c => chunks.push(c))
@@ -1564,7 +1583,7 @@ function mnGetOnce(url, bin, pUrl) {
       host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: 'GET',
       headers: { 'user-agent': MN_UA, referer: MN_BASE, accept: bin ? 'image/*,*/*' : 'text/html,application/xhtml+xml' }
     }
-    if (pUrl) { try { opts.agent = tunnelAgent(pUrl) } catch (_) {} }
+    if (pUrl) { const ag = agentMaybe(u, pUrl); if (ag) opts.agent = ag }
     const rq = https.request(opts, rs => {
       const chunks = []
       rs.on('data', c => chunks.push(c))
@@ -2239,7 +2258,7 @@ function scOnce(url, opts = {}) {
       }, body ? { 'content-type': 'application/x-www-form-urlencoded', 'content-length': String(body.length) } : {}, opts.hdrs || {})
     }
     const pUrl = proxyUrl()
-    if (pUrl) o.agent = tunnelAgent(pUrl)
+    if (pUrl) { const ag = agentMaybe(u, pUrl); if (ag) o.agent = ag }
     const rq = https.request(o, rs => {
       const chunks = []
       rs.on('data', c => chunks.push(c))
