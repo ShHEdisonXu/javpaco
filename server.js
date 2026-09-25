@@ -898,6 +898,7 @@ async function scanAsync() {
     SCAN.phase = 'index'
     await yieldLoop()
     const items = []
+    const dataRoot = readMediaPathFile() || MEDIA_ROOT   // 渐进落盘用的 root（与扫描结束时的最终值一致）
     // 目录 → 图片索引（异步：网盘上 readdir 不能阻塞主线程）
     const dirImgs = {}
     async function indexImgs(dir) {
@@ -979,6 +980,9 @@ async function scanAsync() {
       if (it.pending) SCAN.failCount++; else SCAN.okCount++   // 成功 = 识别出番号且刮到过元数据；失败 = 落进「识别失败待处理」
       items.push(it)
       SCAN.scanned = ++i
+      /* 渐进落盘：每 16 部把已扫到的条目挂进 DATA → /data.json 立即可见，
+       * 前端边扫边把海报墙铺出来，不用等整个目录走完（网盘挂载的 walk 可能要几十分钟）。 */
+      if ((i & 15) === 0) DATA = { root: dataRoot, generated: Date.now(), items }
       if ((i & 15) === 0) await yieldLoop()   // 让出事件循环，/api/scan 才能实时响应
     }
     items.sort((a, b) => b.mtime - a.mtime)
@@ -2106,9 +2110,12 @@ function enrichFromCache(it) {
   else if (m.title && it.pending) it.pending = false   // 手动改过标题（缓存有 meta 但未在线刮削）→ 同样移出
   if (!m.scraped && m.title) it.scrapeTitle = m.title   // 只有手动标题的缓存 meta（未在线刮削）→ 标题也要生效
   const im = m.images || {}
-  if (!it.relPoster && im.poster) it.webPoster = withVer(im.poster, m)
-  if (!it.relFanart && im.fanart) it.webFanart = withVer(im.fanart, m)
-  if (!(it.relSamples || []).length && (im.samples || []).length) it.webSamples = im.samples.map(u => withVer(u, m))
+  /* 缓存里有图就一定给 web* 字段：媒体目录可能挂网盘（CloudDrive/115），
+   * relPoster 走 /media/ 是网络盘逐张读，海报墙会很慢；web* 指向本地 cache/ 盘上文件，秒开。
+   * 前端展示优先 web*，没有缓存图才回退 rel*（详情页「本地数据」面板仍用 rel* 原始路径）。 */
+  if (im.poster) it.webPoster = withVer(im.poster, m)
+  if (im.fanart) it.webFanart = withVer(im.fanart, m)
+  if ((im.samples || []).length) it.webSamples = im.samples.map(u => withVer(u, m))
   return it
 }
 /* 刮削完成后把结果并回内存里的条目，免整库重扫 */
