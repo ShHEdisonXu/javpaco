@@ -1315,13 +1315,13 @@ function tunnelAgent(pUrl) {
   return agent
 }
 
-async function mnFetch(url, bin, pOverride) {
+async function mnFetch(url, bin, pOverride, referer) {
   const pUrl = pOverride !== undefined ? String(pOverride || '').trim() : proxyUrl()
   const once = () => new Promise((resolve, reject) => {
     const u = new URL(url)
     const opts = {
       host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: 'GET',
-      headers: { 'user-agent': MN_UA, referer: MN_BASE, accept: bin ? 'image/jpeg,*/*' : 'text/html,application/xhtml+xml' }
+      headers: { 'user-agent': MN_UA, referer: referer || MN_BASE, accept: bin ? 'image/jpeg,*/*' : 'text/html,application/xhtml+xml' }
     }
     if (pUrl) opts.agent = tunnelAgent(pUrl)
     const rq = https.request(opts, rs => {
@@ -1355,6 +1355,51 @@ function avaKey(a, mnid) {
   if (a.lid) return String(a.lid).replace(/[^\w-]/g, '')
   if (mnid) return 'mn' + mnid
   return 'nm-' + Buffer.from(String(a.name)).toString('base64url').replace(/[^a-zA-Z0-9]/g, '').slice(0, 18)
+}
+/* ---------- 头像在线兜底（精简镜像）：本地 actresses/ 缺失时按名册在线抓取 ----------
+ * 精简版镜像不再内置 957MB 头像库。/actresses/<key>.jpg 本地没有时：
+ *   ① cache/actors/<key>.jpg（cache 卷，之前抓过、重建容器也不丢）→ ② 名册 mimg（minnano
+ * 缩略图源，覆盖 ~94%，与本地文件同源同尺寸）→ ③ iconRemote（imgur/javbus/r18/dmm）。
+ * 抓到落盘 cache/actors/ 并直接回源；失败做 10 分钟负缓存，避免墙面上几十张占位图
+ * 同时打爆图源；并发请求合并到同一个 Promise。前端完全无感知（URL 不变）。 */
+const AVA_ONLINE_FAIL = new Map()    // key → 失败时间戳
+const AVA_ONLINE_JOB = new Map()     // key → Promise<Buffer|null>（去重并发）
+let AVA_ONLINE_INDEX = null          // key → 名册条目（惰性构建，16MB JSON 一次性解析）
+function avaOnlineIndex() {
+  if (AVA_ONLINE_INDEX) return AVA_ONLINE_INDEX
+  const idx = new Map()
+  try { for (const a of JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) idx.set(avaKey(a), a) } catch (_) {}
+  AVA_ONLINE_INDEX = idx
+  return idx
+}
+const isImgBuf = b => !!(b && b.length > 2048 && ((b[0] === 0xFF && b[1] === 0xD8) || (b[0] === 0x89 && b[1] === 0x50)))
+async function avatarOnline(key) {
+  const a = avaOnlineIndex().get(key)
+  const urls = []
+  if (a && a.mimg) urls.push(String(a.mimg))
+  if (a && a.iconRemote) urls.push(String(a.iconRemote))
+  if (!urls.length) return null
+  if (AVA_ONLINE_FAIL.get(key) > Date.now() - 10 * 60 * 1000) return null
+  if (AVA_ONLINE_JOB.has(key)) return AVA_ONLINE_JOB.get(key)
+  const job = (async () => {
+    for (const u of urls) {
+      try {
+        // Referer 跟着图源域名走（javbus 校验自家 Referer；minnano 用默认 MN_BASE）
+        const ref = (() => { try { const o = new URL(u).origin + '/'; return o === MN_BASE ? undefined : o } catch (_) { return undefined } })()
+        const b = await mnFetch(u, true, undefined, ref)
+        if (isImgBuf(b)) {
+          try { fs.mkdirSync(path.join(cacheDir(), 'actors'), { recursive: true }); fs.writeFileSync(path.join(cacheDir(), 'actors', key + '.jpg'), b) } catch (_) {}
+          return b
+        }
+      } catch (_) {}
+    }
+    AVA_ONLINE_FAIL.set(key, Date.now())
+    return null
+  })()
+  AVA_ONLINE_JOB.set(key, job)
+  const r = await job
+  AVA_ONLINE_JOB.delete(key)
+  return r
 }
 
 /* 女优头像回退来源：minnano 没编号/没头像时 → 必应图片 → 谷歌图片（按名字搜图） */
@@ -5643,7 +5688,7 @@ async function rankUpdateAsync() {
         const fname = lk + '.jpg'
         return {
           rank: x.rank, name: x.name, mnid: String(x.id), works: x.works, lid: lk, name_zh: a.name_zh || '',
-          avatar: fs.existsSync(path.join(AVA_DIR, fname)) ? '/actresses/' + fname : (a.icon || '')
+          avatar: '/actresses/' + fname   // 本地缺图时由头像在线兜底服务
         }
       })
       RANKUP.count += rows.length
@@ -6119,6 +6164,21 @@ const server = http.createServer((req, res) => {
           return res.end(buf)
         }
       }
+    }
+    /* 女优头像：本地 actresses/ 没有（精简镜像）→ cache/actors/（在线抓过的落盘）→ 在线抓取 */
+    if (/^\/actresses\/[\w.-]+\.(jpe?g|png|webp)$/i.test(p)) {
+      const fname = path.basename(p)
+      const local = path.join(UI_ROOT, 'actresses', fname)
+      try { if (fs.statSync(local).isFile()) return sendFile(req, res, local) } catch (_) {}
+      const cached = path.join(cacheDir(), 'actors', fname)
+      try { if (fs.statSync(cached).isFile()) return sendFile(req, res, cached) } catch (_) {}
+      avatarOnline(fname.replace(/\.(jpe?g|png|webp)$/i, '')).then(b => {
+        if (!b) { res.writeHead(404); return res.end('Not Found') }
+        const ct = /\.png$/i.test(p) ? 'image/png' : (/\.webp$/i.test(p) ? 'image/webp' : 'image/jpeg')
+        res.writeHead(200, { 'content-type': ct, 'cache-control': 'public, max-age=86400' })
+        res.end(b)
+      }).catch(() => { try { res.writeHead(404); res.end('Not Found') } catch (_) {} })
+      return
     }
     if (/^\/(covers\/|actresses\/|favicon\.ico|manifest\.webmanifest|sw\.js|hls\.light\.min\.js|icon-192\.png|icon-512\.png|apple-touch-icon\.png)/.test(p) ||
         ['/actresses.json', '/name-map.json', '/name-alias.json', '/rankings.json', '/tags-zh.json'].includes(p)) {
