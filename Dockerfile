@@ -22,17 +22,18 @@ RUN npm ci --omit=dev --no-audit --no-fund \
 COPY actresses.json name-map.json name-alias.json rankings.json tags-zh.json actresses-extra.json ./
 
 # 头像库（actresses/，957MB）已改为在线按需抓取，不再 COPY 进镜像。
-# 影片示例数据（离线资料库）：cache/movies/<番号>/（meta.json+封面/剧照）+ 头像缓存。
-# 注意：不能用「COPY cache/movies/A cache/movies/B ./cache/movies/」多目录源写法——
-# Docker 对多目录源会把目录内容拍平合并，141 个影片互相覆盖只剩最后一个！
-# 整目录单源拷贝才是正确的（135MB 单层，弱网推送时耐心磨）。
-COPY cache ./cache
+# 示例影片包（sample-cache/movies/<番号>/：meta.json + 竖版海报，~8MB，118 部）：
+# 首次运行且离线缓存为空时自动播种（server.js seedSamples），没挂媒体也能看到内容。
+COPY sample-cache ./sample-cache
 # 个人数据（server-config.json / watch.json / userdata.json / media-path.txt）已被 .dockerignore 排除。
 
 ENV PORT=8090
+# 离线数据文件夹挂载点：用户把任意宿主文件夹挂到 /app/cache，
+# 缓存自动建在其下 cache/ 子目录（宿主机上是 <挂载文件夹>/cache/），无需手动创建
+ENV JP_CACHE=/app/cache
 EXPOSE 8090
 
-# /app/cache 声明为卷：不映射时 Docker 自动建卷并拷入示例数据；映射后用宿主目录
+# 媒体目录可选：不挂载也能跑（展示示例/离线缓存条目），要用时再挂任意路径并在网页里添加媒体库
 VOLUME ["/media", "/app/cache"]
 
 # 容器内媒体固定挂载在 /media
