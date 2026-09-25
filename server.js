@@ -1421,7 +1421,13 @@ function tunnelAgent(pUrl) {
   return agent
 }
 
-async function mnFetch(url, bin, pOverride, referer) {
+async function mnFetch(url, bin, pOverride, referer, opt) {
+  /* opt.timeout=硬性总时限、opt.idle=空闲超时、opt.tries=重试次数——
+   * 头像墙这类「一次请求几十张」的场景必须传短超时+单次，
+   * 否则被墙/慢源一张磨 20s×3 次重试，浏览器同源并发全被堵死，整页图片跟着卡。 */
+  const hardMs = (opt && opt.timeout) || 45000
+  const idleMs = (opt && opt.idle) || 20000
+  const tries = (opt && opt.tries) || 3
   const pUrl = pOverride !== undefined ? String(pOverride || '').trim() : proxyUrl()
   const once = () => new Promise((resolve, reject) => {
     const u = new URL(url)
@@ -1441,13 +1447,13 @@ async function mnFetch(url, bin, pOverride, referer) {
       })
     })
     // 硬性总时限：空闲超时挡不住慢速细流响应（会永久挂起）
-    const deadline = setTimeout(() => rq.destroy(new Error('timeout')), 45000)
+    const deadline = setTimeout(() => rq.destroy(new Error('timeout')), hardMs)
     rq.on('error', e => { clearTimeout(deadline); reject(e) })
-    rq.setTimeout(20000, () => rq.destroy(new Error('timeout')))
+    rq.setTimeout(idleMs, () => rq.destroy(new Error('timeout')))
     rq.end()
   })
-  for (let i = 0; i < 3; i++) {
-    try { return await once() } catch (e) { mnFetch.lastErr = e && e.message; await new Promise(s => setTimeout(s, 1200 * (i + 1))) }
+  for (let i = 0; i < tries; i++) {
+    try { return await once() } catch (e) { mnFetch.lastErr = e && e.message; if (i < tries - 1) await new Promise(s => setTimeout(s, 1200 * (i + 1))) }
   }
   return null
 }
@@ -1492,7 +1498,9 @@ async function avatarOnline(key) {
   if (a && a.mimg) urls.push(String(a.mimg))
   if (a && a.iconRemote) urls.push(String(a.iconRemote))
   if (!urls.length) return null
-  if (AVA_ONLINE_FAIL.get(key) > Date.now() - 10 * 60 * 1000) return null
+  /* 负缓存 6 小时：无代理环境 miss 是常态（源被墙），10 分钟太短——每 10 分钟整页头像又慢一遍。
+   * 用户改代理配置时会自动清空（见 /api/config），不用担心配了代理后一直不重试。 */
+  if (AVA_ONLINE_FAIL.get(key) > Date.now() - 6 * 60 * 60 * 1000) return null
   if (AVA_ONLINE_JOB.has(key)) return AVA_ONLINE_JOB.get(key)
   const job = (async () => {
     if (a && a.mnid) {   // ① GitHub 云端中转（Actions 每日抓的榜上女优头像，api.github.com 国内直连可达）
@@ -1506,7 +1514,8 @@ async function avatarOnline(key) {
       try {
         // Referer 跟着图源域名走（javbus 校验自家 Referer；minnano 用默认 MN_BASE）
         const ref = (() => { try { const o = new URL(u).origin + '/'; return o === MN_BASE ? undefined : o } catch (_) { return undefined } })()
-        const b = await mnFetch(u, true, undefined, ref)
+        // 头像链专用短超时：8 秒总限、6 秒空闲、不重试——页面几十张头像并发，慢源快速放弃
+        const b = await mnFetch(u, true, undefined, ref, { timeout: 8000, idle: 6000, tries: 1 })
         if (isImgBuf(b)) {
           try { fs.mkdirSync(path.join(cacheDir(), 'actors'), { recursive: true }); fs.writeFileSync(path.join(cacheDir(), 'actors', key + '.jpg'), b) } catch (_) {}
           return b
@@ -3775,10 +3784,12 @@ async function handleActorApi(req, res, p) {
       if (pv && !/^https?:\/\/[\w.-]+(:\d+)?\/?$/.test(pv)) return json(res, { ok: false, error: '代理格式应为 http://host:port，留空表示直连' })
       CFG.proxy = pv
       proxyAgents.clear()   // 让下一次请求立即使用新代理
+      AVA_ONLINE_FAIL.clear()   // 代理地址变了 → 头像负缓存作废，允许立刻重试
     }
     if ('proxyEnabled' in body) {
       CFG.proxyEnabled = !!body.proxyEnabled
       proxyAgents.clear()
+      AVA_ONLINE_FAIL.clear()   // 代理开关变了 → 头像负缓存作废，允许立刻用新链路重试
     }
     if ('githubToken' in body) {   // GitHub PAT：私有仓库的 relay/ 中转数据经 Contents API 读取
       CFG.githubToken = String(body.githubToken || '').trim()
@@ -6307,7 +6318,9 @@ const server = http.createServer((req, res) => {
       const cached = path.join(cacheDir(), 'actors', fname)
       try { if (fs.statSync(cached).isFile()) return sendFile(req, res, cached) } catch (_) {}
       avatarOnline(fname.replace(/\.(jpe?g|png|webp)$/i, '')).then(b => {
-        if (!b) { res.writeHead(404); return res.end('Not Found') }
+        /* 404 也让浏览器缓存 30 分钟：前端几十个头像请求 miss 时不反复打回来，
+         * 否则每次翻页/刷新都重试在线链，页面资源队列被拖慢 */
+        if (!b) { res.writeHead(404, { 'Cache-Control': 'public, max-age=1800' }); return res.end('Not Found') }
         const ct = /\.png$/i.test(p) ? 'image/png' : (/\.webp$/i.test(p) ? 'image/webp' : 'image/jpeg')
         res.writeHead(200, { 'content-type': ct, 'cache-control': 'public, max-age=86400' })
         res.end(b)
