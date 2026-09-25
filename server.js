@@ -1470,8 +1470,14 @@ let AVA_ONLINE_INDEX = null          // key → 名册条目（惰性构建，16
 function avaOnlineIndex() {
   if (AVA_ONLINE_INDEX) return AVA_ONLINE_INDEX
   const idx = new Map()
-  try { for (const a of JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) idx.set(avaKey(a), a) } catch (_) {}
-  try { for (const a of readExtraRoster()) if (a && !idx.has(avaKey(a))) idx.set(avaKey(a), a) } catch (_) {}   // 榜上新增女优也在补充名册里
+  const put = a => {   // 主名册按 lid、榜上补充名册按 mnid 两种键都可能被请求到，全注册
+    if (!a) return
+    const k = avaKey(a)
+    if (k && !idx.has(k)) idx.set(k, a)
+    if (a.mnid) { const k2 = String(a.mnid); if (!idx.has(k2)) idx.set(k2, a); const k3 = 'mn' + a.mnid; if (!idx.has(k3)) idx.set(k3, a) }
+  }
+  try { for (const a of JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) put(a) } catch (_) {}
+  try { for (const a of readExtraRoster()) put(a) } catch (_) {}
   AVA_ONLINE_INDEX = idx
   return idx
 }
