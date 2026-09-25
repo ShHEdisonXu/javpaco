@@ -1471,6 +1471,7 @@ function avaOnlineIndex() {
   if (AVA_ONLINE_INDEX) return AVA_ONLINE_INDEX
   const idx = new Map()
   try { for (const a of JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) idx.set(avaKey(a), a) } catch (_) {}
+  try { for (const a of readExtraRoster()) if (a && !idx.has(avaKey(a))) idx.set(avaKey(a), a) } catch (_) {}   // 榜上新增女优也在补充名册里
   AVA_ONLINE_INDEX = idx
   return idx
 }
@@ -5812,7 +5813,7 @@ async function rankUpdateAsync() {
       })
       RANKUP.count += rows.length
     }
-    if (fresh.length) { try { writeExtraRoster(extra.concat(fresh)); RANKUP.added = fresh.length } catch (_) {} }
+    if (fresh.length) { try { writeExtraRoster(extra.concat(fresh)); RANKUP.added = fresh.length; AVA_ONLINE_INDEX = null } catch (_) {} }
     const tmp = RANK_FILE + '.tmp'
     // 走中转时 updatedAt 记中转数据的时间：数据新鲜（当天）就不再重试，过期了每小时自动重试
     fs.writeFileSync(tmp, JSON.stringify({ updatedAt: viaRelay && relayAt ? relayAt : Date.now(), via: viaRelay ? 'relay' : 'direct', day: out.day, week: out.week, month: out.month }))
