@@ -79,7 +79,16 @@ function writeCfg() {
   fs.renameSync(t, CFG_FILE)
 }
 /* 线上刮削缓存根目录（设置页可改）：cache/movies/<番号>/meta.json · cache/actors/*.jpg */
-function cacheDir() { return path.resolve(CFG.cacheDir || path.join(UI_ROOT, 'cache')) }
+/* 缓存根目录定位：
+ * 1) CFG.cacheDir（设置里手动指定）优先；
+ * 2) 镜像里通过 JP_CACHE 指定「离线数据文件夹」挂载点 → 缓存自动建在其下 cache/ 子目录
+ *    （用户挂载任意文件夹到 /app/cache，无需自己先建 cache 文件夹，应用自动创建）；
+ * 3) 兜底：程序目录下 ./cache（本地源码运行）。 */
+function cacheDir() {
+  return path.resolve(CFG.cacheDir
+    || (process.env.JP_CACHE ? path.join(process.env.JP_CACHE, 'cache') : '')
+    || path.join(UI_ROOT, 'cache'))
+}
 
 /* ---------- 线上数据源：JavDB 直连（国内线路，不依赖任何中间服务 / 不出海） ----------
  * 上游 = JavDB 移动端 API，鉴权只有一个「应用级签名」，与账号无关：
@@ -974,6 +983,25 @@ async function scanAsync() {
     }
     items.sort((a, b) => b.mtime - a.mtime)
     console.log(`[scan] ${items.length} 个影片，封面匹配 ${items.filter(x => x.relFanart || x.relPoster).length}，耗时 ${Date.now() - t0}ms`)
+    /* 离线缓存兜底展示：还没配置媒体库（或扫到 0 部）时，用离线缓存里的条目做纯在线展示
+     * （首次部署没挂媒体也能看到示例影片/已刮削条目，详情页在线播放、演员、系列都可用）。
+     * 配上自己的媒体库并扫出内容后，这些条目自动让位。 */
+    if (!items.length) {
+      const mroot = path.join(cacheDir(), 'movies')
+      let ces = []
+      try { ces = fs.readdirSync(mroot, { withFileTypes: true }).filter(x => x.isDirectory()) } catch (_) {}
+      for (const e of ces) {
+        const m = readMovieCache(e.name)
+        if (!m || (!m.title && !m.scraped)) continue
+        const mt = Date.parse(m.scrapedAt || m.fetchedAt || '') || 0
+        items.push(enrichFromCache({ code: m.code || e.name, title: m.title || e.name, plot: m.plot || '',
+          year: m.year || '', studio: m.studio || '', publisher: m.publisher || '', series: m.series || '',
+          actors: m.actors || [], genres: m.genres || [], relVideo: null, relFanart: null, relPoster: null,
+          relSamples: [], size: 0, mtime: mt, cachedOnly: true }))
+      }
+      items.sort((a, b) => b.mtime - a.mtime)
+      if (items.length) console.log('[scan] 未配置媒体库/扫到 0 部 → 展示离线缓存条目 ' + items.length + ' 部（示例与已刮削数据，纯在线浏览）')
+    }
     /* 扫描完成 → 自动刮削新番号（设置页可关，默认开）：本轮「识别失败待处理」且能解析出番号的，
      * 复用订阅自动入库的队列逐部刮（用户手动刮削优先）；一次最多 200 部防刷站。
      * 缓存里已有离线数据的（之前刮过）不算新番号，直接跳过。 */
@@ -1111,6 +1139,27 @@ function libStats() {
     }
   })
 }
+/* 示例数据播种：镜像内置 sample-cache/（118 部 meta+竖版海报）。
+ * 离线缓存目录还是空的（首次部署）→ 整包拷进去，页面立刻有内容可看；
+ * 缓存里已有数据（老用户/已扫描过）则跳过，绝不覆盖。 */
+function seedSamples() {
+  try {
+    const src = path.join(UI_ROOT, 'sample-cache', 'movies')
+    if (!fs.existsSync(src)) return
+    const dst = path.join(cacheDir(), 'movies')
+    let cur = []
+    try { cur = fs.readdirSync(dst).filter(n => !n.startsWith('.')) } catch (_) {}
+    if (cur.length) return
+    fs.mkdirSync(dst, { recursive: true })
+    let n = 0
+    for (const d of fs.readdirSync(src)) {
+      if (d.startsWith('.')) continue
+      try { fs.cpSync(path.join(src, d), path.join(dst, d), { recursive: true }); n++ } catch (_) {}
+    }
+    if (n) console.log('[seed] 首次运行：已载入 ' + n + ' 部示例影片到离线缓存（配置媒体库后自动让位）')
+  } catch (e) { console.log('[seed] 示例数据载入失败：' + e.message) }
+}
+seedSamples()
 rescan()                              // 后台启动扫描，服务先监听，进度走 /api/scan
 
 function safeMediaPath(rel) {
