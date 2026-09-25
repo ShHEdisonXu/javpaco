@@ -1425,6 +1425,8 @@ const isImgBuf = b => !!(b && b.length > 2048 && ((b[0] === 0xFF && b[1] === 0xD
 async function avatarOnline(key) {
   const a = avaOnlineIndex().get(key)
   const urls = []
+  // ① 云端中转（Actions 每日抓的榜上女优头像，raw.githubusercontent 国内直连可达）
+  if (a && a.mnid) urls.push(RELAY_BASE + 'avatars/' + a.mnid + '.jpg')
   if (a && a.mimg) urls.push(String(a.mimg))
   if (a && a.iconRemote) urls.push(String(a.iconRemote))
   if (!urls.length) return null
@@ -5720,12 +5722,18 @@ async function rankUpdateAsync() {
     }
     const modes = [['day', 'ranking_actress.php?daily'], ['week', 'ranking_actress.php'], ['month', 'ranking_actress.php?monthly']]
     const out = {}, fresh = []
+    let viaRelay = false, relayAt = 0
     for (const [key, q] of modes) {
       RANKUP.phase = '抓取 ' + key + ' 榜'
+      let rows = []
       const html = await mnFetch(MN_BASE + q, false)
-      if (!html) throw new Error('无法访问 minnano-av.com' + (mnFetch.lastErr ? '（' + mnFetch.lastErr + '）' : '') + '，请检查 设置 → 网络 的代理')
-      const rows = parseRankRows(html)
-      if (!rows.length) throw new Error('榜单页面解析为空（站点结构可能变了）')
+      if (html) rows = parseRankRows(html)
+      if (!rows.length) {   // minnano 不可达（SNI 阻断）→ 走 GitHub Actions 云端中转
+        const rel = await relayJson('rankings.json', 20000)
+        rows = (rel && Array.isArray(rel[key]) ? rel[key] : []).filter(x => x && x.id && x.name)
+        if (rows.length) { viaRelay = true; relayAt = Math.max(relayAt, +rel.fetchedAt || 0); RANKUP.phase = '中转 ' + key + ' 榜' }
+      }
+      if (!rows.length) throw new Error('无法访问 minnano-av.com' + (mnFetch.lastErr ? '（' + mnFetch.lastErr + '）' : '') + '，且云端中转暂无数据')
       RANKUP.phase = '整理 ' + key + ' 榜'
       out[key] = rows.map(x => {
         let a = byMnid.get(String(x.id)) || byName.get(rankNorm(x.name))
