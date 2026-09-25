@@ -1,0 +1,16 @@
+{
+  "name": "JAVぱこ 媒体库",
+  "short_name": "JAVぱこ",
+  "description": "本地媒体库 + 女优数据库 · 流媒体风格",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08060f",
+  "theme_color": "#08060f",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

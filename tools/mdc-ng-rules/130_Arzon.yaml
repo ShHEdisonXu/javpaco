@@ -1,0 +1,61 @@
+name: "Arzon"
+base_url: https://www.arzon.jp
+enabled: false
+
+settings:
+  cookie_session: true
+
+detail:
+  rules:
+    - field: Number
+      xpath: //tr[td[contains(text(), "品番：")]]/td[2]/text()
+      processes:
+        - type: string
+          replace:
+            from: 廃盤
+            to: ""
+    - field: Title
+      xpath: //div[@class="detail_title_new2"]/table/tr/td/h1/text()
+    - field: Outline
+      xpath: //div[@class="item_text"]/text()
+    - field: Actors
+      xpath: //tr[td[contains(text(), "AV女優：")]]/td[2]/a/text()
+      is_array: true
+    - field: Tags
+      xpath: //div[@id="adultgenre2"]//a/text()
+      is_array: true
+    - field: Studio
+      xpath: //tr[td[contains(text(), "AVメーカー：")]]/td[2]/a/text()
+    - field: Publisher
+      xpath: //tr[td[contains(text(), "AVレーベル：")]]/td[2]/a/text()
+    - field: Series
+      xpath: //tr[td[contains(text(), "シリーズ：")]]/td[2]/a/text()
+    - field: Director
+      xpath: //tr[td[contains(text(), "監督：")]]/td[2]/a/text()
+    - field: Cover
+      xpath: //td[@align="center"]/a/img/@src
+      is_url: true
+    - field: Release
+      xpath: //tr[td[contains(text(), "発売日：")]]/td[2]/text()
+      processes:
+        - type: regex
+          extract:
+            pattern: (\d\d\d\d/\d\d/\d\d)
+        - type: date
+          format: "%Y/%m/%d"
+
+    - field: Runtime
+      xpath: //tr[td[contains(text(), "収録時間：")]]/td[2]/text()
+      processes:
+        - type: string
+          replace:
+            from: "分"
+            to: ""
+
+    - field: ExtraFanart
+      xpath: //div[@class="detail_img"]/a/@href
+      is_array: true
+      is_url: true
+search:
+  url: /index.php?action=adult_customer_agecheck&agecheck=1&redirect=https%3A%2F%2Fwww.arzon.jp%2Fitemlist.html%3Ft%3D%26m%3Dall%26s%3D%26q%3D{number}%26m%3Ddvd
+  detail_xpath: "//div[@class='pictlist']//dl[@class='hentry']//dd[@class='entry-title']/h2/a/@href"

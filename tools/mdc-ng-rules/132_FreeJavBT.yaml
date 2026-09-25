@@ -1,0 +1,68 @@
+name: FreeJavBT
+base_url: https://freejavbt.com
+settings:
+  jav_number_format:
+    case: upper
+    with_dash: true
+
+detail:
+  rules:
+    - field: Title
+      xpath: //h1/text()
+      processes:
+        - type: string
+          replace:
+            from: "{number}"
+            to: ""
+        - type: string
+          replace:
+            from: "免費AV在線看"
+            to: ""
+
+    - field: Actors
+      xpath: //div[@class="single-video-meta d-flex"]/div/a[@class="actress"]/text()
+      is_array: true
+      processes:
+        - type: regex
+          replace:
+            pattern: ".*暫無.*"
+            to: ""
+    - field: Director
+      xpath: //span[contains(text(), "导演") or contains(text(), "導演") or contains(text(), "監督")]/following-sibling::*//text()
+    - field: Tags
+      xpath: //div[@class="single-video-meta d-flex"]/div/a[@class="btn btn-danger btn-sm"]/text()
+      is_array: true
+    - field: Series
+      xpath: //span[contains(text(), "系列")]/following-sibling::*//text()
+    - field: Studio
+      xpath: //span[contains(text(), "制作") or contains(text(), "製作") or contains(text(), "メーカー")]/following-sibling::*//text()
+    - field: Publisher
+      xpath: //span[contains(text(), "发行") or contains(text(), "發行")]/following-sibling::*//text()
+    - field: Cover
+      xpath: //img[@class='video-cover rounded lazyload' or @class='col-lg-2 col-md-2 col-sm-6 col-12 lazyload']/@data-src
+      is_url: true
+    - field: ExtraFanart
+      xpath: //a[@class='tile-item']/@href
+      is_url: true
+      is_array: true
+      processes:
+        - type: regex
+          replace:
+            pattern: ".*preview-video.*"
+            to: ""
+    - field: Release
+      xpath: //span[contains(text(), "日期") or contains(text(), "発売日")]/following-sibling::*//text()
+      processes:
+        - type: date
+          format: "%Y-%m-%d"
+    - field: Runtime
+      xpath: //span[contains(text(), "时长") or contains(text(), "時長") or contains(text(), "収録時間")]/following-sibling::*//text()
+      processes:
+        - type: string
+          replace:
+            from: 分鐘
+            to: ""
+
+search:
+  url: /search?wd={number}
+  detail_xpath: //div[contains(@class, "category-page")]//div[@class="card-body"]/a[contains(@href, "{number}")]/@href

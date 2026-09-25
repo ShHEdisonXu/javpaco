@@ -1,0 +1,49 @@
+name: HBOX.JP
+base_url: https://hbox.jp
+
+settings:
+  encoding: ISO-8859-1
+  jav_number_format:
+    uppercase: true
+    with_dash: true
+
+search:
+  url: /search_result?category_val=&x=0&y=0&gaq={number}&q_array%5B%5D={number}
+  detail_xpath: //div[@class="resultbox"]//div[@class="one"]//a/@href
+
+detail:
+  rules:
+    - field: Title
+      xpath: //h2[@class="title"]/text()
+    - field: OriginalTitle
+      xpath: //h2[@class="title"]/text()
+    - field: Outline
+      xpath: //h3[@class="title intro"]/following-sibling::p/text()
+    - field: Poster
+      xpath: //div[@id="hidden"]//img/@src
+      is_url: true
+    - field: Actors
+      xpath: //div[@class="right"]//table//tr/th[text()="女優："]/following-sibling::td/a/text()
+      is_array: true
+    - field: Release
+      xpath:
+        - //div[@class="right"]//table//tr/th[text()="発売日："]/following-sibling::td/text()
+        - //div[@class="right"]//table//tr/th[text()="配信開始日："]/following-sibling::td/text()
+      is_array: true
+    - field: Studio
+      xpath: //div[@class="right"]//table//tr/th[text()="メーカー："]/following-sibling::td/a/text()
+    - field: Series
+      xpath: //div[@class="right"]//table//tr/th[text()="シリーズ："]/following-sibling::td/a/text()
+    - field: Director
+      xpath: //div[@class="right"]//table//tr/th[text()="監督："]/following-sibling::td/a/text()
+    - field: Runtime
+      xpath: //div[@class="right"]//table//tr/th[text()="時間："]/following-sibling::td/text()
+      processes:
+        - type: duration_to_minutes
+    - field: Tags
+      xpath: //div[@class="right"]//table//tr/th[text()="タグ："]/following-sibling::td/a/text()
+      is_array: true
+    - field: ExtraFanart
+      xpath: //section[@class="section detailsSample"]/ul/li/a/@href
+      is_url: true
+      is_array: true

@@ -1,0 +1,60 @@
+name: "AVsox"
+base_url: https://avsox.click
+
+settings:
+  jav_number_format:
+    with_dash: true
+    case: upper
+
+search:
+  url:
+    - "/cn/search/{number}"
+  detail_xpath:
+    - //*[@id="waterfall"]/div/a/div[@class="photo-info"]/span/date[contains(text(), "{number}")]/../../../@href
+
+detail:
+  rules:
+    - field: Number
+      xpath: //div[@class="col-md-3 info"]/p/span[@style="color:#CC0000;"]/text()
+
+    - field: Title
+      xpath: //div[@class="container"]/h3/text()
+      processes:
+        - type: string
+          replace:
+            from: "{number}"
+            to: ""
+
+    # - field: Poster
+    #   xpath: //*[@id="waterfall"]/div/a/div[@class="photo-info"]/span/date[contains(text(), "{number}")]/../../../div[@class='photo-frame']/img/@src
+    #   is_url: true
+    #   in_search_page: true
+
+    - field: Cover
+      xpath: //a[@class="bigImage"]/@href
+      is_url: true
+
+    - field: Actors
+      xpath: //div[@id='avatar-waterfall']/a/span/text()
+      is_array: true
+
+    - field: Tags
+      xpath: //span[@class="genre"]/a/text()
+      is_array: true
+
+    - field: Series
+      xpath: //p/a[contains(@href,"/series/")]/text()
+
+    - field: Studio
+      xpath: //p/a[contains(@href,"/studio/")]/text()
+
+    - field: Release
+      xpath: //span[contains(text(),"发行时间:") or contains(text(),"發行日期:") or contains(text(),"発売日:")]/../text()
+
+    - field: Runtime
+      xpath: //span[contains(text(),"长度:") or contains(text(),"長度:") or contains(text(),"収録時間:")]/../text()
+      processes:
+        - type: string
+          replace:
+            from: "分钟"
+            to: ""

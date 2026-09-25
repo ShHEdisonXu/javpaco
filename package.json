@@ -1,0 +1,12 @@
+{
+  "name": "javpaco",
+  "private": true,
+  "version": "1.0.0",
+  "description": "JAVPACO 迷你媒体服务（含 mdc-ng 规则引擎依赖）",
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "js-yaml": "^4.1.0",
+    "jsdom": "^24.0.0",
+    "xpath": "^0.0.34"
+  }
+}

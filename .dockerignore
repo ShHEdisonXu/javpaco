@@ -1,0 +1,36 @@
+# JAVPACO .dockerignore
+#
+# 规则：影片示例数据保留（cache/），个人数据一律排除。
+# 注意：.dockerignore 不支持行尾行内注释，注释必须单独成行。
+
+# ── 运行时个人数据（绝不能进镜像）──
+# 观看进度
+watch.json
+# 设置：含 115 cookie / 代理地址 / 访问口令
+server-config.json
+# 评分等个人标记
+userdata.json
+# 本机影片文件夹路径
+media-path.txt
+
+# ── cache/ 整体保留（影片示例数据：离线资料 meta.json/封面/剧照 + 头像 + 视频指纹），
+#     只排掉纯运行期缓存 ──
+cache/previews/
+cache/actors/.tmp
+
+# ── 本机运行配置（compose 里有个人路径/代理，不要外传）──
+docker-compose.yml
+docker-compose.yml.bak-*
+docker-env.sh
+启动.command
+media-empty/
+
+# ── 开发产物 / 本地文件 ──
+node_modules/
+shot-*.png
+tools/
+_build-exclude/
+core
+*.bak
+.DS_Store
+**/.DS_Store

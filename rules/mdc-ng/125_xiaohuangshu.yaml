@@ -1,0 +1,30 @@
+name: xiaohuangshu
+base_url: https://xchina.co
+
+search:
+  url: /videos/keyword-{serial_name}{serial_number_trim_0}.html
+  detail_xpath:
+    - //div[contains(@class, "video-list")]/div[contains(@class, "video")]/div[@class="tags"]/div[text()="{serial_name}{serial_number_trim_0}"]/../../a/@href
+    - //div[contains(@class, "video-list")]/div[contains(@class, "video")]/div[@class="tags"]/div[text()="{serial_name}{serial_number}"]/../../a/@href
+    - //div[contains(@class, "video-list")]/div[contains(@class, "video")]/div[@class="tags"]/div[text()="{serial_name}-{serial_number_trim_0}"]/../../a/@href
+    - //div[contains(@class, "video-list")]/div[contains(@class, "video")]/div[@class="tags"]/div[text()="{serial_name}-{serial_number}"]/../../a/@href
+
+detail:
+  url_match: "/video/"
+  rules:
+    - field: Number
+      xpath: //div[@class="info-card video-detail"]//i[@class="fas fa-file"]/../../div[@class="text"]/text()
+
+    - field: Title
+      xpath: //div[@class="info-card video-detail"]//i[@class="fas fa-address-card"]/../../div[@class="text"]/text()
+
+    - field: Studio
+      xpath: //div[@class="info-card video-detail"]//i[@class="fas fa-video-camera"]/../../div[@class="text"]/a[2]/text()
+
+    - field: Actors
+      xpath: //div[@class="info-card video-detail"]//div[@class="model-avatar-container"]/a/div/div/text()
+      is_array: true
+
+    - field: Cover
+      xpath: //meta[@property="og:image"]/@content
+      is_url: true
