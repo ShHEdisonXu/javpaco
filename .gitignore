@@ -11,7 +11,9 @@ docker-compose.yml
 *.bak
 
 # ---- 大体积数据目录（按 README 说明自行放置）----
-cache/
+# cache/ 是运行时缓存不入库，但 CI 构建需要目录存在，只保留 .gitkeep 骨架
+cache/*
+!cache/.gitkeep
 actresses/
 media-empty/
 
@@ -19,7 +21,8 @@ media-empty/
 node_modules/
 _build-exclude/
 shot-*.png
-actresses-extra.json
+# CI 构建需要此文件存在（内容为 []，无个人数据）
+!actresses-extra.json
 
 # ---- 系统杂项 ----
 .DS_Store
