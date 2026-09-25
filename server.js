@@ -1265,6 +1265,16 @@ function streamWith(res, rs) {
 const ROSTER = path.join(UI_ROOT, 'actresses.json')
 const AVA_DIR = path.join(UI_ROOT, 'actresses')
 const MN_BASE = 'https://www.minnano-av.com/'
+/* minnano 云端中转：家里宽带对该站是 SNI 阻断（TCP 即 RST），但 raw.githubusercontent.com
+ * 直连可达。GitHub Actions 每日抓榜单+头像提交到仓库 relay/ 目录，这里兜底读取。 */
+const RELAY_BASE = 'https://raw.githubusercontent.com/ShHEdisonXu/javpaco/main/relay/'
+async function relayJson(p, ms) {
+  try {
+    const r = await fetch(RELAY_BASE + p, { signal: AbortSignal.timeout(ms || 15000) })
+    if (!r.ok) return null
+    return await r.json()
+  } catch (_) { return null }
+}
 const MN_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const dropEmpty = (k, v) => (v === '' || v === null || (Array.isArray(v) && v.length === 0) ? undefined : v)
 const mnDec = s => String(s || '')
