@@ -1,0 +1,38 @@
+# minnano 云端中转：Actions 机房直连抓榜单+头像，提交 relay/ 目录。
+# 家里宽带对 minnano-av.com 是 SNI 阻断（TCP 握手即 RST），NAS 侧改从
+# raw.githubusercontent.com 直连读取（国内可达），无需代理。
+name: minnano-relay
+
+on:
+  schedule:
+    - cron: '30 21 * * *'   # UTC 21:30 = 北京时间 05:30，日榜刚更新
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: minnano-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 抓取 minnano 榜单与头像
+        run: node tools/rank-relay.js
+      - name: 提交 relay 数据
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add relay/
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "relay: minnano 榜单中转更新 $(date -u +%F)"
+            git push
+          fi
