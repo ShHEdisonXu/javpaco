@@ -1,0 +1,27 @@
+# ---- 个人数据（绝不入库）----
+# server-config.json 含 115 cookie、代理等个人凭据
+server-config.json
+userdata.json
+watch.json
+media-path.txt
+启动.command
+docker-env.sh
+# docker-compose.yml 含内网 IP，仓库只保留 example 版
+docker-compose.yml
+*.bak
+
+# ---- 大体积数据目录（按 README 说明自行放置）----
+cache/
+actresses/
+media-empty/
+
+# ---- 构建辅助 / 开发产物 ----
+node_modules/
+_build-exclude/
+shot-*.png
+actresses-extra.json
+
+# ---- 系统杂项 ----
+.DS_Store
+*.log
+*.bak-cloud
