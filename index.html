@@ -7004,7 +7004,7 @@ window.acmpPickImg = async function (i, quiet) {
       body: JSON.stringify({ url: it.url })
     })
     const j = await r.json()
-    if (!j.ok) { st.textContent = j.error || '头像下载失败'; return }
+    if (!j.ok) { st.textContent = (j.error || '头像下载失败') + ' —— 这张没选上，换一张候选再点保存（外部图源偶尔抽风，也可以在设置里检查代理）'; return }
     ACM_STATE.iconData = j.dataUrl
     ACM_STATE.iconPath = ''
     const av = document.getElementById('acmAva')
@@ -7028,9 +7028,18 @@ window.acmPick = function (inp) {
 window.acScrapeSave = async function () {
   const a = AC_CUR
   if (!a) return
+  const st = document.getElementById('acmStatus')
+  /* 头像守卫：候选没点成 / 还在下载 / 下载失败时 iconData 是空的 —— 这时保存不会改头像。
+   * 名册里本来就没头像的话明确问一下，免得用户以为「保存了头像却没生效」。 */
+  const picking = st && /下载候选|正在下载/.test(st.textContent || '')
+  if (!ACM_STATE.iconData && !ACM_STATE.iconPath && !a.icon) {
+    const msg = picking
+      ? '头像候选还在下载中，等它完成（状态栏会显示「已选头像 xxx KB」）再点保存，头像才会生效。'
+      : '这次没有选中任何头像候选（可能下载失败了，状态栏有提示），保存只会写入文字资料。'
+    if (!confirm(msg + '\n\n仍然继续保存吗？')) return
+  }
   const fields = {}
   ACM_FIELDS.forEach(([k]) => { const el = document.getElementById('acm-f-' + k); if (el) fields[k] = el.value })
-  const st = document.getElementById('acmStatus')
   st.textContent = '保存中…'
   try {
     const r = await fetch('/api/actor/save', {
@@ -7044,28 +7053,33 @@ window.acScrapeSave = async function () {
     })
     const j = await r.json()
     if (!j.ok) { st.textContent = j.error || '保存失败'; return }
+    window.acTip(ACM_STATE.iconData || ACM_STATE.iconPath
+      ? '已保存：新头像 + 文字资料，页面即将刷新'
+      : '已保存文字资料（未改头像），页面即将刷新', 2500)
     acScrapeClose()
     const nn = '#/actor/' + encodeURIComponent(j.name || a.name)
     if (location.hash !== nn) location.hash = nn
-    location.reload()
+    setTimeout(() => location.reload(), 600)
   } catch (e) { st.textContent = '保存失败：' + e.message }
 }
 
 /* ---- 「识别刮削」：按 minnano 现况核对单人资料，有变化（含改名 / 新资料 / 缺头像）直接更新名册 ---- */
+/* 全局轻提示（详情页操作共用：识别刮削 / 刮削编辑保存） */
+window.acTip = function (msg, ms) {
+  let el = document.getElementById('acSyncTip')
+  if (!el) {
+    el = document.createElement('div'); el.id = 'acSyncTip'
+    el.style.cssText = 'position:fixed;left:50%;bottom:64px;transform:translateX(-50%);background:rgba(20,20,28,.92);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.4);transition:opacity .25s;pointer-events:none;opacity:0;max-width:70vw'
+    document.body.appendChild(el)
+  }
+  el.textContent = msg; el.style.opacity = '1'
+  clearTimeout(acTip._t); acTip._t = setTimeout(() => { el.style.opacity = '0' }, ms || 3500)
+}
 window.acSyncNow = async function (nameEnc, idx, btn) {
   const name = decodeURIComponent(nameEnc)
   const oldTxt = btn ? btn.textContent : ''
   if (btn) { btn.disabled = true; btn.textContent = '⟳ 识别中…' }
-  const tip = msg => {
-    let el = document.getElementById('acSyncTip')
-    if (!el) {
-      el = document.createElement('div'); el.id = 'acSyncTip'
-      el.style.cssText = 'position:fixed;left:50%;bottom:64px;transform:translateX(-50%);background:rgba(20,20,28,.92);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.4);transition:opacity .25s;pointer-events:none;opacity:0;max-width:70vw'
-      document.body.appendChild(el)
-    }
-    el.textContent = msg; el.style.opacity = '1'
-    clearTimeout(tip._t); tip._t = setTimeout(() => { el.style.opacity = '0' }, 3500)
-  }
+  const tip = (msg, ms) => window.acTip(msg, ms)
   try {
     const r = await fetch('/api/actor/sync', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
