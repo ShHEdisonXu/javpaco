@@ -5988,9 +5988,7 @@ async function mvFetch(url, hdrs = {}, deadlineMs = 20000) {
       } else throw e
     }
     if ([301, 302, 303, 307, 308].includes(rs.status) && rs.headers.location) {
-      const next = new URL(rs.headers.location, cur).href
-      try { if (new URL(next).origin !== new URL(cur).origin && hdrs.referer) { hdrs = Object.assign({}, hdrs); delete hdrs.referer } } catch (_) {}
-      cur = next
+      cur = new URL(rs.headers.location, cur).href
       continue
     }
     rs.finalUrl = cur
@@ -6125,10 +6123,12 @@ function missavHlsReq(res, p, u) {
     const site = ordered[idx++]
     const upstream = site + '/jmpres/surrit.com/' + uuid + rest + suffix
     mvStreamUpstream(upstream, site, isPlaylist, res, (err, buf) => {
-      if (buf) {   // m3u8 内容拿到但需要重写
+      if (buf) {   // m3u8 内容拿到但需要重写——先验货：CDN 防盗链会把无 referer/风控请求引到 JPEG 诱饵图
+        const text0 = Buffer.concat(buf).toString('utf8')
+        if (!/^\uFEFF?\s*#EXTM3U/.test(text0)) { mvNote(site, false); return tryRoute() }
         mvNote(site, true)
         const baseDir = rest.replace(/[^/]*$/, '')
-        const out = missavRewriteM3U8(Buffer.concat(buf).toString('utf8'), uuid, baseDir, site)
+        const out = missavRewriteM3U8(text0, uuid, baseDir, site)
         res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' })
         return res.end(out)
       }
@@ -6180,18 +6180,15 @@ function mvStreamUpstream(url, site, isPlaylist, res, onDone, uuid) {
   })
 }
 /* https.get + 手动跟随 302（jmpres → 国内 CDN）。
- * 关键：跨域重定向要剥掉 referer（浏览器行为）——CDN（vcsocdp.net 等）有防盗链，
- * 带着镜像站的 referer 过去会被 403，这正是「解析成功但播放失败」的根因。 */
+ * 注意 referer 必须保留：CDN（vcsheaye.cc 等）以镜像站 referer 做防盗链白名单，
+ * 带 referer 返回真 m3u8，不带会返回 JPEG 诱饵图（所以这里不能学浏览器跨域剥离）。 */
 function mvFollowGet(url, hdrs, cb, hop = 0) {
   if (hop > 5) return cb(new Error('重定向次数过多'))
   const uu = new URL(url)
   const req = https.get(uu, { headers: hdrs, timeout: 25000 }, rs => {
     if ([301, 302, 303, 307, 308].includes(rs.statusCode) && rs.headers.location) {
       rs.resume()
-      const next = new URL(rs.headers.location, uu).href
-      const nh = Object.assign({}, hdrs)
-      try { if (new URL(next).origin !== uu.origin) delete nh.referer } catch (_) {}
-      return mvFollowGet(next, nh, cb, hop + 1)
+      return mvFollowGet(new URL(rs.headers.location, uu).href, hdrs, cb, hop + 1)
     }
     cb(null, rs, url)
   })
