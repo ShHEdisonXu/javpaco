@@ -6774,6 +6774,7 @@ function renderActorDetail(name) {
     ? `<div class="ac-heroimg" title="点击查看原图" onclick="acLightbox('${a.icon}')"><img src="${a.icon}" alt="" onerror="this.remove()"></div>`
     : acAvatar(a)
   const scrapeBtn = canEdit ? `<button class="ac-scrape" onclick="acScrapeOpen()" title="刮削编辑头像与资料">✎ 刮削</button>` : ''
+  const syncBtn = `<button class="ac-scrape" onclick="acSyncNow('${encodeURIComponent(a.name)}',${a.idx == null ? -1 : a.idx},this)" title="按 minnano 最新资料核对该女优：有新资料 / 改名 / 缺头像就直接更新">⟳ 识别刮削</button>`
   // 「关注过该女优的人也在关注的女演员」（minnano 相关推荐，按 mnid 映射到本地女优页）
   const relSeen = new Set()
   const relItems = (Array.isArray(a.rel) ? a.rel : []).map(r => {
@@ -6790,7 +6791,7 @@ function renderActorDetail(name) {
     <div class="ac-hero" data-mod="achero" data-st="achero">
       ${heroImg}
       <div class="ac-idname">
-        <div class="ac-name">${a.name}${scrapeBtn}<button class="ac-fav${FAV_ACTORS.has(a.name) ? ' on' : ''}" data-n="${libEsc(a.name)}" onclick="toggleFavActor(this.dataset.n, this)">${FAV_ACTORS.has(a.name) ? '<span class="h">♥</span> 已关注' : '<span class="h">♡</span> 关注'}</button><button class="ac-fav ac-sub" data-n="${libEsc(a.name)}" onclick="subsAddActor(this.dataset.n, this)" title="订阅该女优：订阅页会去线上找她的新作品">✚ 订阅</button></div>
+        <div class="ac-name">${a.name}${scrapeBtn}${syncBtn}<button class="ac-fav${FAV_ACTORS.has(a.name) ? ' on' : ''}" data-n="${libEsc(a.name)}" onclick="toggleFavActor(this.dataset.n, this)">${FAV_ACTORS.has(a.name) ? '<span class="h">♥</span> 已关注' : '<span class="h">♡</span> 关注'}</button><button class="ac-fav ac-sub" data-n="${libEsc(a.name)}" onclick="subsAddActor(this.dataset.n, this)" title="订阅该女优：订阅页会去线上找她的新作品">✚ 订阅</button></div>
         <div class="ac-count">${sub.join(' · ')}</div>
         ${al.length ? `<div class="ac-aliases">${al.map(x => `<span class="ac-alias">${x}</span>`).join('')}</div>` : ''}
       </div>
@@ -7048,6 +7049,51 @@ window.acScrapeSave = async function () {
     if (location.hash !== nn) location.hash = nn
     location.reload()
   } catch (e) { st.textContent = '保存失败：' + e.message }
+}
+
+/* ---- 「识别刮削」：按 minnano 现况核对单人资料，有变化（含改名 / 新资料 / 缺头像）直接更新名册 ---- */
+window.acSyncNow = async function (nameEnc, idx, btn) {
+  const name = decodeURIComponent(nameEnc)
+  const oldTxt = btn ? btn.textContent : ''
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ 识别中…' }
+  const tip = msg => {
+    let el = document.getElementById('acSyncTip')
+    if (!el) {
+      el = document.createElement('div'); el.id = 'acSyncTip'
+      el.style.cssText = 'position:fixed;left:50%;bottom:64px;transform:translateX(-50%);background:rgba(20,20,28,.92);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.4);transition:opacity .25s;pointer-events:none;opacity:0;max-width:70vw'
+      document.body.appendChild(el)
+    }
+    el.textContent = msg; el.style.opacity = '1'
+    clearTimeout(tip._t); tip._t = setTimeout(() => { el.style.opacity = '0' }, 3500)
+  }
+  try {
+    const r = await fetch('/api/actor/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, idx })
+    })
+    const d = await r.json()
+    if (!d.ok) throw new Error(d.error || '同步失败')
+    const parts = []
+    if (d.created) parts.push('已在名册建档')
+    if (d.renamed) parts.push(`改名 ${d.renamed.from} → ${d.renamed.to}`)
+    if (d.changed && d.changed.length) parts.push('更新 ' + d.changed.join('、'))
+    tip(parts.length ? parts.join('；') : '与 minnano 一致，没有新变化')
+    /* 名册已变 → 重拉资料重建缓存，再重渲染当前女优页（改名后跳新名） */
+    ACR = null
+    await loadActressData()
+    const nn = d.renamed && d.renamed.to
+    if (nn && name !== nn) {
+      const nh = '#/actor/' + encodeURIComponent(nn)
+      if (location.hash !== nh) location.hash = nh
+      else route()
+    } else if ((location.hash || '').startsWith('#/actor/')) {
+      route()
+    }
+  } catch (e) {
+    tip('识别刮削失败：' + e.message)
+  } finally {
+    if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = oldTxt }
+  }
 }
 
 /* ================= 排行榜（#/ranking，minnano 日/周/月人气 Top100） ================= */
