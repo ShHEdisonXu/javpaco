@@ -6406,10 +6406,14 @@ function actorAvaOf(name) {
   }
   return ACT_AVA_MAP[acNorm(name)] || ''
 }
+/* 头像版本戳：保存新头像后 bump，URL 变化强制绕过浏览器缓存（含旧版强缓存遗留条目）→ 换完立即可见 */
+function avaVer() {
+  try { return localStorage.avaEpoch ? '?v=' + localStorage.avaEpoch : '' } catch (_) { return '' }
+}
 function acAvatar(a, sm) {
   const cls = 'ac-ava' + (sm ? ' sm' : '')
   const ch = `<span>${(a.name || '?')[0]}</span>`
-  if (a.icon) return `<div class="${cls}">${ch}<img loading="lazy" decoding="async" alt="" src="${a.icon}" onerror="this.remove()"></div>`
+  if (a.icon) return `<div class="${cls}">${ch}<img loading="lazy" decoding="async" alt="" src="${a.icon}${avaVer()}" onerror="this.remove()"></div>`
   const f = (a.films || []).find(x => x.posterUrl || x.fanartUrl)
   if (f) return `<div class="${cls}" style="background-image:url('${f.posterUrl || f.fanartUrl}')"></div>`
   return `<div class="${cls}">${ch}</div>`
@@ -7069,6 +7073,7 @@ window.acScrapeSave = async function () {
     window.acTip(ACM_STATE.iconData || ACM_STATE.iconPath
       ? '已保存：新头像 + 文字资料，页面即将刷新'
       : '已保存文字资料（未改头像），页面即将刷新', 2500)
+    if (ACM_STATE.iconData || ACM_STATE.iconPath) { try { localStorage.avaEpoch = Date.now() } catch (_) {} }
     acScrapeClose()
     const nn = '#/actor/' + encodeURIComponent(j.name || a.name)
     if (location.hash !== nn) location.hash = nn
