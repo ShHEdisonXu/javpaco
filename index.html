@@ -2882,6 +2882,11 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
             <label class="sp-switch"><input type="checkbox" id="optAutoScrapeNew" checked><i></i></label>
           </div>
           <div class="sp-row">
+            <div class="l">部署后自动拉女优头像
+              <small>服务启动后自动扫描名册，把本地缺的头像从云端中转仓库（jsDelivr / GitHub raw，国内直连、免 token 免代理）预取到缓存卷，一轮约 1 小时，之后每 12 小时补新增。已下载的头像本地直出、断网也能显示。</small></div>
+            <label class="sp-switch"><input type="checkbox" id="optAutoAvatar" checked><i></i></label>
+          </div>
+          <div class="sp-row">
             <div class="l">媒体库每日自动重扫
               <small>服务每天在下面这个时间点自动把媒体库重扫一遍（适合网盘挂载、新片陆续落盘的场景）；正在手动扫描时本轮让路，扫描失败隔一小时重试。扫完若上面的开关开着，新番号会一并自动刮好。</small></div>
             <label class="sp-switch"><input type="checkbox" id="optAutoRescan"><i></i></label>
@@ -7091,7 +7096,8 @@ window.acSyncNow = async function (nameEnc, idx, btn) {
     if (d.created) parts.push('已在名册建档')
     if (d.renamed) parts.push(`改名 ${d.renamed.from} → ${d.renamed.to}`)
     if (d.changed && d.changed.length) parts.push('更新 ' + d.changed.join('、'))
-    tip(parts.length ? parts.join('；') : '与 minnano 一致，没有新变化')
+    const base = parts.length ? parts.join('；') : '与 minnano 一致，没有新变化'
+    tip(base + (d.via === 'relay' ? '（minnano 直连不可达，数据来自云端名册·每日自动同步）' : ''))
     /* 名册已变 → 重拉资料重建缓存，再重渲染当前女优页（改名后跳新名） */
     ACR = null
     await loadActressData()
@@ -10555,6 +10561,7 @@ const optRankAuto = document.getElementById('optRankAuto')
 const optRankHour = document.getElementById('optRankHour')
 const rankUpInfo = document.getElementById('rankUpInfo')
 const optAutoScrapeNew = document.getElementById('optAutoScrapeNew')
+const optAutoAvatar = document.getElementById('optAutoAvatar')
 const optAutoRescan = document.getElementById('optAutoRescan')
 const optAutoRescanHour = document.getElementById('optAutoRescanHour')
 if (optRankHour && !optRankHour.options.length) {
@@ -10586,6 +10593,7 @@ async function spLoadScrape() {
     if (optRankHour) { optRankHour.value = String(j.rankHour == null ? 4 : j.rankHour); optRankHour.disabled = !(j.rankAuto !== false) }
     spRankInfo(j.rankUpdatedAt, j.rankRunning)
     if (optAutoScrapeNew) optAutoScrapeNew.checked = j.autoScrapeNew !== false
+    if (optAutoAvatar) optAutoAvatar.checked = j.autoAvatar !== false
     if (optAutoRescan) optAutoRescan.checked = j.autoRescan === true
     if (optAutoRescanHour) { optAutoRescanHour.value = String(j.autoRescanHour == null ? 5 : j.autoRescanHour); optAutoRescanHour.disabled = !(j.autoRescan === true) }
     const ari = document.getElementById('autoRescanInfo')
@@ -10604,6 +10612,7 @@ if (optRankAuto) optRankAuto.addEventListener('change', () => {
 })
 if (optRankHour) optRankHour.addEventListener('change', () => { spSaveCfg({ rankHour: parseInt(optRankHour.value, 10) || 0 }) })
 if (optAutoScrapeNew) optAutoScrapeNew.addEventListener('change', () => { spSaveCfg({ autoScrapeNew: optAutoScrapeNew.checked }) })
+if (optAutoAvatar) optAutoAvatar.addEventListener('change', () => { spSaveCfg({ autoAvatar: optAutoAvatar.checked }) })
 if (optAutoRescan) optAutoRescan.addEventListener('change', () => {
   spSaveCfg({ autoRescan: optAutoRescan.checked })
   if (optAutoRescanHour) optAutoRescanHour.disabled = !optAutoRescan.checked
