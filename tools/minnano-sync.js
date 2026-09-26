@@ -424,8 +424,11 @@ async function stageProfiles(list) {
   fs.mkdirSync(TMP, { recursive: true })
   const cache = REDO ? {} : loadJson(C_PROF, {})
   const targets = list.filter(a => a.mnid)
-  const stale = targets.filter(a => { const c = cache[a.mnid]; return !c || Date.now() - c.fetchedAt > PROF_TTL })
-  console.log(`[profiles] 有 mnid ${targets.length} 人，过期需刷新 ${stale.length}`)
+  /* ONLY=mnid1,mnid2 → 只刷新指定的人（无视 TTL，用于新人补档，不全量爬） */
+  const ONLY = (process.env.ONLY || '').split(',').map(s => s.trim()).filter(Boolean)
+  const stale = ONLY.length ? targets.filter(a => ONLY.includes(String(a.mnid)))
+    : targets.filter(a => { const c = cache[a.mnid]; return !c || Date.now() - c.fetchedAt > PROF_TTL })
+  console.log(`[profiles] 有 mnid ${targets.length} 人，需刷新 ${stale.length}${ONLY.length ? '（ONLY 指定模式）' : ''}`)
   let ok = 0, fail = 0
   const tasks = stale.map(a => async () => {
     const r = await get(BASE + 'actress' + a.mnid + '.html')
@@ -674,13 +677,22 @@ async function stageRankings(idx, list) {
   const byName = new Map()
   list.forEach(a => { const k = acNorm(a.name); if (k && !byName.has(k)) byName.set(k, a) })
   const rank = {}
-  let added = 0
+  let added = 0, renamed = 0
   for (const [key, url] of modes) {
     const r = await get(BASE + url)
     const rows = r && r.text ? parseRankRows(r.text) : []
     console.log(`[rankings] ${key}: ${rows.length} 条`)
     rank[key] = rows.map(x => {
       let a = byMnid.get(x.id)
+      if (a && x.name && x.name !== (a.name_ja || a.name)) {
+        // 同 mnid 但站点现用名不同 → 改名了：更新名字，旧名收进别名（否则按新名查详情会扑空）
+        const olds = [a.name_ja, a.name].filter(Boolean)
+        a.alias = Array.from(new Set([].concat(a.alias || [], olds)))
+        if (!a.name_zh || a.name === (a.name_ja || a.name)) a.name = x.name
+        a.name_ja = x.name
+        renamed++
+        console.log(`  [rankings] 改名：${olds.join('/')} → ${x.name}（mnid=${x.id}）`)
+      }
       if (!a) {
         // 榜上女优不在本地库 → 自动建档
         const rec = idx ? idx.recs[x.id] : null
@@ -707,7 +719,7 @@ async function stageRankings(idx, list) {
       }
     })
   }
-  if (added) saveRoster(list)
+  if (added || renamed) saveRoster(list)
   saveAtomic(RANK_OUT, { updatedAt: Date.now(), day: rank.day, week: rank.week, month: rank.month })
   console.log(`[rankings] 写入 rankings.json（新入库 ${added} 人）`)
   return list
