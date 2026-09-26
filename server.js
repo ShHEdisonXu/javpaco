@@ -5955,8 +5955,10 @@ function mvNote(site, ok) {
   else { h.failures++; h.cooldownUntil = Date.now() + Math.min(5, h.failures) * 60 * 1000 }
 }
 
-/* 直连抓取（不走代理；失败且配置了代理时兜底走一次代理），手动跟随重定向 */
-function mvOnce(url, hdrs = {}, deadlineMs = 20000, useProxy = false) {
+/* 直连抓取：优先 fetch（undici）——CDN（vcsheaye.cc 等）会对 https.request 的
+ * 裸请求特征直接 403（同 URL fetch 200 / https.get 403 实测）；失败且配置了代理
+ * 时兜底走一次隧道代理（fetch 不认代理环境变量，退回 https.request 实现）。 */
+function mvRawOnce(url, hdrs = {}, deadlineMs = 20000, useProxy = false) {
   return new Promise((resolve, reject) => {
     const uu = new URL(url)
     const o = {
@@ -5975,6 +5977,20 @@ function mvOnce(url, hdrs = {}, deadlineMs = 20000, useProxy = false) {
     rq.on('error', e => { clearTimeout(dl); reject(e) })
     rq.end()
   })
+}
+async function mvOnce(url, hdrs = {}, deadlineMs = 20000, useProxy = false) {
+  if (useProxy) return mvRawOnce(url, hdrs, deadlineMs, true)
+  const h = Object.assign({}, hdrs)
+  delete h.__proxied
+  try {
+    const rs = await fetch(url, { headers: h, redirect: 'manual', signal: AbortSignal.timeout(deadlineMs || 20000) })
+    const headers = {}
+    rs.headers.forEach((v, k) => { headers[k] = v })
+    return { status: rs.status, headers, buf: Buffer.from(await rs.arrayBuffer()) }
+  } catch (e) {
+    if (proxyUrl()) return mvRawOnce(url, hdrs, deadlineMs, true)
+    throw e
+  }
 }
 async function mvFetch(url, hdrs = {}, deadlineMs = 20000) {
   let cur = url
@@ -6116,23 +6132,28 @@ function missavHlsReq(res, p, u) {
   const otherQ = new URLSearchParams(u.searchParams); otherQ.delete('m')
   const suffix = otherQ.toString() ? '?' + otherQ.toString() : ''
   const routes = MISSAV.routes.length ? MISSAV.routes : MISSAV_FALLBACK_ROUTES
-  const ordered = [mirror, ...routes].filter(Boolean).filter((x, i, a) => a.indexOf(x) === i)
+  const ordered = [mirror, ...routes].filter(Boolean).filter((x, i, a) => a.indexOf(x) === i).slice(0, 4)
+  /* CDN 防盗链策略组合拳（域名还会轮换）：有的 CDN 带镜像 referer 才给真 m3u8，
+   * 有的反而只给无 referer 放行，还有的直接 403。逐镜像 ×「带/不带 referer」组合尝试，
+   * 每次结果都用 #EXTM3U 验货，假货（JPEG 诱饵）就换下一组合。 */
+  const attempts = []
+  for (const site of ordered) attempts.push({ site, ref: true }, { site, ref: false })
   let idx = 0
   const tryRoute = () => {
-    if (idx >= ordered.length || idx >= 4) { if (!res.headersSent) { res.writeHead(502) } return res.end('missav relay failed') }
-    const site = ordered[idx++]
-    const upstream = site + '/jmpres/surrit.com/' + uuid + rest + suffix
-    mvStreamUpstream(upstream, site, isPlaylist, res, (err, buf) => {
-      if (buf) {   // m3u8 内容拿到但需要重写——先验货：CDN 防盗链会把无 referer/风控请求引到 JPEG 诱饵图
+    if (idx >= attempts.length) { if (!res.headersSent) { res.writeHead(502) } return res.end('missav relay failed') }
+    const att = attempts[idx++]
+    const upstream = att.site + '/jmpres/surrit.com/' + uuid + rest + suffix
+    mvStreamUpstream(upstream, att, isPlaylist, res, (err, buf) => {
+      if (buf) {   // m3u8 内容拿到但需要重写——先验货：CDN 防盗链会把请求引到 JPEG 诱饵图
         const text0 = Buffer.concat(buf).toString('utf8')
-        if (!/^\uFEFF?\s*#EXTM3U/.test(text0)) { mvNote(site, false); return tryRoute() }
-        mvNote(site, true)
+        if (!/^\uFEFF?\s*#EXTM3U/.test(text0)) { mvNote(att.site, false); return tryRoute() }
+        mvNote(att.site, true)
         const baseDir = rest.replace(/[^/]*$/, '')
-        const out = missavRewriteM3U8(text0, uuid, baseDir, site)
+        const out = missavRewriteM3U8(text0, uuid, baseDir, att.site)
         res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' })
         return res.end(out)
       }
-      mvNote(site, false)
+      mvNote(att.site, false)
       tryRoute()
     }, uuid)
   }
@@ -6158,42 +6179,42 @@ function missavRewriteM3U8(text, uuid, baseDir, site) {
     return '/api/missav/hls/' + uuid + pth + q + (q ? '&' : '?') + 'm=' + encodeURIComponent(site)
   }).join('\n')
 }
-/* 上游取流：m3u8 走 302 跟随后缓冲（交给回调重写），分片直接管道 */
-function mvStreamUpstream(url, site, isPlaylist, res, onDone, uuid) {
-  const hdrs = { 'user-agent': MISSAV_UA, referer: site + '/', accept: '*/*' }
-  mvFollowGet(url, hdrs, (err, rs, finalUrl) => {
-    if (err) return onDone(err, null)
-    if (rs.statusCode !== 200) { rs.resume(); return onDone(new Error('HTTP ' + rs.statusCode), null) }
-    if (!isPlaylist) {
-      const hh = { 'Content-Type': rs.headers['content-type'] || 'video/mp2t', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }
-      if (rs.headers['content-length']) hh['Content-Length'] = rs.headers['content-length']
-      if (rs.headers['accept-ranges']) hh['Accept-Ranges'] = rs.headers['accept-ranges']
-      if (rs.headers['content-range']) hh['Content-Range'] = rs.headers['content-range']
-      res.writeHead(rs.statusCode === 206 ? 206 : 200, hh)
-      rs.pipe(res)
-      return
+/* 上游取流：m3u8 走 302 跟随后缓冲（交给回调重写），分片直接管道。
+ * 同 mvOnce：必须用 fetch（undici），https.get 会被 CDN 403。
+ * referer 必须保留（镜像站 referer 是 CDN 防盗链白名单，不带会收到 JPEG 诱饵图）。 */
+function mvStreamUpstream(url, att, isPlaylist, res, onDone, uuid) {
+  const site = att.site
+  const hdrs = { 'user-agent': MISSAV_UA, accept: '*/*' }
+  if (att.ref !== false) hdrs.referer = site + '/'   // 带/不带 referer 两种组合都试（见 missavHlsReq）
+  const deadline = isPlaylist ? 25000 : 120000   // 分片可能几 MB，给足墙钟；m3u8 快速失败
+  ;(async () => {
+    let cur = url
+    for (let hop = 0; hop <= 5; hop++) {
+      let rs
+      try { rs = await fetch(cur, { headers: hdrs, redirect: 'manual', signal: AbortSignal.timeout(deadline) }) }
+      catch (e) { return onDone(e, null) }
+      if ([301, 302, 303, 307, 308].includes(rs.status) && rs.headers.get('location')) {
+        try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+        cur = new URL(rs.headers.get('location'), cur).href
+        continue
+      }
+      if (rs.status !== 200) { try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {} return onDone(new Error('HTTP ' + rs.status), null) }
+      if (!isPlaylist) {
+        const hh = { 'Content-Type': rs.headers.get('content-type') || 'video/mp2t', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }
+        if (rs.headers.get('content-length')) hh['Content-Length'] = rs.headers.get('content-length')
+        if (rs.headers.get('accept-ranges')) hh['Accept-Ranges'] = rs.headers.get('accept-ranges')
+        if (rs.headers.get('content-range')) hh['Content-Range'] = rs.headers.get('content-range')
+        res.writeHead(rs.status === 206 ? 206 : 200, hh)
+        require('stream').Readable.fromWeb(rs.body).pipe(res)
+        return
+      }
+      const chunks = []
+      try { for await (const c of rs.body) chunks.push(Buffer.from(c)) }
+      catch (e) { return onDone(e, null) }
+      return onDone(null, chunks)
     }
-    const chunks = []
-    rs.on('data', c => chunks.push(c))
-    rs.on('error', e => onDone(e, null))
-    rs.on('end', () => onDone(null, chunks))
-  })
-}
-/* https.get + 手动跟随 302（jmpres → 国内 CDN）。
- * 注意 referer 必须保留：CDN（vcsheaye.cc 等）以镜像站 referer 做防盗链白名单，
- * 带 referer 返回真 m3u8，不带会返回 JPEG 诱饵图（所以这里不能学浏览器跨域剥离）。 */
-function mvFollowGet(url, hdrs, cb, hop = 0) {
-  if (hop > 5) return cb(new Error('重定向次数过多'))
-  const uu = new URL(url)
-  const req = https.get(uu, { headers: hdrs, timeout: 25000 }, rs => {
-    if ([301, 302, 303, 307, 308].includes(rs.statusCode) && rs.headers.location) {
-      rs.resume()
-      return mvFollowGet(new URL(rs.headers.location, uu).href, hdrs, cb, hop + 1)
-    }
-    cb(null, rs, url)
-  })
-  req.on('error', e => cb(e))
-  req.on('timeout', () => req.destroy(new Error('timeout')))
+    return onDone(new Error('重定向次数过多'), null)
+  })()
 }
 
 const server = http.createServer((req, res) => {
