@@ -7560,6 +7560,7 @@ document.addEventListener('click', e => {
 })
 window.playMissavOnline = async function (code) {
   if (!code) return
+  /* 先解析线路，成功后直接进主播放器（mountPlayer，hls:// 源），获得全套自制控件 */
   let wrap = document.getElementById('mavWrap')
   if (wrap) wrap.remove()
   wrap = document.createElement('div')
@@ -7572,16 +7573,16 @@ window.playMissavOnline = async function (code) {
       <span style="flex:1"></span>
       <button id="mavClose" style="all:unset;cursor:pointer;color:#fff;font-size:20px;padding:4px 10px;border-radius:8px;background:rgba(255,255,255,.12)">✕</button>
     </div>
-    <video id="mavVideo" controls autoplay playsinline style="max-width:94vw;max-height:78vh;background:#000;border-radius:10px"></video>
-    <div style="display:flex;gap:8px;align-items:center;color:#fff" id="mavBar">
+    <div id="mavHost" style="position:relative;width:min(94vw,1400px);max-height:80vh;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden"></div>
+    <div style="display:flex;gap:8px;align-items:center;color:#fff">
       <span id="mavStatus" style="opacity:.8;font-size:13px">正在解析线路…</span>
       <span style="flex:1"></span>
-      <span id="mavLevels" style="display:flex;gap:6px"></span>
-    </div>
-    <div id="mavFallback" style="display:flex;gap:8px"></div>`
+      <span id="mavFallback" style="display:flex;gap:8px"></span>
+    </div>`
   document.body.appendChild(wrap)
   const $ = id => document.getElementById(id)
-  $('mavClose').onclick = () => { try { if (window._mavHls) { window._mavHls.destroy(); window._mavHls = null } } catch (_) {} $('mavVideo').pause && $('mavVideo').pause(); wrap.remove() }
+  const closeAll = () => { try { unmountPlayer() } catch (_) {} ; try { $('mavVideo') && $('mavVideo').pause() } catch (_) {} ; wrap.remove() }
+  $('mavClose').onclick = closeAll
   const esc = s => String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]))
   const failChip = (n, u) => { const a = document.createElement('a'); a.href = u; a.target = '_blank'; a.rel = 'noopener'; a.textContent = n; a.style.cssText = 'color:#9ecbff;font-size:13px;text-decoration:underline'; $('mavFallback').appendChild(a) }
   let r
@@ -7593,33 +7594,11 @@ window.playMissavOnline = async function (code) {
     failChip('去 Jable', 'https://jable.tv/videos/' + code.toLowerCase() + '/')
     return
   }
+  if (!document.getElementById('mavWrap')) return
   $('mavSite').textContent = r.site
-  const video = $('mavVideo')
-  const master = r.master
-  const buildLevels = hls => {
-    const box = $('mavLevels'); box.innerHTML = ''
-    const mk = (label, lv) => {
-      const b = document.createElement('button')
-      b.textContent = label
-      b.style.cssText = 'all:unset;cursor:pointer;padding:3px 10px;border-radius:999px;background:rgba(255,255,255,.14);font-size:12px'
-      b.onclick = () => { hls.currentLevel = lv; [...box.children].forEach(x => x.style.background = 'rgba(255,255,255,.14)'); b.style.background = 'var(--accent,#e0526d)' }
-      box.appendChild(b)
-    }
-    mk('自动', -1)
-    hls.levels.forEach((lv, i) => mk((lv.height || Math.round((lv.bitrate || 0) / 1000)) + 'p', i))
-  }
-  if (window.Hls && window.Hls.isSupported()) {
-    const hls = new window.Hls({ maxBufferLength: 30, manifestLoadingTimeOut: 25000, manifestLoadingMaxRetry: 2 })
-    window._mavHls = hls
-    hls.on(window.Hls.Events.MANIFEST_PARSED, (_, data) => { $('mavStatus').textContent = ''; buildLevels(hls) })
-    hls.on(window.Hls.Events.ERROR, (_, d) => { if (d.fatal) $('mavStatus').textContent = '播放失败：' + d.details + '（可稍后重试或用下方外链）' })
-    hls.loadSource(master)
-    hls.attachMedia(video)
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = master
-  } else {
-    $('mavStatus').textContent = '当前浏览器不支持 HLS 播放'
-  }
+  $('mavStatus').textContent = ''
+  mountPlayer('hls://' + r.master, 'missav:' + code, [], $('mavHost'))
+  PLAYER.onClose = closeAll
 }
 /* 无海报的本地影片：打开详情页时后台静默刮一次（海报/主图/元数据统一进离线数据） */
 let _AUTO_SCRAPE = new Set()
@@ -10736,7 +10715,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
   const host = embedEl || document.getElementById('mHero')
   host.innerHTML = `
     <div class="vwrap${embedEl ? ' embed' : ''}" id="vWrap">
-      <video id="mVideo" src="${src}" autoplay playsinline preload="metadata"></video>
+      <video id="mVideo" ${/^hls:\/\//.test(src) ? '' : `src="${src}"`} autoplay playsinline preload="metadata"></video>
       <div class="vshade" id="vShade"></div>
       <div class="vbig" id="vBig">▶</div>
       <div class="vcc" id="vCC">
@@ -10756,6 +10735,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
             <span class="vvol-slider"><input type="range" id="vVolR" min="0" max="1" step="0.01" value="${savedVol}"></span>
           </span>
           <div class="vctl-right">
+            <button class="vpbtn" id="vLevelBtn" title="清晰度" style="display:none">画质</button>
             <button class="vpbtn" id="vSpeedBtn" title="倍速（长按画面 3 倍速）">1x</button>
             <button class="vpbtn" id="vSubBtn" title="字幕" style="display:none">${PICONS.cc}</button>
             <button class="vpbtn" id="vAbBtn" title="A-B 循环：点一次设 A 点，再点设 B 点，再点取消">A-B</button>
@@ -10774,7 +10754,36 @@ function mountPlayer(src, key, nextQueue, embedEl) {
   PLAYER = { key: k, v, next: (nextQueue || []).slice(), sent: 0, done, toastT: null, idleT: null, holdT: null,
     ab: { a: null, b: null }, brightness: 1, subs: [], wtAcc: 0, lastTick: 0, pv: null,
     name: (k.split('/').pop() || 'video').replace(/\.[^.]+$/, '') }
-  if (embedEl) { PLAYER.embed = true; document.getElementById('vClose').addEventListener('click', () => closeModal()) }
+  /* 在线源（hls:// 前缀，如 MissAV 中转流）：不走本地文件的预览缩略图/观影进度上报 */
+  const isHls = /^hls:\/\//.test(src)
+  if (isHls) PLAYER.online = true
+  if (isHls) {
+    const hlsUrl = src.replace(/^hls:\/\//, '')
+    if (window.Hls && window.Hls.isSupported()) {
+      const hls = new window.Hls({ maxBufferLength: 30, manifestLoadingTimeOut: 25000, manifestLoadingMaxRetry: 2 })
+      PLAYER.hls = hls
+      try { window._mavHls = hls } catch (_) {}
+      hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+        if (!PLAYER || PLAYER.v !== v) return
+        const b = document.getElementById('vLevelBtn')
+        if (b && hls.levels && hls.levels.length > 1) b.style.display = ''
+        try { v.play() } catch (_) {}
+        updatePlayerUI()
+      })
+      hls.on(window.Hls.Events.ERROR, (_, d) => {
+        if (d && d.fatal && PLAYER && PLAYER.v === v) playToast('在线线路出错：' + d.details + '<button onclick="location.reload()">刷新重试</button>', 6000)
+      })
+      hls.loadSource(hlsUrl)
+      hls.attachMedia(v)
+    } else {
+      /* Safari 原生 HLS / 其他 */
+      try { v.src = hlsUrl } catch (_) {}
+    }
+  } else {
+    try { v.src = src } catch (_) {}
+  }
+  if (PLAYER.online) { const vm = document.getElementById('vMark'); if (vm) vm.style.display = 'none' }
+  if (embedEl) { PLAYER.embed = true; document.getElementById('vClose').addEventListener('click', () => PLAYER && PLAYER.onClose ? PLAYER.onClose() : closeModal()) }
   /* 倍速 / 音量要记忆：注意 Chrome 在媒体资源装载完成时会把 playbackRate 重置回 1，
    * 所以除了创建时设一次，loadedmetadata 里还要再套一遍（否则记忆的倍速会丢）。 */
   try { v.defaultPlaybackRate = spd; v.playbackRate = spd; v.volume = savedVol } catch (_) {}
@@ -10809,7 +10818,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
     PLAYER.sent = now
     const wt = Math.round(PLAYER.wtAcc)
     if (wt > 0) PLAYER.wtAcc -= wt
-    watchReport(k, v.currentTime, v.duration || 0, wt)
+    if (!PLAYER.online) watchReport(k, v.currentTime, v.duration || 0, wt)
   })
   v.addEventListener('progress', updateBufUI)
   v.addEventListener('ratechange', () => {
@@ -10834,6 +10843,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
   document.getElementById('vMute').onclick = () => { v.muted = !v.muted }
   document.getElementById('vVolR').oninput = e => { try { v.muted = false; v.volume = parseFloat(e.target.value) } catch (_) {} }
   document.getElementById('vSpeedBtn').onclick = () => openVMenu('speed')
+  const lvlBtn = document.getElementById('vLevelBtn'); if (lvlBtn) lvlBtn.onclick = () => openVMenu('level')
   document.getElementById('vSubBtn').onclick = () => openVMenu('sub')
   document.getElementById('vAbBtn').onclick = abPress
   document.getElementById('vShotBtn').onclick = playerShot
@@ -10856,8 +10866,8 @@ function mountPlayer(src, key, nextQueue, embedEl) {
     const tip = document.getElementById('vTip')
     tip.style.left = (p * 100) + '%'
     tip.textContent = fmtClock(p * (v.duration || 0))
-    /* 缩略图预览：懒生成（首次悬停才排 ffmpeg 抽帧任务，之后每 3s 查一次进度） */
-    if (!PLAYER.pv || (PLAYER.pv.status !== 'done' && Date.now() - (PLAYER.pv.at || 0) > 3000)) {
+    /* 缩略图预览：懒生成（首次悬停才排 ffmpeg 抽帧任务，之后每 3s 查一次进度）；在线源没有本地文件，跳过 */
+    if (!PLAYER.online && (!PLAYER.pv || (PLAYER.pv.status !== 'done' && Date.now() - (PLAYER.pv.at || 0) > 3000))) {
       PLAYER.pv = PLAYER.pv || { status: 'queued' }
       PLAYER.pv.at = Date.now()
       fetch('api/preview?rel=' + encodeURIComponent(k)).then(r => r.json()).then(d => { if (PLAYER) { PLAYER.pv = Object.assign({ at: Date.now() }, d) } }).catch(() => {})
@@ -11002,6 +11012,12 @@ function openVMenu(kind) {
     const curIntro = (WATCHDB[PLAYER.key] && WATCHDB[PLAYER.key].intro) || 0
     html += `<button data-intro="set">记住片头结束点（当前 ${fmtClock(PLAYER.v.currentTime)}）</button>`
     if (curIntro > 0) html += `<button data-intro="clear">清除片头记忆（${fmtClock(curIntro)}）</button>`
+  } else if (kind === 'level') {
+    const hls = PLAYER.hls
+    const lvls = (hls && hls.levels) || []
+    html = '<div class="vm-h">清晰度</div>' +
+      `<button data-lvl="-1" class="${hls && hls.currentLevel === -1 ? 'cur' : ''}"><span>自动</span></button>` +
+      lvls.map((lv, i) => `<button data-lvl="${i}" class="${hls && hls.currentLevel === i ? 'cur' : ''}"><span>${lv.height || Math.round((lv.bitrate || 0) / 1000) + 'k'}</span>${Math.round((lv.bitrate || 0) / 1000) + ' kbps'}</button>`).join('')
   } else if (kind === 'queue') {
     html = '<div class="vm-h">播放队列（手动加入的先播，再接自动连播）</div>'
     html += QUEUE.length
@@ -11017,6 +11033,9 @@ function openVMenu(kind) {
   menu.classList.add('on')
   menu.querySelectorAll('button').forEach(b => b.onclick = e => {
     if (b.dataset.sp !== undefined) { try { PLAYER.v.playbackRate = parseFloat(b.dataset.sp) } catch (_) {} playToast('播放速度 ' + b.dataset.sp + 'x', 1500) }
+    else if (b.dataset.lvl !== undefined) {
+      if (PLAYER.hls) { try { PLAYER.hls.currentLevel = parseInt(b.dataset.lvl) } catch (_) {} playToast('清晰度：' + (parseInt(b.dataset.lvl) < 0 ? '自动' : PLAYER.hls.levels[parseInt(b.dataset.lvl)].height + 'p'), 1600) }
+    }
     else if (b.dataset.intro !== undefined) {
       if (b.dataset.intro === 'set') {
         const t = PLAYER.v.currentTime
@@ -11204,6 +11223,7 @@ function playerKeys(e) {
 }
 function unmountPlayer() {
   if (!PLAYER) return
+  try { if (PLAYER.hls) { PLAYER.hls.destroy(); window._mavHls = null } } catch (_) {}
   try { clearTimeout(PLAYER.toastT); clearTimeout(PLAYER.idleT); clearTimeout(PLAYER.holdT); clearTimeout(PLAYER.singleT) } catch (_) {}
   document.removeEventListener('keydown', playerKeys)
   PLAYER = null
