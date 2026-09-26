@@ -18,7 +18,7 @@ try {
   } else {
     sh('git -c http.proxy=' + PROXY + ' pull --rebase origin main || git pull --rebase origin main', CLONE)
   }
-  fs.copyFileSync(SRC, path.join(CLONE, 'roster.json'))
+  fs.copyFileSync(SRC, path.join(CLONE, 'relay', 'roster.json'))
   sh('git add roster.json', CLONE)
   let pushed = false
   try {
