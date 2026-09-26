@@ -1181,14 +1181,29 @@ function seedSamples() {
     const dst = path.join(cacheDir(), 'movies')
     let cur = []
     try { cur = fs.readdirSync(dst).filter(n => !n.startsWith('.')) } catch (_) {}
-    if (cur.length) return
-    fs.mkdirSync(dst, { recursive: true })
-    let n = 0
-    for (const d of fs.readdirSync(src)) {
-      if (d.startsWith('.')) continue
-      try { fs.cpSync(path.join(src, d), path.join(dst, d), { recursive: true }); n++ } catch (_) {}
+    const verOf = dir => { try { return parseInt(fs.readFileSync(path.join(dir, 'SEED_VER'), 'utf8').trim(), 10) || 0 } catch (_) { return 0 } }
+    const sVer = verOf(path.join(UI_ROOT, 'sample-cache'))
+    let dVer = verOf(cacheDir())
+    if (!cur.length) {   // 首次：整包拷进去
+      fs.mkdirSync(dst, { recursive: true })
+      let n = 0
+      for (const d of fs.readdirSync(src)) {
+        if (d.startsWith('.')) continue
+        try { fs.cpSync(path.join(src, d), path.join(dst, d), { recursive: true }); n++ } catch (_) {}
+      }
+      try { fs.writeFileSync(path.join(cacheDir(), 'SEED_VER'), String(sVer)) } catch (_) {}
+      if (n) console.log('[seed] 首次运行：已载入 ' + n + ' 部示例影片到离线缓存（配置媒体库后自动让位）')
+      return
     }
-    if (n) console.log('[seed] 首次运行：已载入 ' + n + ' 部示例影片到离线缓存（配置媒体库后自动让位）')
+    if (sVer > dVer) {   // 老用户升级：只刷新示例影片的图片（海报/大图换高清），不碰 meta 和真实影片
+      let n = 0
+      for (const d of fs.readdirSync(src)) {
+        if (d.startsWith('.') || !cur.includes(d)) continue
+        try { fs.cpSync(path.join(src, d, 'images'), path.join(dst, d, 'images'), { recursive: true }); n++ } catch (_) {}
+      }
+      try { fs.writeFileSync(path.join(cacheDir(), 'SEED_VER'), String(sVer)) } catch (_) {}
+      if (n) console.log('[seed] 示例资源升级 v' + sVer + '：刷新 ' + n + ' 部示例图片')
+    }
   } catch (e) { console.log('[seed] 示例数据载入失败：' + e.message) }
 }
 seedSamples()
