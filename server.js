@@ -70,13 +70,41 @@ const mountTip = () => '只能整理已挂载进容器的目录（当前可见�
  * 挂载点只是访问权限，与 Emby 一样：不添加媒体文件夹就不扫描、没有媒体库。
  * 列表完全由设置页添加/移除驱动，落盘 libraries 字段（可为空数组）。 */
 const CFG_FILE = path.join(UI_ROOT, 'server-config.json')
-let CFG = (() => { try { return JSON.parse(fs.readFileSync(CFG_FILE, 'utf8')) } catch (_) { return {} } })()
+/* 配置防丢：server-config.json 在容器层，重建容器就没了（token/媒体库/收藏全丢）。
+ * 每次落盘时同步备份一份到持久化目录（JP_CACHE 挂载点 / cacheDir / ./cache），
+ * 启动时若主配置读不到（新容器首次启动），自动从备份找回。 */
+function cfgBackupFile() {
+  const root = process.env.JP_CACHE || (typeof CFG === 'object' && CFG && CFG.cacheDir) || path.join(UI_ROOT, 'cache')
+  return path.resolve(root, 'server-config.backup.json')
+}
+let CFG = (() => {
+  let txt = ''
+  try { txt = fs.readFileSync(CFG_FILE, 'utf8') } catch (_) {}
+  if (!txt.trim()) {
+    /* 主配置缺失/为空 → 尝试持久化备份（只认 JP_CACHE 与程序目录，此时 CFG 还没加载） */
+    for (const root of [process.env.JP_CACHE, path.join(UI_ROOT, 'cache')].filter(Boolean)) {
+      try {
+        txt = fs.readFileSync(path.resolve(root, 'server-config.backup.json'), 'utf8')
+        fs.writeFileSync(CFG_FILE, txt)
+        console.log('[config] 主配置缺失，已从缓存目录备份找回 server-config.json')
+        break
+      } catch (_) { txt = '' }
+    }
+  }
+  try { return JSON.parse(txt) } catch (_) { return {} }
+})()
 let LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
 function writeCfg() {
   const out = Object.assign({}, CFG, { libraries: LIBS })
   const t = CFG_FILE + '.tmp'
   fs.writeFileSync(t, JSON.stringify(out, null, 2))
   fs.renameSync(t, CFG_FILE)
+  /* 同步备份到持久化目录（失败不影响主流程） */
+  try {
+    const bk = cfgBackupFile()
+    fs.mkdirSync(path.dirname(bk), { recursive: true })
+    fs.writeFileSync(bk, JSON.stringify(out, null, 2))
+  } catch (_) {}
 }
 /* 线上刮削缓存根目录（设置页可改）：cache/movies/<番号>/meta.json · cache/actors/*.jpg */
 /* 缓存根目录定位：
