@@ -6787,8 +6787,10 @@ function renderActorDetail(name) {
   // 原图大图（本地头像文件即 minnano 原图，点击灯箱看原图）+ 刮削按钮（仅内置名册记录可编辑）
   const canEdit = a.idx != null
   AC_CUR = canEdit ? a : null
+  /* 大图必须带 ?v= 版本号：换头像后路径不变，而这个地址在本地文件出现前可能被
+   * 「在线兜底」以 24h 强缓存下发过——不带版本号浏览器会一直用旧缓存（小头像正常、大图不更新的根因） */
   const heroImg = a.icon
-    ? `<div class="ac-heroimg" title="点击查看原图" onclick="acLightbox('${a.icon}')"><img src="${a.icon}" alt="" onerror="this.remove()"></div>`
+    ? `<div class="ac-heroimg" title="点击查看原图" onclick="acLightbox('${a.icon}${avaVer()}')"><img src="${a.icon}${avaVer()}" alt="" onerror="this.remove()"></div>`
     : acAvatar(a)
   const scrapeBtn = canEdit ? `<button class="ac-scrape" onclick="acScrapeOpen()" title="刮削编辑头像与资料">✎ 刮削</button>` : ''
   const syncBtn = `<button class="ac-scrape" onclick="acSyncNow('${encodeURIComponent(a.name)}',${a.idx == null ? -1 : a.idx},this)" title="按 minnano 最新资料核对该女优：有新资料 / 改名 / 缺头像就直接更新">⟳ 识别刮削</button>`
@@ -6870,7 +6872,7 @@ window.acScrapeOpen = function () {
     <div class="acm-head"><h3>刮削编辑 · ${a.name}</h3><button onclick="acScrapeClose()" title="关闭">×</button></div>
     <div class="acm-body">
       <div class="acm-left">
-        <div class="acm-ava" id="acmAva">${a.icon ? `<img src="${a.icon}">` : (a.name || '?')[0]}</div>
+        <div class="acm-ava" id="acmAva">${a.icon ? `<img src="${a.icon}${avaVer()}">` : (a.name || '?')[0]}</div>
         <div class="acm-avabtns">
           <button onclick="acScrapeProbe()">⇅ 聚合刮削（资料 + 头像候选）</button>
           <button onclick="document.getElementById('acmFile').click()">⬆ 上传本地图片</button>
@@ -7070,14 +7072,15 @@ window.acScrapeSave = async function () {
     })
     const j = await r.json()
     if (!j.ok) { st.textContent = j.error || '保存失败'; return }
-    window.acTip(ACM_STATE.iconData || ACM_STATE.iconPath
-      ? '已保存：新头像 + 文字资料，页面即将刷新'
-      : '已保存文字资料（未改头像），页面即将刷新', 2500)
-    if (ACM_STATE.iconData || ACM_STATE.iconPath) { try { localStorage.avaEpoch = Date.now() } catch (_) {} }
+    const changedAva = !!(ACM_STATE.iconData || ACM_STATE.iconPath)
+    if (changedAva) { try { localStorage.avaEpoch = Date.now() } catch (_) {} }
+    window.acTip(changedAva ? '已保存：头像已更新' : '已保存文字资料', 2200)
     acScrapeClose()
+    /* 不整页刷新：重拉名册（no-store）→ 置空缓存 → route() 原地重渲染当前女优页，
+     * 头像 URL 带上新 ?v= 立即换图；改名时再顺带跳到新名字 */
+    try { await loadActressData() } catch (_) {}
     const nn = '#/actor/' + encodeURIComponent(j.name || a.name)
     if (location.hash !== nn) location.hash = nn
-    setTimeout(() => location.reload(), 600)
   } catch (e) { st.textContent = '保存失败：' + e.message }
 }
 
@@ -8971,7 +8974,7 @@ function renderFavs() {
       const a = favActorObj(n)
       const cnt = (a.films || []).length
       return `<div class="fav-acard" onclick="location.hash='#/actor/${encodeURIComponent(n)}'">
-        <div class="fav-apic">${a.icon ? `<img loading="lazy" decoding="async" src="${a.icon}" alt="" onerror="this.remove()">` : `<span>${libEsc(n[0] || '?')}</span>`}</div>
+        <div class="fav-apic">${a.icon ? `<img loading="lazy" decoding="async" src="${a.icon}${avaVer()}" alt="" onerror="this.remove()">` : `<span>${libEsc(n[0] || '?')}</span>`}</div>
         <div class="fav-ameta"><b>${libEsc(n)}</b><em>${cnt ? cnt + ' 部在库' : '库里暂无作品'}${a.cup ? ' · ' + String(a.cup).toUpperCase() + ' 罩杯' : ''}</em></div>
         <button class="fav-ax" title="取消收藏" onclick="event.stopPropagation();toggleFavActor('${libEsc(n)}',null);renderFavs()">✕</button>
       </div>`

@@ -6656,10 +6656,13 @@ const server = http.createServer((req, res) => {
       try { if (fs.statSync(cached).isFile()) return sendFile(req, res, cached) } catch (_) {}
       avatarOnline(fname.replace(/\.(jpe?g|png|webp)$/i, '')).then(b => {
         /* 404 也让浏览器缓存 30 分钟：前端几十个头像请求 miss 时不反复打回来，
-         * 否则每次翻页/刷新都重试在线链，页面资源队列被拖慢 */
+         * 否则每次翻页/刷新都重试在线链，页面资源队列被拖慢。
+         * 在线兜底的 200 只给 1h 强缓存（曾经 24h）：本地文件落盘前，浏览器会拿这个
+         * 无版本号的 URL 强缓存住，之后用户换头像（路径不变）会一直显示旧图——
+         * 前端详情页大图已补 ?v= 版本号兜住主路径，这里再降级缩短残留窗口 */
         if (!b) { res.writeHead(404, { 'Cache-Control': 'public, max-age=1800' }); return res.end('Not Found') }
         const ct = /\.png$/i.test(p) ? 'image/png' : (/\.webp$/i.test(p) ? 'image/webp' : 'image/jpeg')
-        res.writeHead(200, { 'content-type': ct, 'cache-control': 'public, max-age=86400' })
+        res.writeHead(200, { 'content-type': ct, 'cache-control': 'public, max-age=3600' })
         res.end(b)
       }).catch(() => { try { res.writeHead(404); res.end('Not Found') } catch (_) {} })
       return
