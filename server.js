@@ -1429,6 +1429,17 @@ function parseMinnanoProfile(html) {
     if (n) tags.push([m[1], n])
   }
   const img = (html.match(/src="(?:\/)?(p_actress[^"]+?\.jpg)/) || [])[1] || ''
+  /* 「○○をチェックした人が見ている女優」→ rel（10 人，与 tools/minnano-sync.js 同口径） */
+  const rel = []
+  const ri = html.indexOf('をチェックした人が見ている女優')
+  if (ri > -1) {
+    const seg = html.slice(ri, ri + 6000)
+    for (const m of seg.matchAll(/href="(?:\/)?actress(\d+)\.html">\s*<img[^>]*title="([^"]*)"/g)) {
+      const n = mnDec(m[2])
+      if (n && !rel.some(x => x.id === m[1])) rel.push({ id: m[1], name: n })
+      if (rel.length >= 10) break
+    }
+  }
   return {
     canon, birthday,
     height: (size.match(/T(\d+)/) || [])[1] || '',
@@ -1438,10 +1449,11 @@ function parseMinnanoProfile(html) {
     hip: (size.match(/H(\d+)/) || [])[1] || '',
     shoe: (size.match(/S([\d.]+)/) || [])[1] || '',
     blood: kv['血液型'] || '', place: kv['出身地'] || '', hobby: kv['趣味・特技'] || '',
-    period: kv['AV出演期间'] || '', debut: kv['デビュー作品'] || '',
-    agency: kv['所属事务所'] || '', blog: kv['ブログ'] || '',
+    /* 站点是日文「期間」，旧写法「期间」永远匹配不上 → 两个键都认 */
+    period: kv['AV出演期間'] || kv['AV出演期间'] || '', debut: kv['デビュー作品'] || '',
+    agency: kv['所属事务所'] || kv['所属事務所'] || '', blog: kv['ブログ'] || '',
     avatarUrl: img ? MN_BASE + img : '',
-    alias: alias.filter(Boolean), tags
+    alias: alias.filter(Boolean), tags, rel
   }
 }
 
@@ -4707,6 +4719,108 @@ async function handleActorApi(req, res, p) {
     }
     return json(res, { ok: true, profile: prof || {}, icon })
   }
+  /* 女优详情页「识别刮削」：按 minnano 现况核对单人资料，有变化（含改名识别）直接写回名册。
+   * 与每日同步脚本同一套解析/改名口径；头像只在本地没有时补 —— 铁律：统一暂存 cache/actor-cand/，不直接写 actresses/。
+   * body: { name, idx }（idx 越界 = 附加名册/媒体库孤儿 → 按名在附加名册里找，没有就建档）。 */
+  if (p === '/api/actor/sync') {
+    try {
+      const nm = String(body.name || '').trim()
+      if (!nm) return json(res, { ok: false, error: '缺少女优名' })
+      const idx = body.idx | 0
+      let list = []
+      try { list = JSON.parse(fs.readFileSync(ROSTER, 'utf8')) } catch (_) {}
+      let rec = null, local = false, exList = null, created = false
+      if (idx >= 0 && idx < list.length && list[idx] && list[idx].name === nm) {
+        rec = list[idx]
+      } else {
+        exList = readExtraRoster()
+        rec = exList.find(r => r.name === nm) || null
+        local = true
+        if (!rec) {
+          /* 名册里没有（媒体库解析出的孤儿女优）→ 建附加名册档 */
+          created = true
+          rec = { uid: 'local', lid: 'lo' + require('crypto').createHash('sha1').update(nm).digest('hex').slice(0, 12), name: nm, videoCount: 0 }
+        }
+      }
+      /* 定位 mnid：记录里有 → 直接用；没有 → 按名搜索（唯一命中或名字/别名精确匹配才认） */
+      let mnid = String(rec.mnid || '').replace(/\D/g, '')
+      if (!mnid) {
+        const s = await mnSearchActress(rec.name)
+        const cand = s.exact || (((s.list || []).find(x => x.name === rec.name || (Array.isArray(rec.alias) && rec.alias.includes(x.name))) || {}).mnid || '')
+        if (!cand) return json(res, { ok: false, error: 'minnano 搜不到该女优（同名多人时请用「✎ 刮削」手动选）' })
+        mnid = String(cand)
+      }
+      const pr = await mnGetFollow(MN_BASE + 'actress' + mnid + '.html', false)
+      if (!pr || !pr.body) return json(res, { ok: false, error: 'minnano 资料页抓取失败（该站需代理，检查设置里的代理配置）' })
+      const prof = parseMinnanoProfile(pr.body)
+      if (!prof || (!prof.canon && !prof.height && !prof.birthday)) return json(res, { ok: false, error: '资料页解析失败（页面结构可能变了）' })
+      /* 与前端/同步脚本 acNorm 同口径：全角→半角、片假名→平假名、去空白，避免「リマ/りま」这类误判改名 */
+      const cnorm = s => String(s || '')
+        .replace(/[\uFF01-\uFF5E]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, ' ')
+        .replace(/[\u30A1-\u30F6\u31F0-\u31FF]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
+        .replace(/[^\u3040-\u30FF\u4E00-\u9FFF\u3400-\u4DBFa-z0-9]/gi, '')
+        .toLowerCase()
+      const patch = {}
+      const changes = []
+      let renamed = null
+      /* 改名识别：同 mnid 但站点现用名不同 → 更名 + 旧名进别名（与每日同步同口径，否则按新名查详情会扑空） */
+      if (prof.canon && cnorm(prof.canon) !== cnorm(rec.name)) {
+        renamed = { from: rec.name, to: prof.canon }
+        patch.name = prof.canon
+        patch.name_ja = prof.canon
+        patch.alias = Array.from(new Set([].concat(rec.alias || [], [rec.name], prof.alias || [])))
+        changes.push('改名 ' + rec.name + ' → ' + prof.canon)
+      } else if (prof.alias && prof.alias.length) {
+        const merged = Array.from(new Set([].concat(rec.alias || [], prof.alias))).filter(x => x && x !== rec.name)
+        if (merged.length !== (rec.alias || []).length) { patch.alias = merged; changes.push('别名') }
+      }
+      const cmv = v => (v ? String(v).replace(/cm$/i, '') + 'cm' : '')
+      const put = (k, v, lab) => { if (v && String(v) !== String(rec[k] == null ? '' : rec[k])) { patch[k] = v; changes.push(lab) } }
+      put('birthday', prof.birthday, '生年月日')
+      put('height', cmv(prof.height), '身高')
+      put('breast', cmv(prof.bust), '胸围')
+      put('cup', prof.cup, '罩杯')
+      put('waist', cmv(prof.waist), '腰围')
+      put('hip', cmv(prof.hip), '臀围')
+      put('shoe', cmv(prof.shoe), '鞋码')
+      put('blood', prof.blood, '血型')
+      put('place', prof.place, '出身地')
+      put('hobby', prof.hobby, '爱好')
+      put('period', prof.period, '出演期间')
+      put('debut', prof.debut, '出道作品')
+      put('agency', prof.agency, '事务所')
+      put('blog', prof.blog, '博客')
+      if (Array.isArray(prof.tags) && prof.tags.length && JSON.stringify(prof.tags) !== JSON.stringify(rec.tags || [])) { patch.tags = prof.tags; changes.push('标签') }
+      if (Array.isArray(prof.rel) && prof.rel.length && JSON.stringify(prof.rel) !== JSON.stringify(rec.rel || [])) { patch.rel = prof.rel; changes.push('相关女优') }
+      if (!rec.msrc) patch.msrc = MN_BASE + 'actress' + mnid + '.html'
+      if (String(rec.mnid || '') !== String(mnid)) { patch.mnid = mnid; if (!created) changes.push('补全档案') }
+      /* 头像：仅本地没有时补 —— 暂存到 cache/actor-cand/（不直接写 actresses/） */
+      if (!rec.icon && prof.avatarUrl) {
+        const buf = await fetchImageBuf(prof.avatarUrl)
+        if (buf && buf.length > 500) {
+          const key = avaKey(rec, mnid)
+          const dir = path.join(cacheDir(), 'actor-cand')
+          fs.mkdirSync(dir, { recursive: true })
+          fs.writeFileSync(path.join(dir, key + '.jpg'), buf)
+          patch.icon = '/cache/actor-cand/' + key + '.jpg'
+          changes.push('头像')
+        }
+      }
+      if (!changes.length && !Object.keys(patch).length) {
+        return json(res, { ok: true, changed: [], renamed: null, created: false })
+      }
+      if (local) {
+        if (created) exList.push(rec)
+        Object.assign(rec, patch)
+        writeExtraRoster(exList)
+      } else {
+        rosterUpdate(idx, nm, r => Object.assign(r, patch))
+      }
+      return json(res, { ok: true, changed: changes, renamed, created })
+    } catch (e) {
+      return json(res, { ok: false, error: e.message })
+    }
+  }
   if (p === '/api/actor/save') {
     try {
       const idx = body.idx | 0
@@ -6311,7 +6425,7 @@ const server = http.createServer((req, res) => {
     if (p === '/api/missav/play') return handleMissavPlay(req, res, u)
     if (p.startsWith('/api/missav/hls/')) return missavHlsReq(res, p, u)
     if (p === '/api/config' || p === '/api/config/test' || p === '/api/prefs' || p === '/api/rank/update' || p === '/api/rank/status' ||
-        p === '/api/actor/scrape' || p === '/api/actor/save' ||
+        p === '/api/actor/scrape' || p === '/api/actor/save' || p === '/api/actor/sync' ||
         p === '/api/actor/probe' || p === '/api/actor/pick-avatar' ||
         p === '/api/library' || p === '/api/library/add' || p === '/api/library/remove' || p === '/api/library/rescan' || p === '/api/lib/hide' ||
         p === '/api/sources' || p === '/api/source/test' ||
