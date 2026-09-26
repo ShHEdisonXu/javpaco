@@ -1235,6 +1235,35 @@ function compressibleType(type) {
   return /text|json|javascript|svg|xml/.test(type)
 }
 
+/* 海报墙缩略图生成（ffmpeg，按需+并发去重+落盘缓存 cache/thumbs/，源图更新自动失效） */
+const THUMB_DIR = () => path.join(cacheDir(), 'thumbs')
+const thumbInFlight = new Map()   // key -> Promise<Buffer|null>
+async function movieThumb(code, kind) {
+  if (!/^[A-Za-z0-9._-]+$/.test(code) || !['poster', 'fanart'].includes(kind)) return null
+  const src = path.join(cacheDir(), 'movies', code, 'images', kind + '.jpg')
+  let st; try { st = fs.statSync(src) } catch (_) { return null }
+  const out = path.join(THUMB_DIR(), code + '-' + kind + '.jpg')
+  try {
+    const ot = fs.statSync(out)
+    if (ot.mtimeMs >= st.mtimeMs) return fs.readFileSync(out)
+  } catch (_) {}
+  const key = code + '-' + kind
+  let pr = thumbInFlight.get(key)
+  if (!pr) {
+    pr = new Promise(resolve => {
+      try { fs.mkdirSync(THUMB_DIR(), { recursive: true }) } catch (_) {}
+      const vf = kind === 'poster' ? 'scale=-2:720' : 'scale=960:-2'
+      execFile('ffmpeg', ['-i', src, '-frames:v', '1', '-vf', vf, '-q:v', '5', '-y', out], { timeout: 30000 }, e => {
+        thumbInFlight.delete(key)
+        if (e) { try { fs.unlinkSync(out) } catch (_) {}; return resolve(null) }
+        try { resolve(fs.readFileSync(out)) } catch (_) { resolve(null) }
+      })
+    })
+    thumbInFlight.set(key, pr)
+  }
+  return pr
+}
+
 function sendFile(req, res, fp) {
   let st; try { st = fs.statSync(fp) } catch (_) { res.writeHead(404); return res.end('Not Found') }
   if (!st.isFile()) { res.writeHead(404); return res.end('Not Found') }
@@ -4344,6 +4373,19 @@ async function handleActorApi(req, res, p) {
       return res.end(r.buf)
     } catch (_) { res.writeHead(404); return res.end('Not Found') }
   }
+  /* ---------- 海报墙缩略图：/thumb/<番号>/<poster|fanart> ----------
+   * 全尺寸原图（海报可到 1032×1468、大图 2184×1468，单张几百 KB ~ 1MB）直接喂墙会拖慢滚动，
+   * 这里用 ffmpeg 压成墙用小图（海报限高 720 / 大图限宽 960），原图仍留给详情页。
+   * 缩略图缓存 cache/thumbs/，按源图 mtime 失效；生成失败回退原图。 */
+  const MT = /^\/thumb\/([A-Za-z0-9._-]+)\/(poster|fanart)$/.exec(p)
+  if (MT) {
+    const tb = await movieThumb(MT[1], MT[2])
+    if (tb) {
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': tb.length, 'Cache-Control': 'public, max-age=604800' })
+      return res.end(tb)
+    }
+    return sendFile(req, res, path.join(cacheDir(), 'movies', MT[1], 'images', MT[2] + '.jpg'))
+  }
   /* ---------- 外挂字幕：找同目录同名字幕，srt/ass 现场转成 WebVTT 再喂给 <track>（浏览器只认 vtt） ---------- */
   if (p === '/api/subs') {
     const rel = String(body.rel || '')
@@ -6240,7 +6282,7 @@ const server = http.createServer((req, res) => {
     if (ACCESS_CODE() && !/^(localhost|127\.0\.0\.1)$/.test(req.headers.host.split(':')[0] || '')) {
       if (p === '/login') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(LOGIN_HTML) }
       if (!hasAccess(req, p)) {
-        if (p.startsWith('/api/') || p.startsWith('/media/') || p.startsWith('/cache/')) { res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' }); return res.end('{"ok":false,"error":"需要访问口令"}') }
+        if (p.startsWith('/api/') || p.startsWith('/media/') || p.startsWith('/cache/') || p.startsWith('/thumb/')) { res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' }); return res.end('{"ok":false,"error":"需要访问口令"}') }
         res.writeHead(302, { Location: '/login' }); return res.end()
       }
     }
