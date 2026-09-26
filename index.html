@@ -4094,11 +4094,15 @@ function clientTags(name, extra) {
  * 首屏既慢又占内存。做法：有图的卡片只把地址写进 data-bg，先用渐变占位，
  * 等滚动到视口附近（提前 400px）才真正挂上背景图。
  * 每个容器一个观察器，重渲前先 disconnect() —— 否则旧节点会被一直观察着不放。 */
+/* 墙用缩略图改写：/cache/movies/<code>/images/<kind>.jpg → /thumb/<code>/<kind>
+ * （服务端 ffmpeg 压的小图，单张几十 KB；原图留给详情页。thumb 接口失败会自动回退原图，不会裂图） */
+const thumbOf = u => { const m = /^\/cache\/movies\/([^/]+)\/images\/(poster|fanart)\.jpg$/.exec(String(u || '')); return m ? '/thumb/' + m[1] + '/' + m[2] : u }
+
 function loadLazyBg(el) {
-  const u = el.dataset.bg
+  const u = thumbOf(el.dataset.bg)
   if (!u) return
   const fit = el.dataset.bgFit || ''
-  const fb = el.dataset.fb || ''
+  const fb = thumbOf(el.dataset.fb || '')
   const apply = src => {
     const v = `url('${src}')`
     /* 带 bg-fit 的（主页卡片）要用 background 简写 —— background-image 不接受
