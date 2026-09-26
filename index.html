@@ -10777,6 +10777,17 @@ const PICONS = {
   pip: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><rect x="12" y="11" width="7" height="6" rx="1.2" fill="currentColor" stroke="none"/></svg>',
   cc: '<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10.2 10.6a2.3 2.3 0 1 0 0 2.8M16.6 10.6a2.3 2.3 0 1 0 0 2.8" stroke-linecap="round"/></svg>'
 }
+/* video.play() 返回 Promise，被新加载（切画质/换片/换线路）打断时会 reject——
+ * 这是预期内的中断，静默吞掉；其它失败（自动播放策略等）只记调试日志，不弹未处理错误 */
+function safePlay(v) {
+  try {
+    const p = v.play()
+    if (p && p.catch) p.catch(e => {
+      const s = (e && (e.name || '') + ' ' + (e.message || '')) || ''
+      if (!/abort|interrupt|NotAllowedError.*load/i.test(s)) console.debug('[player] play() 被拒绝：', s)
+    })
+  } catch (_) {}
+}
 function mountPlayer(src, key, nextQueue, embedEl) {
   if (!src) return
   const k = watchKey(key || src)
@@ -10840,7 +10851,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
         if (!PLAYER || PLAYER.v !== v) return
         const b = document.getElementById('vLevelBtn')
         if (b && hls.levels && hls.levels.length > 1) b.style.display = ''
-        try { v.play() } catch (_) {}
+        safePlay(v)
         updatePlayerUI()
       })
       hls.on(window.Hls.Events.ERROR, (_, d) => {
@@ -10910,7 +10921,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
   v.addEventListener('pause', () => { playIcon(false); PLAYER.wake() })
   v.addEventListener('ended', () => { watchReport(k, v.duration || 0, v.duration || 0); playNext() })
   /* ---- 控制条各按钮 ---- */
-  document.getElementById('vPlay').onclick = () => v.paused ? v.play() : v.pause()
+  document.getElementById('vPlay').onclick = () => v.paused ? safePlay(v) : v.pause()
   document.getElementById('vIntro').onclick = () => { const it = (WATCHDB[k] && WATCHDB[k].intro) || 0; if (it > 3) { seekTo(it); playToast('已跳过片头', 1400) } }
   document.getElementById('vMark').onclick = () => toggleWatched(k)
   document.getElementById('vMute').onclick = () => { v.muted = !v.muted }
@@ -11070,7 +11081,7 @@ function shadeTap(e) {
   clearTimeout(PLAYER.singleT)
   PLAYER.singleT = setTimeout(() => {
     if (!PLAYER) return
-    if (e.pointerType === 'mouse') { v.paused ? v.play() : v.pause(); flashBig(v.paused ? '❚❚' : '▶') }
+    if (e.pointerType === 'mouse') { v.paused ? safePlay(v) : v.pause(); flashBig(v.paused ? '▶' : '❚❚') }
     else { const vw = document.getElementById('vWrap'); if (vw.classList.contains('idle')) wake(); else PLAYER.goIdleNow() }
   }, 340)
 }
@@ -11197,7 +11208,7 @@ function fsToggle() {
   if (w.requestFullscreen) w.requestFullscreen().catch(() => {})
   else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen()   // iOS Safari 只支持视频自带全屏
 }
-window.playFromStart = () => { if (!PLAYER) return; PLAYER.v.currentTime = 0; PLAYER.v.play(); playToast('已从头播放', 1500) }
+window.playFromStart = () => { if (!PLAYER) return; PLAYER.v.currentTime = 0; safePlay(PLAYER.v); playToast('已从头播放', 1500) }
 /* 手动播放队列：详情页「加入队列」进来；播完当前片先放手动队列，再走自动连播 */
 let QUEUE = []
 function updateQueueBadge() {
@@ -11279,7 +11290,7 @@ function playerKeys(e) {
   const v = PLAYER.v
   if (e.key === 'ArrowRight') { seekTo(v.currentTime + 10); flashBig('+10s') }
   else if (e.key === 'ArrowLeft') { seekTo(v.currentTime - 10); flashBig('−10s') }
-  else if (e.key === ' ') { v.paused ? v.play() : v.pause(); flashBig(v.paused ? '▶' : '❚❚') }
+  else if (e.key === ' ') { v.paused ? safePlay(v) : v.pause(); flashBig(v.paused ? '▶' : '❚❚') }
   else if (e.key === 'ArrowUp') { v.volume = Math.min(1, v.volume + 0.05); playToast('音量 ' + Math.round(v.volume * 100) + '%', 900) }
   else if (e.key === 'ArrowDown') { v.volume = Math.max(0, v.volume - 0.05); playToast('音量 ' + Math.round(v.volume * 100) + '%', 900) }
   else if (/^[0-9]$/.test(e.key) && v.duration) { seekTo(v.duration * parseInt(e.key) / 10); flashBig(e.key + '0%') }
