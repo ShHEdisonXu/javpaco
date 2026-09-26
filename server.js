@@ -1275,11 +1275,14 @@ function sendFile(req, res, fp) {
   const etag = `W/"${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}"`
   const lastMod = new Date(st.mtimeMs).toUTCString()
   const isImg = /^image\//.test(type) && !/svg/.test(type)
-  /* 缓存策略分三类：
-   *   图片   → 1 小时强缓存（封面/剧照反复出现，省掉重复读盘）
+  /* 缓存策略分四类：
+   *   女优头像（/actresses/、actor-cand）→ no-cache（换头像后文件名不变，强缓存会让浏览器一直显示旧图）
+   *   其他图片 → 1 小时强缓存（封面/剧照反复出现，省掉重复读盘）
    *   音视频 → no-store（动辄几个 G，不能让浏览器往磁盘缓存里塞；播放靠 Range 按需取）
    *   文本   → no-cache（每次都来问一次，内容没变回 304，改完代码不会看到旧页面） */
-  const cache = isImg ? 'public, max-age=3600'
+  const isAva = /[/\\]actresses[/\\]|actor-cand/.test(fp)
+  const cache = isAva ? 'no-cache'
+    : isImg ? 'public, max-age=3600'
     : /^(video|audio)\//.test(type) ? 'no-store'
       : 'no-cache'
   const range = req.headers.range
