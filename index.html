@@ -1669,6 +1669,14 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   /* 播放器：自绘控制条（进度/音量/倍速/字幕/A-B循环/截图/画中画/全屏/下一部）+ 手势 */
   .vwrap { position: absolute; inset: 0; background: #000; user-select: none; -webkit-user-select: none; }
   .vwrap video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000; }
+  /* 加载遮罩：起播 / 换线路 / 切画质 / 缓冲时显示，canplay 后淡出 */
+  .vload { position: absolute; inset: 0; z-index: 5; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: rgba(0,0,0,.55); opacity: 1; transition: opacity .25s; pointer-events: none; }
+  .vload.off { opacity: 0; }
+  .vload-spin { width: 42px; height: 42px; border-radius: 50%; border: 3px solid rgba(255,255,255,.18); border-top-color: #ff6ad5; animation: vspin .9s linear infinite; }
+  @keyframes vspin { to { transform: rotate(360deg) } }
+  .vload-txt { color: #fff; font-size: 13px; letter-spacing: 1px; text-shadow: 0 1px 4px rgba(0,0,0,.6); }
+  .vload-bar { width: min(320px, 62%); height: 3px; border-radius: 2px; background: rgba(255,255,255,.18); overflow: hidden; }
+  .vload-bar i { display: block; height: 100%; width: 0%; border-radius: 2px; background: linear-gradient(90deg, #b26bff, #ff6ad5); transition: width .35s; }
   .vwrap.idle video { cursor: none; }
   /* 手势层：吃点击/双击/长按/滑动，位于视频之上、控制条之下 */
   .vshade { position: absolute; inset: 0; z-index: 3; }
@@ -10802,6 +10810,7 @@ function mountPlayer(src, key, nextQueue, embedEl) {
       <video id="mVideo" ${/^hls:\/\//.test(src) ? '' : `src="${src}"`} autoplay playsinline preload="metadata"></video>
       <div class="vshade" id="vShade"></div>
       <div class="vbig" id="vBig">▶</div>
+      <div class="vload" id="vLoad"><div class="vload-spin"></div><div class="vload-txt" id="vLoadTxt">加载中…</div><div class="vload-bar"><i></i></div></div>
       <div class="vcc" id="vCC">
         <div class="vprog" id="vProg">
           <div class="vpr-track"><div class="vpr-buf" id="vBuf"></div><div class="vpr-play" id="vPlayed"></div><div class="vpr-ab" id="vAbSeg"></div></div>
@@ -10867,6 +10876,34 @@ function mountPlayer(src, key, nextQueue, embedEl) {
     try { v.src = src } catch (_) {}
   }
   if (PLAYER.online) { const vm = document.getElementById('vMark'); if (vm) vm.style.display = 'none' }
+  /* 加载遮罩：起播 / 换线路 / 切画质（都走 mountPlayer 重建，天然重显示）时出现；
+   * 进度条按「已缓冲 / 总时长」走，时长未知（HLS 清单未解析）时只转圈；canplay/playing 淡出，waiting 缓冲再显 */
+  {
+    const vLoad = document.getElementById('vLoad')
+    const vLoadTxt = document.getElementById('vLoadTxt')
+    const vLoadBarI = vLoad.querySelector('.vload-bar i')
+    const alive = () => PLAYER && PLAYER.v === v
+    const showLoad = txt => { if (!alive()) return; if (txt) vLoadTxt.textContent = txt; vLoad.classList.remove('off') }
+    const hideLoad = () => { if (alive()) vLoad.classList.add('off') }
+    v.addEventListener('loadstart', () => { vLoadBarI.style.width = '0%'; showLoad('加载中…') })
+    v.addEventListener('progress', () => {
+      if (!alive()) return
+      try {
+        const d = v.duration
+        if (d && isFinite(d) && d > 0) {
+          let end = 0
+          for (let i = 0; i < v.buffered.length; i++)
+            if (v.buffered.start(i) <= (v.currentTime || 0) + 1.5) end = Math.max(end, v.buffered.end(i))
+          vLoadBarI.style.width = Math.min(100, Math.round(end / d * 100)) + '%'
+        }
+      } catch (_) {}
+    })
+    v.addEventListener('canplay', hideLoad)
+    v.addEventListener('playing', hideLoad)
+    v.addEventListener('waiting', () => showLoad('缓冲中…'))
+    v.addEventListener('stalled', () => showLoad('缓冲中…'))
+    v.addEventListener('error', hideLoad)
+  }
   if (embedEl) { PLAYER.embed = true; document.getElementById('vClose').addEventListener('click', () => PLAYER && PLAYER.onClose ? PLAYER.onClose() : closeModal()) }
   /* 倍速 / 音量要记忆：注意 Chrome 在媒体资源装载完成时会把 playbackRate 重置回 1，
    * 所以除了创建时设一次，loadedmetadata 里还要再套一遍（否则记忆的倍速会丢）。 */
