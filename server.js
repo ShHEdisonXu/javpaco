@@ -1383,6 +1383,32 @@ async function relayJson(p, ms) {
   if (!b) return null
   try { return JSON.parse(b.toString('utf8')) } catch (_) { return null }
 }
+/* 名字归一（与前端/同步脚本 acNorm 同口径）：全角→半角、片假名→平假名、去空白，避免「リマ/りま」这类误判 */
+const cnormJa = s => String(s || '')
+  .replace(/[\uFF01-\uFF5E]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, ' ')
+  .replace(/[\u30A1-\u30F6\u31F0-\u31FF]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
+  .replace(/[^\u3040-\u30FF\u4E00-\u9FFF\u3400-\u4DBFa-z0-9]/gi, '')
+  .toLowerCase()
+/* relay 名册惰性索引：minnano 直连不可达（家宽 SNI 阻断、未配代理）时，「识别刮削」回落到
+ * relay 仓库的 roster.json —— GitHub Actions 每日自动从 minnano 全量同步，数据 T+1 新鲜、国内直连可达。 */
+let RELAY_ROSTER_IDX = null
+let RELAY_ROSTER_TS = 0
+async function relayRosterIndex() {
+  if (RELAY_ROSTER_IDX && Date.now() - RELAY_ROSTER_TS < 6 * 3600 * 1000) return RELAY_ROSTER_IDX
+  const arr = await relayJson('roster.json', 30000)
+  if (!Array.isArray(arr) || !arr.length) return RELAY_ROSTER_IDX
+  const byMnid = new Map(), byName = new Map()
+  for (const a of arr) {
+    if (!a) continue
+    const k = String(a.mnid || '').replace(/\D/g, '')
+    if (k && !byMnid.has(k)) byMnid.set(k, a)
+    const reg = x => { const c = cnormJa(x); if (c && !byName.has(c)) byName.set(c, a) }
+    reg(a.name); if (Array.isArray(a.alias)) a.alias.forEach(reg)
+  }
+  RELAY_ROSTER_IDX = { byMnid, byName }
+  RELAY_ROSTER_TS = Date.now()
+  return RELAY_ROSTER_IDX
+}
 const MN_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const dropEmpty = (k, v) => (v === '' || v === null || (Array.isArray(v) && v.length === 0) ? undefined : v)
 const mnDec = s => String(s || '')
@@ -1622,6 +1648,60 @@ async function avatarOnline(key) {
   const r = await job
   AVA_ONLINE_JOB.delete(key)
   return r
+}
+
+/* ---------- 部署完自动拉头像：扫描名册，把本地缺的头像从 relay（raw/jsDelivr 国内直连、免 token 免代理）
+ * 预取落盘 cache/actors/。触发：启动 15s 后首轮 + 每 12h 一轮；只处理带 mnid 的条目（relay 按 mn<id>.jpg 存）。
+ * 并发 3、张间 250ms 温和限速；已有头像（actresses/ 或 cache/actors/）直接跳过。开关 CFG.autoAvatar 默认开。 */
+let AVA_BACKFILL_RUNNING = false
+let AVA_BACKFILL_STATS = null      // {todo, ok, fail, done, startedAt} 供日志/排查
+async function avatarBackfillOnce(trigger) {
+  if (AVA_BACKFILL_RUNNING || CFG.autoAvatar === false) return
+  AVA_BACKFILL_RUNNING = true
+  const t0 = Date.now()
+  try {
+    const raw = []
+    try { raw.push(...JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) } catch (_) {}
+    try { raw.push(...readExtraRoster()) } catch (_) {}
+    const actorsDir = path.join(cacheDir(), 'actors')
+    const seen = new Set()
+    const todo = []
+    for (const a of raw) {
+      if (!a || !a.mnid) continue
+      const key = avaKey(a, a.mnid)
+      if (seen.has(key)) continue
+      seen.add(key)
+      if (fs.existsSync(path.join(actorsDir, key + '.jpg'))) continue
+      if (a.icon && fs.existsSync(path.join(AVA_DIR, path.basename(a.icon)))) continue
+      todo.push({ mnid: String(a.mnid).replace(/\D/g, ''), key })
+    }
+    if (!todo.length) { if (trigger !== 'boot') console.log('[avatar-backfill] %s 无缺口，跳过', trigger) ; return }
+    AVA_BACKFILL_STATS = { todo: todo.length, ok: 0, fail: 0, done: 0, startedAt: t0 }
+    console.log('[avatar-backfill] %s 开始：本地缺 %d 张，relay 直连预取中…', trigger, todo.length)
+    fs.mkdirSync(actorsDir, { recursive: true })
+    let ptr = 0
+    const worker = async () => {
+      while (ptr < todo.length && CFG.autoAvatar !== false && AVA_BACKFILL_RUNNING) {
+        const it = todo[ptr++]
+        try {
+          const b = await relayBuf('avatars/' + it.mnid + '.jpg', 12000)
+          if (isImgBuf(b)) { fs.writeFileSync(path.join(actorsDir, it.key + '.jpg'), b); AVA_BACKFILL_STATS.ok++ }
+          else AVA_BACKFILL_STATS.fail++
+        } catch (_) { AVA_BACKFILL_STATS.fail++ }
+        AVA_BACKFILL_STATS.done++
+        if (AVA_BACKFILL_STATS.done % 500 === 0)
+          console.log('[avatar-backfill] 进度 %d/%d (ok=%d fail=%d)', AVA_BACKFILL_STATS.done, AVA_BACKFILL_STATS.todo, AVA_BACKFILL_STATS.ok, AVA_BACKFILL_STATS.fail)
+        await new Promise(s => setTimeout(s, 250))
+      }
+    }
+    await Promise.all(Array.from({ length: 3 }, worker))
+    const st = AVA_BACKFILL_STATS
+    console.log('[avatar-backfill] %s 完成：ok=%d fail=%d 用时 %d 分钟', trigger, st.ok, st.fail, Math.round((Date.now() - t0) / 60000))
+  } catch (e) {
+    console.log('[avatar-backfill] %s 出错：%s', trigger, e.message)
+  } finally {
+    AVA_BACKFILL_RUNNING = false
+  }
 }
 
 /* 女优头像回退来源：minnano 没编号/没头像时 → 必应图片 → 谷歌图片（按名字搜图） */
@@ -3861,6 +3941,8 @@ async function handleActorApi(req, res, p) {
       autoOrganize: CFG.autoOrganize === true, rankAuto: CFG.rankAuto !== false,
       rankHour: rankHour(), rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running,
       autoScrapeNew: CFG.autoScrapeNew !== false,
+      autoAvatar: CFG.autoAvatar !== false,
+      autoAvatarRunning: AVA_BACKFILL_RUNNING, autoAvatarStats: AVA_BACKFILL_STATS,
       autoRescan: CFG.autoRescan === true, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
       accessOn: !!ACCESS_CODE(),
       mounts: containerMounts(), mediaRoot: MEDIA_ROOT
@@ -3868,6 +3950,10 @@ async function handleActorApi(req, res, p) {
     // 各字段独立保存：body 里带哪个就更新哪个，互不覆盖
     if ('autoOrganize' in body) CFG.autoOrganize = !!body.autoOrganize
     if ('autoScrapeNew' in body) CFG.autoScrapeNew = !!body.autoScrapeNew
+    if ('autoAvatar' in body) {
+      CFG.autoAvatar = !!body.autoAvatar
+      if (!CFG.autoAvatar) AVA_BACKFILL_RUNNING = false   // 关开关 → 立即叫停进行中的预取
+    }
     if ('autoRescan' in body) CFG.autoRescan = !!body.autoRescan
     if ('autoRescanHour' in body) CFG.autoRescanHour = Math.max(0, Math.min(23, parseInt(body.autoRescanHour, 10) || 0))
     if ('rankAuto' in body) CFG.rankAuto = !!body.rankAuto
@@ -4745,24 +4831,42 @@ async function handleActorApi(req, res, p) {
           rec = { uid: 'local', lid: 'lo' + require('crypto').createHash('sha1').update(nm).digest('hex').slice(0, 12), name: nm, videoCount: 0 }
         }
       }
-      /* 定位 mnid：记录里有 → 直接用；没有 → 按名搜索（唯一命中或名字/别名精确匹配才认） */
+      /* 定位 mnid：记录里有 → 直接用；没有 → 按名搜索（唯一命中或名字/别名精确匹配才认）；
+       * minnano 直连不可达时回落 relay 名册（CI 每日全量同步，T+1 数据） */
+      let via = 'minnano'
       let mnid = String(rec.mnid || '').replace(/\D/g, '')
       if (!mnid) {
         const s = await mnSearchActress(rec.name)
         const cand = s.exact || (((s.list || []).find(x => x.name === rec.name || (Array.isArray(rec.alias) && rec.alias.includes(x.name))) || {}).mnid || '')
-        if (!cand) return json(res, { ok: false, error: 'minnano 搜不到该女优（同名多人时请用「✎ 刮削」手动选）' })
-        mnid = String(cand)
+        if (!cand) {
+          const ridx = await relayRosterIndex()
+          const rr = ridx && ridx.byName.get(cnormJa(rec.name))
+          if (!rr || !rr.mnid) return json(res, { ok: false, error: 'minnano 搜不到该女优，relay 名册也没有（同名多人时请用「✎ 刮削」手动选）' })
+          via = 'relay'
+          mnid = String(rr.mnid).replace(/\D/g, '')
+        } else mnid = String(cand)
       }
+      /* 抓资料页：直连失败（家宽 SNI 阻断 / 未配代理）→ relay 名册兜底，数据来自每日 CI 同步 */
       const pr = await mnGetFollow(MN_BASE + 'actress' + mnid + '.html', false)
-      if (!pr || !pr.body) return json(res, { ok: false, error: 'minnano 资料页抓取失败（该站需代理，检查设置里的代理配置）' })
-      const prof = parseMinnanoProfile(pr.body)
-      if (!prof || (!prof.canon && !prof.height && !prof.birthday)) return json(res, { ok: false, error: '资料页解析失败（页面结构可能变了）' })
-      /* 与前端/同步脚本 acNorm 同口径：全角→半角、片假名→平假名、去空白，避免「リマ/りま」这类误判改名 */
-      const cnorm = s => String(s || '')
-        .replace(/[\uFF01-\uFF5E]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, ' ')
-        .replace(/[\u30A1-\u30F6\u31F0-\u31FF]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
-        .replace(/[^\u3040-\u30FF\u4E00-\u9FFF\u3400-\u4DBFa-z0-9]/gi, '')
-        .toLowerCase()
+      let prof = pr && pr.body ? parseMinnanoProfile(pr.body) : null
+      if (!prof || (!prof.canon && !prof.height && !prof.birthday)) {
+        const ridx = await relayRosterIndex()
+        const rr = ridx && (ridx.byMnid.get(String(mnid)) || ridx.byName.get(cnormJa(rec.name)))
+        if (!rr) return json(res, { ok: false, error: 'minnano 资料页抓取失败，relay 名册也无此女优（该站需代理，检查设置里的代理配置，或等每日自动同步）' })
+        via = 'relay'
+        const nocm = v => String(v || '').replace(/cm$/i, '')
+        prof = {
+          canon: rr.name || rec.name, birthday: rr.birthday || '',
+          height: nocm(rr.height), bust: nocm(rr.breast), cup: rr.cup || '',
+          waist: nocm(rr.waist), hip: nocm(rr.hip), shoe: nocm(rr.shoe),
+          blood: rr.blood || '', place: rr.place || '', hobby: rr.hobby || '',
+          period: rr.period || '', debut: rr.debut || '', agency: rr.agency || '', blog: rr.blog || '',
+          avatarUrl: '',   // 头像由 avatarOnline 的 relay 链路兜底，不走 minnano 直连
+          alias: Array.isArray(rr.alias) ? rr.alias : [], tags: Array.isArray(rr.tags) ? rr.tags : [],
+          rel: Array.isArray(rr.rel) ? rr.rel : []
+        }
+      }
+      const cnorm = cnormJa
       const patch = {}
       const changes = []
       let renamed = null
@@ -4810,7 +4914,7 @@ async function handleActorApi(req, res, p) {
         }
       }
       if (!changes.length && !Object.keys(patch).length) {
-        return json(res, { ok: true, changed: [], renamed: null, created: false })
+        return json(res, { ok: true, changed: [], renamed: null, created: false, via })
       }
       if (local) {
         if (created) exList.push(rec)
@@ -4819,7 +4923,7 @@ async function handleActorApi(req, res, p) {
       } else {
         rosterUpdate(idx, nm, r => Object.assign(r, patch))
       }
-      return json(res, { ok: true, changed: changes, renamed, created })
+      return json(res, { ok: true, changed: changes, renamed, created, via })
     } catch (e) {
       return json(res, { ok: false, error: e.message })
     }
@@ -4998,7 +5102,7 @@ async function handleActorApi(req, res, p) {
     const applied = []
     try {
       if (inc.config && typeof inc.config === 'object') {
-        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoOrganize', 'autoScrapeNew', 'autoRescan', 'autoRescanHour', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
+        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoOrganize', 'autoScrapeNew', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
         SAFE.forEach(k => { if (inc.config[k] !== undefined) CFG[k] = inc.config[k] })
         LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
         writeCfg(); applied.push('配置')
@@ -6615,6 +6719,9 @@ server.listen(PORT, '0.0.0.0', () => {
     }
   }
   console.log(`  按 Ctrl+C 停止`)
+  /* 部署完自动拉头像：等扫描稳定后首轮，之后每 12h 补一次新增（开关 设置→autoAvatar） */
+  setTimeout(() => avatarBackfillOnce('boot').catch(() => {}), 15000)
+  setInterval(() => avatarBackfillOnce('timer').catch(() => {}), 12 * 3600 * 1000).unref()
 })
 
 process.on('SIGINT', () => { console.log('\n已停止'); process.exit(0) })
