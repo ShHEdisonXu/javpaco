@@ -1297,12 +1297,15 @@ function streamWith(res, rs) {
 const ROSTER = path.join(UI_ROOT, 'actresses.json')
 const AVA_DIR = path.join(UI_ROOT, 'actresses')
 const MN_BASE = 'https://www.minnano-av.com/'
-/* minnano 云端中转：家里宽带对该站是 SNI 阻断（TCP 即 RST），但 api.github.com 直连可达。
- * GitHub Actions 每日抓榜单+头像提交到仓库 relay/ 目录，这里经 Contents API 兜底读取。
- * 私有仓库需在 设置→网络 配 githubToken（PAT）；未配 token 时仅公共仓库可用（退回 raw）。 */
-const RELAY_API = 'https://api.github.com/repos/ShHEdisonXu/javpaco/contents/relay/'
-const RELAY_BASE = 'https://raw.githubusercontent.com/ShHEdisonXu/javpaco/main/relay/'
-const relayCache = new Map()   // p → {ts, buf|null}（10 分钟，避开 GitHub API 限频）
+/* minnano 云端中转：家里宽带对该站是 SNI 阻断（TCP 即 RST），但 GitHub raw / jsDelivr 国内直连可达。
+ * GitHub Actions 每日抓榜单+头像，提交到公共仓库 ShHEdisonXu/javpaco-relay —— 数据公开，
+ * 任何新用户拉镜像后无需配置 githubToken 即可读取（零配置开箱即用）。
+ * 读取顺序：raw.githubusercontent.com → cdn.jsdelivr.net → api.github.com（配了 token 则带鉴权）。 */
+const RELAY_REPO = 'ShHEdisonXu/javpaco-relay'
+const RELAY_RAW = 'https://raw.githubusercontent.com/' + RELAY_REPO + '/main/relay/'
+const RELAY_CDN = 'https://cdn.jsdelivr.net/gh/' + RELAY_REPO + '@main/relay/'
+const RELAY_API = 'https://api.github.com/repos/' + RELAY_REPO + '/contents/relay/'
+const relayCache = new Map()   // p → {ts, buf|null}（10 分钟，避开上游限频）
 async function relayBuf(p, ms) {
   const c = relayCache.get(p)
   if (c && Date.now() - c.ts < 10 * 60 * 1000) return c.buf
@@ -1311,6 +1314,14 @@ async function relayBuf(p, ms) {
   return b
 }
 async function relayBufFetch(p, ms) {
+  /* ① raw（公共仓库免 token，国内直连可达） ② jsDelivr CDN 兜底 */
+  for (const u of [RELAY_RAW + p, RELAY_CDN + p]) {
+    try {
+      const r = await fetch(u, { signal: AbortSignal.timeout(ms || 15000) })
+      if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (b.length > 2) return b }
+    } catch (_) {}
+  }
+  /* ③ Contents API（配了 githubToken 则带鉴权，避开未认证限频） */
   const hd = { accept: 'application/vnd.github.raw' }
   const tk = String(CFG.githubToken || '').trim()
   if (tk) hd.authorization = 'Bearer ' + tk
@@ -1318,12 +1329,6 @@ async function relayBufFetch(p, ms) {
     const r = await fetch(RELAY_API + p, { headers: hd, signal: AbortSignal.timeout(ms || 15000) })
     if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (b.length > 2) return b }
   } catch (_) {}
-  if (!tk) {   // 没配 token：退回 raw（仅公共仓库有效）
-    try {
-      const r = await fetch(RELAY_BASE + p, { signal: AbortSignal.timeout(ms || 15000) })
-      if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); if (b.length > 2) return b }
-    } catch (_) {}
-  }
   return null
 }
 async function relayJson(p, ms) {
@@ -1414,6 +1419,7 @@ const DIRECT_HOSTS = [
   'x99dh.cc', 'x99dh.vip', 'x99dh.my', 'x99dh.pro',                                    // MissAV 线路发现
   'missav.ws', 'missav123.com', 'njavtv.my', 'thisav.my', 'missav888.cc', 'njav01.net', 'missav.watch',
   'raw.githubusercontent.com', 'api.github.com', 'github.com', 'codeload.github.com',  // 云端中转
+  'cdn.jsdelivr.net', 'fastly.jsdelivr.net', 'data.jsdelivr.com',                       // jsDelivr CDN（中转兜底）
   'cn.bing.com', 'www.bing.com',                                                       // 图片兜底
   '115.com', 'webapi.115.com', 'clouddownload.115.com'                                 // 115 网盘
 ]
