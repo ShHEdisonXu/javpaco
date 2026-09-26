@@ -1537,8 +1537,8 @@ async function avatarOnline(key) {
   if (AVA_ONLINE_FAIL.get(key) > Date.now() - 6 * 60 * 60 * 1000) return null
   if (AVA_ONLINE_JOB.has(key)) return AVA_ONLINE_JOB.get(key)
   const job = (async () => {
-    if (a && a.mnid) {   // ① GitHub 云端中转（Actions 每日抓的榜上女优头像，api.github.com 国内直连可达）
-      const rb = await relayBuf('avatars/' + a.mnid + '.jpg')
+    if (a && a.mnid) {   // ① GitHub 云端中转（Actions 每日抓的全量头像，raw 国内直连可达；6s 短超时防冷失败拖页面）
+      const rb = await relayBuf('avatars/' + a.mnid + '.jpg', 6000)
       if (isImgBuf(rb)) {
         try { fs.mkdirSync(path.join(cacheDir(), 'actors'), { recursive: true }); fs.writeFileSync(path.join(cacheDir(), 'actors', key + '.jpg'), rb) } catch (_) {}
         return rb
@@ -5988,7 +5988,9 @@ async function mvFetch(url, hdrs = {}, deadlineMs = 20000) {
       } else throw e
     }
     if ([301, 302, 303, 307, 308].includes(rs.status) && rs.headers.location) {
-      cur = new URL(rs.headers.location, cur).href
+      const next = new URL(rs.headers.location, cur).href
+      try { if (new URL(next).origin !== new URL(cur).origin && hdrs.referer) { hdrs = Object.assign({}, hdrs); delete hdrs.referer } } catch (_) {}
+      cur = next
       continue
     }
     rs.finalUrl = cur
@@ -6177,14 +6179,19 @@ function mvStreamUpstream(url, site, isPlaylist, res, onDone, uuid) {
     rs.on('end', () => onDone(null, chunks))
   })
 }
-/* https.get + 手动跟随 302（jmpres → 国内 CDN） */
+/* https.get + 手动跟随 302（jmpres → 国内 CDN）。
+ * 关键：跨域重定向要剥掉 referer（浏览器行为）——CDN（vcsocdp.net 等）有防盗链，
+ * 带着镜像站的 referer 过去会被 403，这正是「解析成功但播放失败」的根因。 */
 function mvFollowGet(url, hdrs, cb, hop = 0) {
   if (hop > 5) return cb(new Error('重定向次数过多'))
   const uu = new URL(url)
   const req = https.get(uu, { headers: hdrs, timeout: 25000 }, rs => {
     if ([301, 302, 303, 307, 308].includes(rs.statusCode) && rs.headers.location) {
       rs.resume()
-      return mvFollowGet(new URL(rs.headers.location, uu).href, hdrs, cb, hop + 1)
+      const next = new URL(rs.headers.location, uu).href
+      const nh = Object.assign({}, hdrs)
+      try { if (new URL(next).origin !== uu.origin) delete nh.referer } catch (_) {}
+      return mvFollowGet(next, nh, cb, hop + 1)
     }
     cb(null, rs, url)
   })
