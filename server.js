@@ -1019,19 +1019,7 @@ async function scanAsync() {
      * （首次部署没挂媒体也能看到示例影片/已刮削条目，详情页在线播放、演员、系列都可用）。
      * 配上自己的媒体库并扫出内容后，这些条目自动让位。 */
     if (!items.length) {
-      const mroot = path.join(cacheDir(), 'movies')
-      let ces = []
-      try { ces = fs.readdirSync(mroot, { withFileTypes: true }).filter(x => x.isDirectory()) } catch (_) {}
-      for (const e of ces) {
-        const m = readMovieCache(e.name)
-        if (!m || (!m.title && !m.scraped)) continue
-        const mt = Date.parse(m.scrapedAt || m.fetchedAt || '') || 0
-        items.push(enrichFromCache({ code: m.code || e.name, title: m.title || e.name, plot: m.plot || '',
-          year: m.year || '', studio: m.studio || '', publisher: m.publisher || '', series: m.series || '',
-          actors: m.actors || [], genres: m.genres || [], relVideo: null, relFanart: null, relPoster: null,
-          relSamples: [], size: 0, mtime: mt, cachedOnly: true }))
-      }
-      items.sort((a, b) => b.mtime - a.mtime)
+      items.push(...bootOfflineCache())
       if (items.length) console.log('[scan] 未配置媒体库/扫到 0 部 → 展示离线缓存条目 ' + items.length + ' 部（示例与已刮削数据，纯在线浏览）')
     }
     /* 扫描完成 → 自动刮削新番号（设置页可关，默认开）：本轮「识别失败待处理」且能解析出番号的，
@@ -1207,7 +1195,32 @@ function seedSamples() {
   } catch (e) { console.log('[seed] 示例数据载入失败：' + e.message) }
 }
 seedSamples()
-rescan()                              // 后台启动扫描，服务先监听，进度走 /api/scan
+/* 启动不自动扫描（v0.2.28）：映射的可能是 115 云盘等慢挂载，开机就全量扫会拖垮启动、
+ * 还会打爆网盘 API。启动只把离线缓存载入内存做展示（示例影片/已刮削条目）；
+ * 真实媒体库扫描只在这些时机触发——设置页添加/删除媒体库、修改配置、手动「重扫」、
+ * 设置里开启的每日自动重扫。 */
+function bootOfflineCache() {
+  const mroot = path.join(cacheDir(), 'movies')
+  let ces = []
+  try { ces = fs.readdirSync(mroot, { withFileTypes: true }).filter(x => x.isDirectory()) } catch (_) {}
+  const items = []
+  for (const e of ces) {
+    const m = readMovieCache(e.name)
+    if (!m || (!m.title && !m.scraped)) continue
+    const mt = Date.parse(m.scrapedAt || m.fetchedAt || '') || 0
+    items.push(enrichFromCache({ code: m.code || e.name, title: m.title || e.name, plot: m.plot || '',
+      year: m.year || '', studio: m.studio || '', publisher: m.publisher || '', series: m.series || '',
+      actors: m.actors || [], genres: m.genres || [], relVideo: null, relFanart: null, relPoster: null,
+      relSamples: [], size: 0, mtime: mt, cachedOnly: true }))
+  }
+  items.sort((a, b) => b.mtime - a.mtime)
+  return items
+}
+{
+  const items = bootOfflineCache()
+  DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items }
+  console.log('[scan] 启动不自动扫描：已载入离线缓存 ' + items.length + ' 部做展示；媒体库扫描请在设置页添加/重扫触发')
+}
 
 function safeMediaPath(rel) {
   const fp = path.resolve(MEDIA_ROOT, rel)
