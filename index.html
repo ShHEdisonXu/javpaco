@@ -3291,6 +3291,21 @@ function errShow(title, detail) {
   bar.classList.add('open')
 }
 window.errHide = () => { const b = document.getElementById('errBar'); if (b) b.classList.remove('open') }
+/* 通用剪贴板：navigator.clipboard 只在安全上下文存在（https / localhost），
+ * NAS 这类 http://IP 访问时是 undefined，必须退回 execCommand('copy')（点击手势内有效） */
+window.copyTextTo = async function (txt) {
+  txt = txt || ''
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(txt); return true }
+  } catch (_) {}
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.focus(); ta.select()
+    const ok = document.execCommand('copy'); ta.remove()
+    return !!ok
+  } catch (_) { return false }
+}
 window.errCopy = () => {
   const txt = ERR_LOG.join('\n')
   const ok = () => {
@@ -3300,15 +3315,8 @@ window.errCopy = () => {
     t.textContent = '已复制'
     setTimeout(() => { t.textContent = '出错了' }, 1600)
   }
-  /* http 页面下 clipboard 可能不可用，退回到临时 textarea */
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(txt).then(ok, () => {}) ; return }
-  } catch (_) {}
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0'
-    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); ok()
-  } catch (_) {}
+  /* http 页面下 clipboard 不可用，copyTextTo 内部已降级 execCommand */
+  copyTextTo(txt).then(ok, () => {})
 }
 function errReport(kind, msg, extra) {
   const one = `[${new Date().toLocaleTimeString('zh-CN')}] ${kind}：${msg}`
@@ -7269,10 +7277,9 @@ window.refreshMagnets = function (code) {
   loadMagnets(code, true)
 }
 window.copyMagnet = async function (i, btn) {
-  try {
-    await navigator.clipboard.writeText((_MG[i] || {}).magnet || '')
-    btn.textContent = '已复制'; setTimeout(() => { btn.textContent = '复制磁力' }, 1500)
-  } catch (_) { btn.textContent = '复制失败' }
+  const ok = await copyTextTo((_MG[i] || {}).magnet || '')
+  btn.textContent = ok ? '已复制' : '复制失败'
+  setTimeout(() => { btn.textContent = '复制磁力' }, 1500)
 }
 /* 115 离线推送：把这条磁力直接推到 115 指定文件夹（设置 → 115 离线推送 里配 cookie / 目标文件夹）。
  * 推完 115 云端离线下载，本地 CloudDrive 挂载同目录重扫即可自动入库。 */
@@ -7643,11 +7650,11 @@ function moviePathRows(P) {
 }
 /* 路径 / 文本一键复制（刮削面板的绝对路径标注用） */
 window.copyPath = async function (t, el) {
-  try {
-    await navigator.clipboard.writeText(t || '')
-    const old = el && el.textContent
-    if (el) { el.textContent = '✓ 已复制'; setTimeout(() => { el.textContent = old }, 1200) }
-  } catch (_) {}
+  const ok = await copyTextTo(t || '')
+  if (ok && el) {
+    const old = el.textContent
+    el.textContent = '✓ 已复制'; setTimeout(() => { el.textContent = old }, 1200)
+  }
 }
 
 /* ---------- 在线播放链接：按番号拼免费站的直达页 / 搜索页 ---------- */
