@@ -812,7 +812,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   }
   /* 详情页附加资料行（血型 / 出身地 / 出道期间 / 爱好） */
   .ac-metaline {
-    max-width: 1320px; margin: 16px auto 0; padding: 0 40px;
+    max-width: var(--ac-maxw, 1320px); margin: 16px auto 0; padding: 0 var(--ac-pgx, 40px);
     display: flex; flex-wrap: wrap; align-items: center; gap: 7px 20px;
     color: #a8a8b4; font-size: 12.5px;
   }
@@ -861,12 +861,12 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   .ac-vlink:hover { text-decoration: underline; }
   /* ---- 详情页：minnano 标签（中文翻译，悬停显示原文） ---- */
   .ac-tags {
-    max-width: 1320px; margin: 16px auto 0; padding: 0 40px;
+    max-width: var(--ac-maxw, 1320px); margin: 16px auto 0; padding: 0 var(--ac-pgx, 40px);
     display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   }
   /* ---- 详情页外部链接（JavBus / JavDB / FANZA / MissAV / 维基 / minnano） ---- */
   .ac-xlinks {
-    max-width: 1320px; margin: 12px auto 0; padding: 0 40px;
+    max-width: var(--ac-maxw, 1320px); margin: 12px auto 0; padding: 0 var(--ac-pgx, 40px);
     display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   }
   .ac-xlinks small { color: #5f5f6b; font-size: 12px; margin-right: 4px; }
@@ -935,7 +935,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   .rk-item .n { font-size: var(--rk-name-fs, 13px); color: var(--text-2); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rk-item:hover .n { color: #fff; }
   .rk-item .w { font-size: 10.5px; color: #5a5a64; margin-top: 3px; }
-  .ac-chips { display: flex; flex-wrap: wrap; gap: 10px; max-width: 1320px; margin: 0 auto; padding: 26px 40px 4px; }
+  .ac-chips { display: flex; flex-wrap: wrap; gap: 10px; max-width: var(--ac-maxw, 1320px); margin: 0 auto; padding: 26px var(--ac-pgx, 40px) 4px; }
   .ac-chip { padding: 7px 16px; border-radius: 8px; font-size: 12.5px; background: #1d1d27; color: var(--text-2); cursor: pointer; border: none; transition: background .15s; }
   .ac-chip:hover { background: #262633; }
   .ac-chip.active { background: var(--accent); color: #fff; font-weight: 700; }
@@ -1041,7 +1041,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   /* ---- 女优列表：排序条 ---- */
   .ac-sortbar {
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
-    max-width: 1320px; margin: 0 auto; padding: 0 40px; flex-wrap: wrap;
+    max-width: var(--al-maxw, 1320px); margin: 0 auto; padding: 0 var(--al-padx, 40px); flex-wrap: wrap;
   }
   .ac-sortbar .ac-total { color: var(--text-dim); font-size: var(--al-sort-fs, 13px); }
   .ac-sortbar .ac-total b { color: var(--text); font-size: 15px; font-weight: 700; }
@@ -1093,7 +1093,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   /* ---- 分页 ---- */
   .ac-pager {
     display: flex; align-items: center; justify-content: center; gap: 6px; flex-wrap: wrap;
-    max-width: 1320px; margin: 0 auto; padding: 30px 40px 74px;
+    max-width: var(--al-maxw, 1320px); margin: 0 auto; padding: 30px var(--al-padx, 40px) var(--al-padb, 74px);
   }
   .ac-pager button {
     min-width: 34px; height: 34px; padding: 0 11px; border-radius: 999px; cursor: pointer;
@@ -2393,7 +2393,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   .sno-meta b { font-size: 14px; font-weight: 800; letter-spacing: .6px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sno-meta em { font-style: normal; font-size: 12px; color: var(--text-dim); flex: none; }
   /* ---------- 系列详情页（#/seriesno/）：系列信息头 + 自动刮削进度 + 信息块 ---------- */
-  .sn-wrap { max-width: 1320px; }
+  .sn-wrap { max-width: var(--sr-maxw, 1280px); }
   .sn-hero { position: relative; border-radius: 18px; overflow: hidden; margin-bottom: 22px; background: #14141c center/cover no-repeat; border: 1px solid rgba(255,255,255,.08); }
   .sn-hero::before { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, rgba(8,8,12,.97) 0%, rgba(8,8,12,.88) 44%, rgba(8,8,12,.46) 100%); }
   .sn-hero-in { position: relative; z-index: 2; padding: 26px 32px 24px; }
