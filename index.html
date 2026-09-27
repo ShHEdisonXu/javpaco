@@ -5119,10 +5119,8 @@ const ST_MODS_RANK = {
     h: [{ k: '--rk-ava', lb: '头像大小', f: .45, min: 40, max: 160, u: 'px' },
         { k: '--rk-card-min', lb: '卡片宽度', f: .3, min: 80, max: 260, u: 'px', pos: 'r' }] }
 }
-/* 系列 / 类别 / 清单页（#/series、#/seriesno、#/favorites）模块 */
+/* 系列 / 类别 / 清单页（#/series、#/seriesno、#/favorites）模块：页面留白走容器级 pgwrap */
 const ST_MODS_SERIES = {
-  srwrap: { tag: '页面留白', params: ['--sr-maxw', '--sr-padx', '--sr-padt', '--sr-padb'],
-    h: [{ k: '--sr-padx', lb: '左右留白', f: .12, min: 0, max: 140, u: 'px' }] },
   snosec: { tag: '番号系列', params: ['--sr-h3-fs', '--sr-sec-mb', '--sno-card-min', '--sno-gap'],
     h: [{ k: '--sno-card-min', lb: '系列卡片宽度', f: .3, min: 120, max: 400, u: 'px' },
         { k: '--sno-gap', lb: '卡片间距', f: .08, min: 4, max: 44, u: 'px', pos: 'r' }] },
@@ -8924,7 +8922,7 @@ function renderSeries(tag) {
   if (tag) {
     const hits = LIB.filter(x => (x.genres || []).includes(tag))
     listPage.innerHTML = acHead('#/series', libEsc(tag)) + `
-      <div class="sr-wrap" data-mod="srwrap" data-st="srwrap">
+      <div class="sr-wrap">
         <div class="sr-note">「${libEsc(tag)}」· ${hits.length} 部影片 · <a href="#/series">全部类别 ›</a></div>
         <div class="sr-grid" data-mod="srgrid" data-st="srgrid">${hits.map(x => libCard(x)).join('') || '<div class="mv-note">这个类别下暂时没有影片</div>'}</div>
       </div>`
@@ -8944,7 +8942,7 @@ function renderSeries(tag) {
         <button class="sno-fav${FAV_SERIES.has(g.key) ? ' on' : ''}" title="收藏这个系列" onclick="event.stopPropagation();toggleFavSeries('${libEsc(g.key)}', this)">${FAV_SERIES.has(g.key) ? '♥' : '♡'}</button>
       </div>`
     listPage.innerHTML = acHead('#/', '系列') + `
-      <div class="sr-wrap" data-mod="srwrap" data-st="srwrap">
+      <div class="sr-wrap">
         <div class="sno-sec" data-mod="snosec" data-st="snosec">
           <h3>番号系列 <em>同前缀番号归为一个系列，按番号顺序排列</em></h3>
           <div class="sno-grid">${grupos.map(snoCard).join('') || '<div class="mv-note">媒体库还没有成系列的番号（同一前缀至少 2 部）</div>'}</div>
