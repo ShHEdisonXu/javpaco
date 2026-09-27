@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-title" content="JAVPACO">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <title>javpaco</title>
-<script>try { var _t = localStorage.getItem('javpaco.theme'); if (_t === 'glass' || _t === 'neon') document.documentElement.setAttribute('data-theme', _t); else if (_t) localStorage.removeItem('javpaco.theme') } catch (e) {}</script>
+<script>try { var _t = localStorage.getItem('javpaco.theme'); if (_t === 'glass' || _t === 'neon') document.documentElement.setAttribute('data-theme', _t); else { if (_t) localStorage.removeItem('javpaco.theme'); document.documentElement.setAttribute('data-theme', 'neon') } } catch (e) {}</script>
 <script>/* PWA：HTTPS/localhost 环境才注册（局域网 http 上 iOS 仍可「添加到主屏幕」拿图标） */
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localhost|127\.0\.0\.1)$/.test(location.hostname))) {
   addEventListener('load', () => { navigator.serviceWorker.register('/sw.js').catch(() => {}) })
@@ -2794,12 +2794,12 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
 <section class="hero" id="hero" data-mod="hero" data-st="hero" data-page-node-id="EwdqolLAYKCKOYwTyzOc8J" style="display:none"></section>
 
 <!-- ============ 海报行 ============ -->
-<main class="rows no-hero" id="rows" data-page-node-id="GTIUxZ99cf5mXvKq46zwyT"></main>
+<main class="rows no-hero" id="rows" data-mod="homepg" data-st="homepg" data-page-node-id="GTIUxZ99cf5mXvKq46zwyT"></main>
 
 <footer data-page-node-id="McRamscQKMeomQYZPSKN4N">JAVぱこ · 本地媒体库 + 女优数据库 · 流媒体风格</footer>
 
 <!-- ============ 设置页（独立视图 #/settings） ============ -->
-<div class="settings-page" id="settingsPage">
+<div class="settings-page" id="settingsPage" data-mod="pgwrap" data-st="pgwrap">
   <div class="sp-head" data-mod="sphead" data-st="sphead">
     <button class="sp-back" onclick="location.hash='#/'" title="返回">‹</button>
     <h1>设置</h1>
@@ -2990,7 +2990,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
       </section>
       <section class="sp-sec" data-sec="theme">
         <h2>外观</h2>
-        <p class="hint">「毛玻璃」为浅色毛玻璃风格（Apple Liquid Glass）；「霓虹」为深紫夜底 + 紫粉霓虹光效（Logo 会变成霓虹灯牌）。点一下立即生效并记住（保存在本机浏览器）；取消选中则回到默认暗色。</p>
+        <p class="hint">「霓虹」为深紫夜底 + 紫粉霓虹光效（Logo 会变成霓虹灯牌），是<strong>默认主题</strong>；「毛玻璃」为浅色毛玻璃风格（Apple Liquid Glass）。点一下立即生效并记住（保存在本机浏览器）。</p>
         <div class="sp-card">
           <div id="themeGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px"></div>
         </div>
@@ -3210,14 +3210,14 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
 </div>
 
 <!-- ============ 女优页（#/actors 列表 · #/actor/名字 详情，netflav 同款） ============ -->
-<div class="actors-page" id="actorsPage"></div>
-<!-- ============ 系列 / 我的收藏（#/series · #/series/<tag> · #/favorites） ============ -->
-<div class="actors-page" id="listPage"></div>
+<div class="actors-page" id="actorsPage" data-mod="pgwrap" data-st="pgwrap"></div>
+<!-- ============ 系列 / 我的收藏（#/series · #/series/<tag> · #/favorites · #/lib 影片库共用容器） ============ -->
+<div class="actors-page" id="listPage" data-mod="pgwrap" data-st="pgwrap"></div>
 <!-- ============ 影片详情页（#/movie/<番号>，javbus 布局） ============ -->
 <div class="actors-page" id="moviePage"></div>
 
 <!-- ============ 添加影片（在线刮削 · #/add 独立视图） ============ -->
-<div class="settings-page" id="addPage"></div>
+<div class="settings-page" id="addPage" data-mod="pgwrap" data-st="pgwrap"></div>
 <div class="ac-lightbox" id="acLightbox" onclick="this.classList.remove('open')"><img id="acLightboxImg" alt=""></div>
 <div class="ac-modal" id="acModal" onclick="if(event.target===this)this.classList.remove('open')"><div class="acm-box" id="acmBox"></div></div>
 <div class="ac-modal" id="mvScrapeModal" onclick="if(event.target===this)this.classList.remove('open')"><div class="acm-box" id="mvScrapeBox" style="width:min(780px,94vw)"></div></div>
@@ -3358,7 +3358,7 @@ const PREF_DEF = {
   cardfx: '1',       // 影视墙磨砂卡片 + 悬停动效
   showhidden: '0',   // 显示已隐藏的影片
   privacy: '0',      // 隐私模式（模糊封面）
-  theme: '',         // 主题（空 = 默认）
+  theme: 'neon',     // 主题（'neon' 霓虹 = 默认；'glass' 毛玻璃；空值按 neon 处理）
   autoplay: '1',     // 详情页自动播放
   cupbadge: '0',     // 女优罩杯徽章
   wallpic: '0',      // 海报墙横竖版：'0' 竖版海报（默认）/'1' 横版主图（导航栏 🖼 开关 + 设置→外观）
@@ -4934,6 +4934,9 @@ function applyTune() {
   MV_ROWS.forEach(r => { if (!GLOBAL_KEYS[r.k]) applyOneRow(r, MVTUNE) })   // 全局比例只认主页那份，避免互相覆盖
   ACTOR_ROWS.forEach(r => { if (!GLOBAL_KEYS[r.k]) applyOneRow(r, ATUNE) })
   LIB_ROWS.forEach(r => { if (!GLOBAL_KEYS[r.k]) applyOneRow(r, LBTUNE) })
+  /* 各 PG 页（女优列表/榜单/系列/设置/添加）的参数也要套：原来漏了这行，
+   * 调过的留白/字号只在当次会话生效，刷新就回到默认 */
+  Object.keys(PG_ROWS).forEach(mk => PG_ROWS[mk].forEach(r => { if (!GLOBAL_KEYS[r.k]) applyOneRow(r, PG_TUNE[mk]) }))
   followRatios()
   applyLayoutVars()
 }
@@ -5150,6 +5153,25 @@ const ST_MODS_BY_MODE = {
   home: ST_MODS_HOME, movie: ST_MODS_MOVIE, actor: ST_MODS_ACTOR, lib: ST_MODS_LIB,
   alist: ST_MODS_ALIST, rank: ST_MODS_RANK, series: ST_MODS_SERIES, sp: ST_MODS_SP, add: ST_MODS_ADD
 }
+/* 整页「页面留白」模块：挂在各页最外层容器上（#rows/#actorsPage/#listPage/#settingsPage/#addPage），
+ * 画布里点页面空白处或左栏「页面留白」即可选中，调本页左右留白 / 顶部留白 / 内容宽度。
+ * 各页的留白变量不同（--pgx/--ac-pgx/--lb-pgx/--al-padx…），按模式各配一份。 */
+ST_MODS_HOME.homepg = { tag: '页面留白', params: ['--pgx', '--blockgap', '--rowtitle-fs'],
+  h: [{ k: '--pgx', lb: '左右留白', f: .12, min: 8, max: 120, u: 'px' }] }
+ST_MODS_ACTOR.pgwrap = { tag: '页面留白', params: ['--ac-maxw', '--ac-pgx', '--ac-hero-padt'],
+  h: [{ k: '--ac-pgx', lb: '左右留白', f: .12, min: 8, max: 120, u: 'px', pos: 'r' }] }
+ST_MODS_LIB.pgwrap = { tag: '页面留白', params: ['--lb-maxw', '--lb-pgx', '--lb-padt', '--lb-padb'],
+  h: [{ k: '--lb-pgx', lb: '左右留白', f: .12, min: 0, max: 120, u: 'px', pos: 'r' }] }
+ST_MODS_ALIST.pgwrap = { tag: '页面留白', params: ['--al-maxw', '--al-padx', '--al-padt', '--al-padb'],
+  h: [{ k: '--al-padx', lb: '左右留白', f: .12, min: 0, max: 140, u: 'px', pos: 'r' }] }
+ST_MODS_RANK.pgwrap = { tag: '页面留白', params: ['--rk-maxw', '--rk-padx', '--rk-padt', '--rk-padb'],
+  h: [{ k: '--rk-padx', lb: '左右留白', f: .12, min: 0, max: 140, u: 'px', pos: 'r' }] }
+ST_MODS_SERIES.pgwrap = { tag: '页面留白', params: ['--sr-maxw', '--sr-padx', '--sr-padt', '--sr-padb'],
+  h: [{ k: '--sr-padx', lb: '左右留白', f: .12, min: 0, max: 140, u: 'px' }] }
+ST_MODS_SP.pgwrap = { tag: '页面留白', params: ['--sp-maxw', '--sp-padx', '--sp-padt'],
+  h: [{ k: '--sp-padx', lb: '左右留白', f: .12, min: 0, max: 140, u: 'px', pos: 'r' }] }
+ST_MODS_ADD.pgwrap = { tag: '页面留白', params: ['--ad-maxw', '--ad-padx', '--ad-padt'],
+  h: [{ k: '--ad-padx', lb: '左右留白', f: .12, min: 0, max: 140, u: 'px', pos: 'r' }] }
 
 /* ---- 画布：给模块挂名字标签 + 尺寸把手，并支持直接拖拽改尺寸 ---- */
 const ST_IS_MOVIE = isMovieMode   // 同一个判断，只是名字不同（画布与外层共用）
@@ -9851,7 +9873,7 @@ function applyTheme(id) {
 }
 function themeRender() {
   const grid = document.getElementById('themeGrid'); if (!grid) return
-  const cur = PREF('theme') || ''
+  const cur = PREF('theme') || 'neon'   // 默认霓虹：没存过主题（或存了空）都算 neon
   grid.innerHTML = THEMES.map(t => {
     const on = cur === t.id
     return '<div class="theme-card" data-t="' + t.id + '" style="cursor:pointer;border:2px solid ' + (on ? t.accent : 'rgba(0,0,0,.12)') + ';border-radius:12px;overflow:hidden;background:var(--bg-elev);transition:border-color .15s,transform .15s">'
@@ -9866,7 +9888,8 @@ function themeRender() {
       + '</div></div>'
   }).join('')
   grid.querySelectorAll('.theme-card').forEach(el => el.addEventListener('click', () => {
-    applyTheme(cur === el.dataset.t ? '' : el.dataset.t)
+    if (cur === el.dataset.t) return   // 已是当前主题（含默认霓虹）再点不动，避免「取消选中」退回旧暗色
+    applyTheme(el.dataset.t)
     themeRender()
   }))
 }
@@ -12391,6 +12414,8 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
     const M = modsOf()
     return [...doc.querySelectorAll('[data-mod]')]
       .filter(e => M[e.dataset.mod])
+      /* 各页容器常驻 DOM（只是没 .open）：只列当前可见页面的模块，否则「页面留白」会重复出现 */
+      .filter(e => { try { return !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length) } catch (_) { return true } })
       .map(e => ({ uid: e.dataset.st, id: e.dataset.mod, on: true }))
   }
   function renderMods() {
@@ -12401,7 +12426,7 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
       const l = a ? a.layout() : readLayout()
       if (l && l.length) S.layout = l
     }
-    /* 主页的导航栏是固定模块（不在布局里）：画布里存在就在列表最上面给一项，只能选中调尺寸 */
+    /* 主页的导航栏 / 整页留白是固定模块（不在布局里）：画布里存在就在列表最上面给一项，只能选中调尺寸 */
     let navItem = ''
     if (S.mode === 'home' && modsOf().nav) {
       let hasNav = false
@@ -12412,13 +12437,23 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
         <span class="nm" title="导航栏（固定模块，选中后调高度/留白/字号）">导航栏</span>
       </div>`
     }
+    let pgItem = ''
+    if (S.mode === 'home' && modsOf().homepg) {
+      let hasPg = false
+      try { hasPg = !!(frame.contentDocument && frame.contentDocument.querySelector('[data-st="homepg"]')) } catch (_) {}
+      if (hasPg) pgItem = `
+      <div class="st-mod${S.sel === 'homepg' ? ' sel' : ''}" data-uid="homepg">
+        <span class="st-mini" style="border:0;background:none;width:14px">•</span>
+        <span class="nm" title="整个页面的左右留白与区块间距">页面留白</span>
+      </div>`
+    }
     const box = $('stMods')
     $('stModCount').textContent = isMovie ? (S.layout.length + ' 个') : (S.layout.filter(m => m.on !== false).length + '/' + S.layout.length)
-    if (!S.layout.length && !navItem) {
+    if (!S.layout.length && !navItem && !pgItem) {
       box.innerHTML = '<div class="st-empty">' + (isMovie ? '详情页数据还在加载…稍等一下' : '页面还没有模块，下面「添加模块」加一个') + '</div>'
       return
     }
-    box.innerHTML = navItem + S.layout.map((m, i) => `
+    box.innerHTML = navItem + pgItem + S.layout.map((m, i) => `
       <div class="st-mod${S.sel === m.uid ? ' sel' : ''}${m.on === false ? ' off' : ''}" data-uid="${m.uid}">
         ${isMovie ? '<span class="st-mini" style="border:0;background:none;width:14px">•</span>' : `<button class="st-mini" data-act="up" title="上移">↑</button>
         <button class="st-mini" data-act="down" title="下移">↓</button>`}
@@ -12504,6 +12539,19 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
   }
 
   /* ---------------- 右栏：选中模块的参数 ---------------- */
+  /* 页面级参数按当前页各配一份：原来写死的是主页变量（--pgx 等），在别的页里调了也不生效 */
+  const PG_LEVEL = {
+    home: ['--cover-ratio', '--fan-ratio', '--pgx', '--blockgap', '--rowtitle-fs'],
+    movie: ['--cover-ratio', '--fan-ratio', '--mv-maxw', '--mv-padx', '--mv-padt', '--mv-padb'],
+    actor: ['--cover-ratio', '--fan-ratio', '--ac-maxw', '--ac-pgx', '--ac-hero-padt'],
+    lib: ['--cover-ratio', '--fan-ratio', '--lb-maxw', '--lb-pgx', '--lb-padt', '--lb-padb'],
+    alist: ['--cover-ratio', '--fan-ratio', '--al-maxw', '--al-padx', '--al-padt', '--al-padb'],
+    rank: ['--cover-ratio', '--fan-ratio', '--rk-maxw', '--rk-padx', '--rk-padt', '--rk-padb'],
+    series: ['--cover-ratio', '--fan-ratio', '--sr-maxw', '--sr-padx', '--sr-padt', '--sr-padb'],
+    sp: ['--sp-maxw', '--sp-padx', '--sp-padt'],
+    add: ['--ad-maxw', '--ad-padx', '--ad-padt']
+  }
+  const pgLevelRows = () => PG_LEVEL[S.mode] || ['--cover-ratio', '--fan-ratio', '--pgx', '--blockgap', '--rowtitle-fs']
   /* 全库标签词表：徽章（有码/无码/中字…）排前面，NFO 类别（剧情/巨乳…）按片数排 */
   function tagListOf() {
     const lib = (typeof LIB !== 'undefined' && LIB && LIB.length ? LIB : (window.LIB || []))
@@ -12563,9 +12611,9 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
     const head = $('stRHead'), body = $('stBody')
     const m = S.layout.find(x => x.uid === S.sel) || (S.sel && modsOf()[S.sel] ? { uid: S.sel, id: S.sel, on: true } : null)
     if (!m) {
-      head.innerHTML = '未选中模块<small>点中间页面里的模块（或左栏列表）来选中，选中后能直接拖红色把手改尺寸</small>'
-      body.innerHTML = `<details class="st-sec" open><summary>页面级（全站生效）</summary>
-        ${['--cover-ratio', '--fan-ratio', '--pgx', '--blockgap', '--rowtitle-fs'].map(itemHtml).join('')}</details>`
+      head.innerHTML = '未选中模块<small>点中间页面里的模块（或左栏列表）来选中，选中后能直接拖红色把手改尺寸；「页面留白」一节调整个页面的边距与宽度</small>'
+      body.innerHTML = `<details class="st-sec" open><summary>页面留白（本页生效）</summary>
+        ${pgLevelRows().map(itemHtml).join('')}</details>`
       bindRows(body)
       return
     }
@@ -12581,7 +12629,7 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
       note: '当前标签：' + m.id.slice(4) + ' · 点「更换标签」重新挑一个'
     })
     if (m.id === 'lbwall') secs.push({ title: '影片墙显示内容', rows: (typeof LB_FIELDS !== 'undefined' ? LB_FIELDS : []).map(f => '@fld.' + f[0]) })
-    secs.push({ title: '页面级（全站生效）', rows: ['--cover-ratio', '--fan-ratio', '--pgx', '--blockgap', '--rowtitle-fs'] })
+    secs.push({ title: '页面留白（本页生效）', rows: pgLevelRows() })
     body.innerHTML = secs.map((s, i) => `<details class="st-sec"${i === 0 ? ' open' : ''}><summary>${esc(s.title)}</summary>${s.note ? `<div class="st-note">${esc(s.note)}</div>` : ''}${s.rows.map(itemHtml).join('')}</details>`).join('')
     bindRows(body)
     bindTagRow(body, m.uid)
