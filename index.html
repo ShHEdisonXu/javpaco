@@ -5002,6 +5002,7 @@ function updateHomeEditBtn() {
   }
   EDIT_MODE = m
   b.style.display = m ? '' : 'none'
+  b.dataset.mode = m || ''                          // 模式烙在按钮上：点击时直接用，不靠点击瞬间的 hash 再猜
   if (m) b.innerHTML = EDIT_BTN[m] || '✎ 编辑'
 }
 window.htSet = function (k, v, unit) {
@@ -12299,8 +12300,11 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
     const hash = S.mode === 'home' ? '#/' : (location.hash || '#/')   // 详情/女优页保留当前 hash
     return location.pathname + '?st=1' + hash
   }
-  function openStudio() {
-    S.mode = (typeof editModeOf === 'function' && editModeOf()) || 'home'
+  function openStudio(forced) {
+    S.mode = forced || (typeof editModeOf === 'function' && editModeOf()) || 'home'
+    if (!forced && S.mode === 'home' && location.hash && location.hash !== '#/' && location.hash !== '#') {
+      console.warn('[studio] 模式回落到 home，hash=', location.hash, 'btn.dataset.mode=', btn.dataset.mode)   // 诊断用：正常永远不会触发
+    }
     S.layout = readLayout() || []
     S.enter = snapshot()
     S.sel = null
@@ -12338,8 +12342,9 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
     updateHomeEditBtn()
   }
   btn.addEventListener('click', () => {
-    if (!editModeOf()) return
-    if (studio.classList.contains('open')) closeStudio(); else openStudio()
+    const m = btn.dataset.mode || editModeOf()      // 优先用按钮上烙好的模式（route 时已解析）
+    if (!m) return
+    if (studio.classList.contains('open')) closeStudio(); else openStudio(m)
   })
   $('stExit').addEventListener('click', () => {
     pushSnap(S.enter)
