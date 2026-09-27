@@ -12632,7 +12632,8 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
       note: '当前标签：' + m.id.slice(4) + ' · 点「更换标签」重新挑一个'
     })
     if (m.id === 'lbwall') secs.push({ title: '影片墙显示内容', rows: (typeof LB_FIELDS !== 'undefined' ? LB_FIELDS : []).map(f => '@fld.' + f[0]) })
-    secs.push({ title: '页面留白（本页生效）', rows: pgLevelRows() })
+    /* 选中的就是「页面留白」模块时不再重复附页面级一节（参数完全相同，出现两遍） */
+    if (!['pgwrap', 'homepg', 'mvpage'].includes(m.id)) secs.push({ title: '页面留白（本页生效）', rows: pgLevelRows() })
     body.innerHTML = secs.map((s, i) => `<details class="st-sec"${i === 0 ? ' open' : ''}><summary>${esc(s.title)}</summary>${s.note ? `<div class="st-note">${esc(s.note)}</div>` : ''}${s.rows.map(itemHtml).join('')}</details>`).join('')
     bindRows(body)
     bindTagRow(body, m.uid)
