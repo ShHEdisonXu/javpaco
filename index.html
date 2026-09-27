@@ -12605,7 +12605,11 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
     const row = rowDef(k)
     if (!row) return ''
     const live = a ? a.val(k) : null
-    const v = live == null ? (parseFloat(row.min) || 0) : live
+    /* 回退顺序：画布实际值 → :root CSS 默认值 → 行定义 min。
+     * 原来回退直接用 min：画布没就绪时滑块显示 900（实际默认 1280），一拖就跳变 */
+    let v = live == null ? NaN : parseFloat(live)
+    if (isNaN(v)) v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(k))
+    if (isNaN(v)) v = parseFloat(row.min) || 0
     const unit = row.unit || ''
     return `<div class="st-row"><label>${esc(row.label)}<b data-out="${k}">${fmtV(v, unit)}</b></label>
       <input type="range" data-k="${k}" data-unit="${unit}" min="${row.min}" max="${row.max}" step="${row.step}" value="${v}"></div>`
