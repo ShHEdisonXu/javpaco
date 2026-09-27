@@ -162,6 +162,7 @@ async function onlineGet(rel, { timeout = 20000, raw = false, tries = 3 } = {}) 
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), timeout)
     try {
+      /* JavDB 国内直连线路，固定直连不走代理（用户确认不经代理） */
       const r = await fetch(base + '/api/' + String(rel).replace(/^\/+/, ''), {
         signal: ac.signal,
         headers: {
@@ -207,6 +208,7 @@ async function onlineImageGet(u, { timeout = 20000 } = {}) {
   try { url = new URL(decodeURIComponent(raw)) } catch (_) { throw new Error('图片地址不合法') }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('不允许的图片协议')
   if (!IMG_HOST_OK.test(url.hostname)) throw new Error('不允许的图片来源')
+  /* JavDB 图床（tp.spfcas.com 等）国内直连即通，固定直连不走代理 */
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), timeout)
   try {
@@ -1588,6 +1590,30 @@ async function mnFetch(url, bin, pOverride, referer, opt) {
     try { return await once() } catch (e) { mnFetch.lastErr = e && e.message; if (i < tries - 1) await new Promise(s => setTimeout(s, 1200 * (i + 1))) }
   }
   return null
+}
+
+/* 数据源连通性探测（v0.2.29）：经代理发 GET，只看响应头（不收正文），跟随最多 5 次跳转。
+ * 老实现「首发必须 200」会把 javbus/avmoo 这类 302 跳转（年龄门/补斜杠）误判成连不上，
+ * 用户以为代理坏了，实际线路是通的。 */
+function srcProbeOnce(url, pUrl) {
+  return new Promise((resolve, reject) => {
+    let u
+    try { u = new URL(url) } catch (e) { return reject(new Error('地址不合法')) }
+    const fin = (status, location) => { try { rq.destroy() } catch (_) {} resolve({ status, location }) }
+    let rq
+    if (u.protocol === 'https:') {
+      const opts = { host: u.hostname, port: Number(u.port) || 443, path: u.pathname + u.search, method: 'GET',
+        headers: { 'user-agent': MN_UA, accept: '*/*', connection: 'close' } }
+      if (pUrl) { try { opts.agent = tunnelAgent(pUrl) } catch (e) { return reject(e) } }
+      rq = https.request(opts, rs => { rs.resume(); fin(rs.statusCode, rs.headers.location) })
+    } else {
+      rq = http.request({ host: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { 'user-agent': MN_UA, accept: '*/*', connection: 'close' } },
+        rs => { rs.resume(); fin(rs.statusCode, rs.headers.location) })
+    }
+    rq.setTimeout(15000, () => { try { rq.destroy(new Error('超时')) } catch (_) {} reject(new Error('超时')) })
+    rq.on('error', e => { try { rq.destroy() } catch (_) {} reject(e) })
+    rq.end()
+  })
 }
 
 /* 头像文件名：沿用已有 icon 的基名（与每日同步脚本的 key 方案一致） */
@@ -3955,6 +3981,7 @@ async function handleActorApi(req, res, p) {
       rankHour: rankHour(), rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running,
       autoScrapeNew: CFG.autoScrapeNew !== false,
       autoAvatar: CFG.autoAvatar !== false,
+      auto115Watch: CFG.auto115Watch !== false,
       autoAvatarRunning: AVA_BACKFILL_RUNNING, autoAvatarStats: AVA_BACKFILL_STATS,
       autoRescan: CFG.autoRescan === true, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
       accessOn: !!ACCESS_CODE(),
@@ -3968,6 +3995,7 @@ async function handleActorApi(req, res, p) {
       if (!CFG.autoAvatar) AVA_BACKFILL_RUNNING = false   // 关开关 → 立即叫停进行中的预取
     }
     if ('autoRescan' in body) CFG.autoRescan = !!body.autoRescan
+    if ('auto115Watch' in body) CFG.auto115Watch = !!body.auto115Watch
     if ('autoRescanHour' in body) CFG.autoRescanHour = Math.max(0, Math.min(23, parseInt(body.autoRescanHour, 10) || 0))
     if ('rankAuto' in body) CFG.rankAuto = !!body.rankAuto
     if ('rankHour' in body) CFG.rankHour = Math.max(0, Math.min(23, parseInt(body.rankHour, 10) || 0))
@@ -4463,7 +4491,16 @@ async function handleActorApi(req, res, p) {
     const results = []
     for (const m of magnets) { try { results.push(Object.assign({ magnet: m }, await pan115AddOne(m))) } catch (e) { results.push({ magnet: m, ok: false, error: e.message }) } }
     const okN = results.filter(r => r.ok).length
+    if (okN > 0) watch115Push(String(body.code || ''))   // 推送成功 → 登记自动认领盯梢
     return json(res, { ok: okN > 0, code: String(body.code || ''), pushed: okN, total: magnets.length, results, savepath: c.savepath })
+  }
+  if (p === '/api/115/watch') {   // 自动认领盯梢状态：body { code }（可空）→ 任务列表（详情页轮询本页番号的任务）
+    const code = norm(String(body.code || ''))
+    const jobs = W115.jobs
+      .filter(j => !code || bare(j.code) === bare(code))
+      .sort((a, b) => b.addedAt - a.addedAt)
+      .slice(0, 20)
+    return json(res, { ok: true, watching: jobs.some(j => j.status === 'watching'), jobs })
   }
   if (p === '/api/115/tasks') {   // 离线任务列表（设置页查验推送结果）
     const c = pan115Cfg()
@@ -4770,25 +4807,61 @@ async function handleActorApi(req, res, p) {
     if (!/^https?:\/\//.test(url)) url = 'https://' + url
     const t0 = Date.now()
     try {
-      const html = await mnFetch(url, false)
-      const ms = Date.now() - t0
-      if (!html) {
-        const err = mnFetch.lastErr || ''
-        const why = /http 403/.test(err) ? '站点拒绝程序访问（403 反爬，浏览器可正常打开）'
-          : /http 4/.test(err) ? '请求被拒绝（' + err + '）'
-          : '无法访问（检查代理设置）'
-        return json(res, { ok: false, ms, error: why })
+      const pv = proxyUrl()
+      let cur = url, status = 0
+      for (let hop = 0; hop < 5; hop++) {
+        const r = await srcProbeOnce(cur, pv)
+        status = r.status
+        if (status >= 300 && status < 400 && r.location) {
+          try { const next = new URL(r.location, cur).href; if (next !== cur) { cur = next; continue } } catch (_) {}
+        }
+        break
       }
-      const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
-      return json(res, { ok: true, ms, title: (m ? m[1].replace(/\s+/g, ' ').trim() : '').slice(0, 80) })
-    } catch (e) { return json(res, { ok: false, ms: Date.now() - t0, error: e.message }) }
+      const ms = Date.now() - t0
+      if (status >= 200 && status < 300) return json(res, { ok: true, ms, status })
+      if (status === 403) return json(res, { ok: false, ms, status, error: '线路通（' + ms + 'ms）但站点反爬拦截 403，刮削可能被拒' })
+      if (status >= 300 && status < 400) return json(res, { ok: false, ms, status, error: '跳转 ' + (5 + 1) + ' 次仍未落地（' + status + '）' })
+      if (status >= 500) return json(res, { ok: false, ms, status, error: '站点服务器错误（' + status + '），线路本身是通的（' + ms + 'ms）' })
+      return json(res, { ok: false, ms, status, error: '站点返回 ' + status })
+    } catch (e) {
+      const msg = e.message || '无响应'
+      return json(res, { ok: false, ms: Date.now() - t0, error: /超时/.test(msg) ? '超时（线路不通或站点无响应）' : '连不上：' + msg })
+    }
   }
   if (p === '/api/config/test') {
-    const pv = body.proxy !== undefined ? String(body.proxy || '').trim() : proxyUrl()
-    const t0 = Date.now()
-    const html = await mnFetch(MN_BASE, false, pv)
-    const ms = Date.now() - t0
-    return json(res, html ? { ok: true, ms, via: pv || 'direct' } : { ok: false, ms, via: pv || 'direct', error: '访问 minnano 失败' })
+    /* 线路延迟测试（v0.2.29）：只测「这条代理线路本身」的延迟，不绑任何具体网站。
+     * 目标用中立的连通性检测端点（微软 NCSI connecttest.txt，国内外直连/经代理都可达）。
+     * 注意必须走 HTTP 80：该域名的 HTTPS 在国内会被解析到没有证书的 Akamai 节点（实测）。
+     * 经 http 代理用 absolute-form GET（代理测延迟的标准做法），连测 3 次回每次耗时 + 平均。 */
+    /* 对齐 mdc-ng proxyConnectionTest：成功 = HTTP 200–399；代理地址缺协议前缀时补 http://（mdc-ng 是直接报错，这里更宽容） */
+    let pv = body.proxy !== undefined ? String(body.proxy || '').trim() : proxyUrl()
+    if (pv && !/^(https?|socks4|socks5):\/\//i.test(pv)) pv = 'http://' + pv
+    const lineProbe = () => new Promise(resolve => {
+      const t0 = Date.now()
+      const done = r => resolve(Object.assign({ ms: Date.now() - t0 }, r))
+      try {
+        const u = new URL('http://www.msftconnecttest.com/connecttest.txt')
+        let rq
+        if (pv) {
+          const pu = new URL(pv)
+          rq = http.request({ host: pu.hostname, port: Number(pu.port) || 80, path: 'http://www.msftconnecttest.com/connecttest.txt', method: 'GET', headers: { host: u.hostname, 'user-agent': MN_UA, accept: '*/*' } },
+            rs => { rs.resume(); done({ ok: rs.statusCode >= 200 && rs.statusCode < 400, status: rs.statusCode }) })
+        } else {
+          rq = http.request({ host: u.hostname, path: u.pathname, method: 'GET', headers: { host: u.hostname, 'user-agent': MN_UA, accept: '*/*' } },
+            rs => { rs.resume(); done({ ok: rs.statusCode >= 200 && rs.statusCode < 400, status: rs.statusCode }) })
+        }
+        rq.setTimeout(8000, () => { try { rq.destroy(new Error('超时')) } catch (_) {} done({ ok: false, error: '超时' }) })
+        rq.on('error', e => done({ ok: false, error: e.message }))
+        rq.end()
+      } catch (e) { done({ ok: false, error: e.message }) }
+    })
+    const samples = []
+    for (let i = 0; i < 3; i++) { samples.push(await lineProbe()); if (i < 2) await new Promise(s => setTimeout(s, 300)) }
+    const okN = samples.filter(x => x.ok)
+    const avg = okN.length ? Math.round(okN.reduce((s, x) => s + x.ms, 0) / okN.length) : 0
+    const bad = samples.find(x => !x.ok) || {}
+    const errText = bad.error ? bad.error : (bad.status ? '代理请求失败：HTTP ' + bad.status : '无响应')
+    return json(res, { ok: okN.length > 0, via: pv || 'direct', avg, samples, error: okN.length ? '' : errText })
   }
   if (p === '/api/actor/scrape') {
     const mnid = String(body.mnid || '').replace(/\D/g, '')
@@ -5058,6 +5131,52 @@ async function handleActorApi(req, res, p) {
   }
   /* 重新扫描（等价「⟳ 重新扫描」）：扫描中调用会在本轮结束后自动再扫一遍 */
   if (p === '/api/library/rescan') { rescan(); return json(res, { ok: true, scanning: SCAN.running }) }
+  /* 番号页「📂 找媒体文件」（v0.2.29）：按番号在媒体库里找文件名/文件夹匹配的视频（手动触发，不自动跑）。
+   * 场景：线上详情页推送 115 离线下载完成后，文件落进挂载目录，来这里认领绑定入库。 */
+  if (p === '/api/library/matchCode') {
+    const code = norm(String(body.code || ''))
+    if (!code || !bare(code)) return json(res, { ok: false, error: '缺少番号' })
+    const ccode = bare(code)
+    const matches = []
+    const seen = new Set()
+    for (const lib of LIBS) {
+      for (const v of await walkAsync(lib)) {
+        if (seen.has(v)) continue; seen.add(v)
+        const bn = bare(baseOf(v))
+        const dn = bare(path.basename(path.dirname(v)))
+        let pc = ''
+        try { pc = bare(parseName(v).code) } catch (_) {}
+        if (pc === ccode || (ccode.length >= 3 && (bn.includes(ccode) || dn.includes(ccode)))) {
+          matches.push({
+            relVideo: path.relative(MEDIA_ROOT, v).split(path.sep).join('/'),
+            file: path.basename(v),
+            dir: path.relative(lib, path.dirname(v)).split(path.sep).join('/')
+          })
+        }
+      }
+    }
+    matches.sort((a, b) => a.relVideo.localeCompare(b.relVideo))
+    return json(res, { ok: true, code, matches })
+  }
+  /* 把找到的文件绑定到番号：写 manual-codes.json（重扫后仍生效）→ 触发重扫入库。
+   * 重扫后该文件的番号取 manualCode，enrichFromCache 会回填本番号已有的离线数据 → 详情页自动变在库。 */
+  if (p === '/api/library/bindCode') {
+    const code = norm(String(body.code || ''))
+    const relVideo = String(body.relVideo || '').trim().replace(/\\/g, '/')
+    if (!code || !relVideo) return json(res, { ok: false, error: '缺少番号或文件路径' })
+    if (relVideo.includes('..') || path.isAbsolute(relVideo)) return json(res, { ok: false, error: '非法路径' })
+    /* relVideo 相对挂载根（MEDIA_ROOT）；必须落在某个已配置媒体库（LIBS 是挂载根的子目录）里 */
+    const fp = path.resolve(MEDIA_ROOT, relVideo)
+    let exists = false
+    for (const lib of LIBS) {
+      const rl = path.resolve(lib)
+      if (fp === rl || fp.startsWith(rl + path.sep)) { try { if (fs.statSync(fp).isFile()) exists = true } catch (_) {} break }
+    }
+    if (!exists) return json(res, { ok: false, error: '文件不在媒体库中（或已被移动）' })
+    saveManualCode(relVideo, code)
+    rescan()
+    return json(res, { ok: true, code, relVideo, scanning: SCAN.running })
+  }
   if (p === '/api/library/add' || p === '/api/library/remove') {
     /* 移除「导入整理用过目录」的记录（body.importDir）：不动文件、不重扫 */
     if (p === '/api/library/remove' && body.importDir) {
@@ -5115,7 +5234,7 @@ async function handleActorApi(req, res, p) {
     const applied = []
     try {
       if (inc.config && typeof inc.config === 'object') {
-        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoOrganize', 'autoScrapeNew', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
+        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoOrganize', 'autoScrapeNew', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'auto115Watch', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
         SAFE.forEach(k => { if (inc.config[k] !== undefined) CFG[k] = inc.config[k] })
         LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
         writeCfg(); applied.push('配置')
@@ -6100,6 +6219,136 @@ function autoOrganizeCode(code) {
   return { moved, failed }
 }
 
+/* ================= 项目内置动作 ③：115 推送自动认领（v0.2.29） =================
+ * 线上详情页推送磁力到 115 离线下载后，服务自动盯梢媒体库：
+ *   文件落盘（连续两轮看到且大小不变才算稳定）→ 绑定番号（manual-codes.json，文件名解析不出番号也能挂对）
+ *   → 清理同目录垃圾文件（网页 / 种子 / 快捷方式 / 系统文件，不动视频图片 nfo 字幕）
+ *   → 重扫入库 → 原地整理成 <番号>/<番号>-标签.ext（复用 autoOrganizeCode）→ 路径变了再扫一遍。
+ * 库里已有该番号离线数据（详情页）→ 重扫时 enrichFromCache 自动挂上；
+ * 没有 → 扫描尾部的 autoScrapeNew 自动排队刮削（元数据 / 封面 / 剧照进离线数据）。
+ * 开关：设置 → 刮削「115 推送自动认领」（CFG.auto115Watch，默认开）。任务 24h 未等到文件自动作废。 */
+const W115 = { jobs: [], timer: null }
+const W115_JUNK = /\.(html?|url|torrent|lnk|mht|aspx?|php\d?)$/i
+const W115_JUNK_NAME = /^(thumbs\.db|desktop\.ini|\.ds_store)$/i
+function w115File() { return path.join(cacheDir(), '115-watch.json') }
+function w115Load() {
+  try { const v = JSON.parse(fs.readFileSync(w115File(), 'utf8')); if (Array.isArray(v.jobs)) W115.jobs = v.jobs } catch (_) {}
+}
+function w115Save() {
+  try { fs.mkdirSync(cacheDir(), { recursive: true }); fs.writeFileSync(w115File(), JSON.stringify({ jobs: W115.jobs.slice(-50) }, null, 2)) } catch (_) {}
+}
+function watch115Push(code) {
+  code = norm(String(code || ''))
+  if (!code || !bare(code) || CFG.auto115Watch === false) return
+  if (W115.jobs.some(j => j.code === code && (j.status === 'watching' || j.status === 'rescanning'))) return
+  W115.jobs.push({ code, addedAt: Date.now(), status: 'watching', rounds: 0, seen: {}, note: '' })
+  W115.jobs = W115.jobs.slice(-50)
+  w115Save()
+  console.log('[115-watch] 盯梢 ' + code + '：等离线下载的文件落进媒体库（每 2 分钟查一轮，24h 内有效）')
+  if (W115.timer) { clearTimeout(W115.timer); W115.timer = null }
+  W115.timer = setTimeout(() => { W115.timer = null; w115Pump() }, 20000)
+}
+/* 与 /api/library/matchCode 同口径找文件，但用「词边界」匹配防误伤（ABC-1 不许匹配 ABC-123） */
+async function w115FindMatches(code) {
+  const ccode = bare(code)
+  if (!ccode || ccode.length < 3) return []
+  const re = new RegExp('(^|[^A-Z0-9])' + ccode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^A-Z0-9])')
+  const matches = []
+  const seen = new Set()
+  for (const lib of LIBS) {
+    for (const v of await walkAsync(lib)) {
+      if (seen.has(v)) continue; seen.add(v)
+      let pc = ''
+      try { pc = bare(parseName(v).code) } catch (_) {}
+      const rawName = (path.basename(v) + ' ' + path.basename(path.dirname(v))).toUpperCase()
+      if (pc === ccode || re.test(rawName)) matches.push(v)
+    }
+  }
+  return matches
+}
+function waitScanDone(maxMs) {
+  return new Promise(resolve => {
+    const t0 = Date.now()
+    const tick = () => {
+      if (!SCAN.running || Date.now() - t0 > (maxMs || 30 * 60 * 1000)) return resolve()
+      setTimeout(tick, 2000)
+    }
+    setTimeout(tick, 1500)
+  })
+}
+async function w115Claim(job, files) {
+  const code = job.code
+  const dirs = new Set()
+  let bound = 0
+  for (const v of files) {
+    const rel = path.relative(MEDIA_ROOT, v).split(path.sep).join('/')
+    let pc = ''
+    try { pc = norm(parseName(v).code || '') } catch (_) {}
+    if (bare(pc) !== bare(code)) { saveManualCode(rel, code); bound++ }
+    dirs.add(path.dirname(v))
+  }
+  /* 清垃圾：只动认领文件同目录下的网页/种子/快捷方式/隐藏系统文件，视频图片 nfo 字幕一律保留 */
+  const cleaned = []
+  for (const dir of dirs) {
+    let entries = []
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch (_) { continue }
+    for (const e of entries) {
+      if (e.isDirectory()) continue
+      if (W115_JUNK.test(e.name) || W115_JUNK_NAME.test(e.name) || e.name.startsWith('.')) {
+        try { fs.unlinkSync(path.join(dir, e.name)); cleaned.push(e.name) } catch (_) {}
+      }
+    }
+  }
+  job.status = 'rescanning'; job.note = ''; w115Save()
+  rescan()                                   // 入库：manualCode 生效 + enrichFromCache / autoScrapeNew
+  await waitScanDone()
+  const og = autoOrganizeCode(code)          // 原地整理 <番号>/<番号>-标签.ext
+  if (og.moved && og.moved.length) rescan()  // 路径变了再刷一遍 DATA
+  job.status = 'done'
+  job.finishedAt = Date.now()
+  job.found = files.length; job.bound = bound; job.cleaned = cleaned.length; job.organized = (og.moved || []).length
+  job.note = '已入库 ' + files.length + ' 个文件' + (bound ? '、绑定番号' : '') + (og.moved && og.moved.length ? '、已原地整理' : '') + (cleaned.length ? '、清理垃圾 ' + cleaned.length + ' 个' : '')
+  console.log('[115-watch] ✓ ' + code + '：' + job.note + (cleaned.length ? '（清理：' + cleaned.slice(0, 5).join('、') + '）' : ''))
+}
+async function w115Pump() {
+  W115.timer = null
+  if (W115.running) { w115Reschedule(120000); return }   // 上一轮还没跑完 → 稍后再来
+  W115.running = true
+  try {
+    if (CFG.auto115Watch !== false) {
+      if (SCAN.running) return w115Reschedule(120000)   // 扫描中让路（walk 云盘挂载很贵）
+      const act = W115.jobs.filter(j => j.status === 'watching')
+      const now = Date.now()
+      for (const job of act) {
+        if (now - job.addedAt > 24 * 3600 * 1000) { job.status = 'expired'; job.note = '24 小时未等到文件，已放弃'; continue }
+        try {
+          const matches = await w115FindMatches(job.code)
+          if (!matches.length) { job.rounds = 0; job.seen = {}; continue }
+          /* 稳定性闸门：连续两轮都看到且大小不变才认领（防云盘列表瞬态） */
+          const snap = {}
+          const stable = []
+          for (const v of matches) {
+            let sz = 0
+            try { sz = fs.statSync(v).size } catch (_) { continue }
+            const rel = path.relative(MEDIA_ROOT, v).split(path.sep).join('/')
+            snap[rel] = sz
+            if (sz > 0 && (job.seen || {})[rel] === sz) stable.push(v)
+          }
+          job.seen = snap
+          if (!stable.length) continue
+          await w115Claim(job, stable)
+        } catch (e) { job.note = e.message }
+      }
+      w115Save()
+    }
+  } finally { W115.running = false }
+  w115Reschedule(120000)
+}
+function w115Reschedule(ms) {
+  if (W115.timer || !W115.jobs.some(j => j.status === 'watching')) return
+  W115.timer = setTimeout(() => { W115.timer = null; w115Pump() }, ms)
+}
+
 /* ================= 项目内置动作 ②：女优人气榜每日更新 =================
  * 不依赖任何外部定时任务：服务自己在每天 rankHour 点刷一遍 minnano 日/周/月榜，
  * 写回项目里的 rankings.json（缺资料的女优补进内置补充名册 actresses-extra.json）。
@@ -6547,7 +6796,8 @@ const server = http.createServer((req, res) => {
     if (p === '/api/config' || p === '/api/config/test' || p === '/api/prefs' || p === '/api/rank/update' || p === '/api/rank/status' ||
         p === '/api/actor/scrape' || p === '/api/actor/save' || p === '/api/actor/sync' ||
         p === '/api/actor/probe' || p === '/api/actor/pick-avatar' ||
-        p === '/api/library' || p === '/api/library/add' || p === '/api/library/remove' || p === '/api/library/rescan' || p === '/api/lib/hide' ||
+        p === '/api/library' || p === '/api/library/add' || p === '/api/library/remove' || p === '/api/library/rescan' ||
+        p === '/api/library/matchCode' || p === '/api/library/bindCode' || p === '/api/lib/hide' ||
         p === '/api/sources' || p === '/api/source/test' ||
         p === '/api/watch' || p === '/api/watch/del' || p === '/api/watch/done' ||
         p === '/api/userdata' || p === '/api/bulk/move' ||
@@ -6556,7 +6806,7 @@ const server = http.createServer((req, res) => {
         p === '/api/favorites' || p === '/api/subscriptions' || p === '/api/subscriptions/feed' ||
         p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/image' || p === '/api/online/config' ||
         p === '/api/online/detail' || p === '/api/online/reviews' || p === '/api/online/board' || p === '/api/online/search' ||
-        p === '/api/115/config' || p === '/api/115/test' || p === '/api/115/push' || p === '/api/115/tasks' || p === '/api/115/dirs' ||
+        p === '/api/115/config' || p === '/api/115/test' || p === '/api/115/push' || p === '/api/115/tasks' || p === '/api/115/dirs' || p === '/api/115/watch' ||
         p === '/api/subs' || p === '/api/subs/get') {
       if (req.method !== 'POST' &&
         !(p === '/api/config' && req.method === 'GET') && !(p === '/api/prefs' && req.method === 'GET') &&
@@ -6738,6 +6988,9 @@ server.listen(PORT, '0.0.0.0', () => {
   /* 部署完自动拉头像：等扫描稳定后首轮，之后每 12h 补一次新增（开关 设置→autoAvatar） */
   setTimeout(() => avatarBackfillOnce('boot').catch(() => {}), 15000)
   setInterval(() => avatarBackfillOnce('timer').catch(() => {}), 12 * 3600 * 1000).unref()
+  /* 115 推送自动认领：恢复上次没盯完的任务（服务重启不丢） */
+  w115Load()
+  if (W115.jobs.some(j => j.status === 'watching')) setTimeout(w115Pump, 30000)
 })
 
 process.on('SIGINT', () => { console.log('\n已停止'); process.exit(0) })

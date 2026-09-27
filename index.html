@@ -2893,6 +2893,11 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
             <label class="sp-switch"><input type="checkbox" id="optAutoScrapeNew" checked><i></i></label>
           </div>
           <div class="sp-row">
+            <div class="l">115 推送自动认领
+              <small>线上详情页推送磁力到 115 后，服务自动盯梢媒体库（每 2 分钟一轮，24h 内有效）：文件下载完成 → 自动绑定番号 → 清理同目录垃圾文件（网页 / 种子 / 快捷方式）→ 原地整理成 番号/番号-标签.mp4 → 重扫入库。本机已有详情页的直接挂上；没有的自动走刮削通道补元数据和封面。</small></div>
+            <label class="sp-switch"><input type="checkbox" id="optAuto115" checked><i></i></label>
+          </div>
+          <div class="sp-row">
             <div class="l">部署后自动拉女优头像
               <small>服务启动后自动扫描名册，把本地缺的头像从云端中转仓库（jsDelivr / GitHub raw，国内直连、免 token 免代理）预取到缓存卷，一轮约 1 小时，之后每 12 小时补新增。已下载的头像本地直出、断网也能显示。</small></div>
             <label class="sp-switch"><input type="checkbox" id="optAutoAvatar" checked><i></i></label>
@@ -7307,7 +7312,7 @@ window.push115 = async function (i, btn) {
       const where = d.savepath || '离线根目录'
       btn.title = '已推到 115「' + where + '」'
       const nm = ((d.results || [])[0] || {}).name || ''
-      libToast('✓ 已推送到 115 · ' + where + (nm ? '（' + nm + '）' : ''), 'ok', 4200)
+      libToast('✓ 已推送到 115 · ' + where + (nm ? '（' + nm + '）' : '') + '<br><span style="opacity:.75">离线下载完成后会自动认领入库、原地整理并清理垃圾文件，无需手动操作</span>', 'ok', 6500)
     } else {
       btn.disabled = false; btn.textContent = '✗ 推送失败'
       btn.title = d.error || '推送失败'
@@ -7319,6 +7324,99 @@ window.push115 = async function (i, btn) {
     libToast('推送失败：' + (e.message || '网络错误'), 'err', 6000)
     setTimeout(() => { btn.textContent = old }, 3000)
   }
+}
+
+/* ---------- 番号页「📂 找媒体文件」（v0.2.29） ----------
+ * 按番号在媒体库文件夹里找文件名/父文件夹匹配的视频 → 绑定（manual-codes.json）→ 触发重扫 → 本页自动变在库。
+ * 典型场景：线上详情页推送 115 离线下载完成后，文件落进挂载目录，来这里手动认领。
+ * 服务不会自动盯下载进度，这一步由用户在下载完成后手动点（设置里的定时重扫开了则会自动兜底）。 */
+window.matchMovieFiles = async function (code, btn) {
+  code = String(code || '').trim()
+  if (!code) return
+  const old = btn ? btn.textContent : ''
+  if (btn) { btn.disabled = true; btn.textContent = '查找中…' }
+  try {
+    const d = await (await fetch('/api/library/matchCode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })).json()
+    if (!d.ok) { libToast('查找失败：' + (d.error || '未知错误'), 'err', 5000); return }
+    if (!(d.matches || []).length) {
+      libToast('媒体库里没有找到文件名含「' + libEsc(code) + '」的视频。<br>若刚推送 115，等离线下载完成、文件出现在挂载目录后再试。', 'err', 8000)
+      return
+    }
+    if (d.matches.length === 1) { matchMovieBind(code, d.matches[0]); return }
+    matchMovieChoose(code, d.matches)
+  } catch (e) {
+    libToast('查找失败：' + (e.message || '网络错误'), 'err', 5000)
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old }
+  }
+}
+/* 多个候选 → 弹层选一个绑定 */
+function matchMovieChoose(code, matches) {
+  const ov = document.createElement('div')
+  ov.id = 'mmChooseBox'
+  ov.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center'
+  const rows = matches.map(m =>
+    `<button class="mm-row" data-rel="${libEsc(m.relVideo)}" style="display:block;width:100%;text-align:left;background:rgba(127,127,127,.12);border:1px solid rgba(127,127,127,.3);border-radius:10px;color:inherit;padding:10px 12px;margin:6px 0;font-size:13px;cursor:pointer">
+      <b style="word-break:break-all">${libEsc(m.file)}</b><br><span style="opacity:.6;font-size:12px">${libEsc(m.dir || '媒体库根目录')}</span></button>`).join('')
+  ov.innerHTML = `<div style="background:var(--card,#1b1d22);border:1px solid rgba(127,127,127,.35);border-radius:14px;max-width:560px;width:92%;max-height:70vh;overflow:auto;padding:18px 20px;color:var(--text,#eee)">
+    <div style="font-size:15px;font-weight:600;margin-bottom:4px">找到 ${matches.length} 个匹配「${libEsc(code)}」的文件</div>
+    <div style="font-size:12px;opacity:.6;margin-bottom:10px">选择要绑定到本番号的视频文件（绑定后触发重扫入库）</div>${rows}
+    <div style="text-align:right;margin-top:8px"><button class="mm-cancel" style="background:none;border:none;color:inherit;opacity:.6;font-size:13px;cursor:pointer;padding:6px 10px">取消</button></div></div>`
+  document.body.appendChild(ov)
+  ov.addEventListener('click', e => {
+    const row = e.target.closest('.mm-row')
+    if (row) { ov.remove(); const m = matches.find(x => x.relVideo === row.dataset.rel) || { relVideo: row.dataset.rel }; matchMovieBind(code, m); return }
+    if (e.target === ov || e.target.closest('.mm-cancel')) ov.remove()
+  })
+}
+/* 绑定成功 → 轮询 /api/scan 等重扫完成 → 刷新媒体库并重渲染本页 */
+window.matchMovieBind = async function (code, m) {
+  if (!m || !m.relVideo) return
+  libToast('已绑定「' + libEsc(m.file) + '」，正在重扫媒体库…', 'ok', 5000)
+  try {
+    const d = await (await fetch('/api/library/bindCode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, relVideo: m.relVideo }) })).json()
+    if (!d.ok) { libToast('绑定失败：' + (d.error || '未知错误'), 'err', 6000); return }
+    let waited = 0
+    const tick = async () => {
+      let s = {}
+      try { s = await (await fetch('/api/scan', { cache: 'no-store' })).json() } catch (_) {}
+      if (s.scanning && waited < 600) { waited++; setTimeout(tick, 2000); return }
+      try { await loadServerLib() } catch (_) {}
+      if ((location.hash || '').startsWith('#/movie/')) {
+        try { renderMovie(encodeURIComponent(code)) } catch (_) {}
+      }
+      libToast('✓ 「' + libEsc(code) + '」已绑定媒体文件，详情页已更新为在库', 'ok', 5000)
+    }
+    setTimeout(tick, 1500)
+  } catch (e) { libToast('绑定失败：' + (e.message || '网络错误'), 'err', 6000) }
+}
+/* ---------- 详情页 115 自动认领轮询（v0.2.29） ----------
+ * 推送过磁力的番号，若服务端正盯梢（watching），本页每 15 秒问一次进度；
+ * 任务完成后等重扫结束 → 刷新媒体库并重渲染本页，线上详情自动变在库。 */
+let W115_POLL = null
+window.w115WatchPage = function (code) {
+  if (W115_POLL) { clearInterval(W115_POLL); W115_POLL = null }
+  code = String(code || '').trim()
+  if (!code) return
+  W115_POLL = setInterval(async () => {
+    if (!location.hash.startsWith('#/movie/')) { clearInterval(W115_POLL); W115_POLL = null; return }
+    let j = {}
+    try { j = await (await fetch('/api/115/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })).json() } catch (_) { return }
+    const job = (j.jobs || []).find(x => String(x.code).toUpperCase() === code.toUpperCase())
+    if (!job || job.status === 'watching') return
+    clearInterval(W115_POLL); W115_POLL = null
+    if (job.status !== 'done') return
+    libToast('✓ 115 下载已完成：「' + libEsc(code) + '」已自动入库' + (job.note ? '<br><span style="opacity:.75">' + libEsc(job.note) + '</span>' : ''), 'ok', 9000)
+    let n = 0
+    const tick = async () => {
+      let s = {}
+      try { s = await (await fetch('/api/scan', { cache: 'no-store' })).json() } catch (_) {}
+      if (s.scanning && n++ < 600) { setTimeout(tick, 2000); return }
+      try { await loadServerLib() } catch (_) {}
+      if ((location.hash || '').startsWith('#/movie/')) { try { renderMovie(encodeURIComponent(code)) } catch (_) {} }
+    }
+    setTimeout(tick, 1500)
+  }, 15000)
 }
 function renderMovie(codeEnc) {
   /* 内嵌播放器还开着就换片/离开：先安全卸载，避免悬挂的播放器实例
@@ -7441,6 +7539,7 @@ function renderMovie(codeEnc) {
           <span id="mvLinks" style="display:contents">加载中…</span>
           <button class="mv-scrape" id="mvScrapeBtn" onclick="scrapeMovie('${libEsc(x.code)}', this)">⟳ 刮削</button>
           ${x.scrapeFields ? `<button class="mv-scrape" title="查看多源刮削结果，逐项换数据来源" onclick="openMvScrape('${libEsc(x.code)}')">☰ 刮削内容</button>` : ''}
+          <button class="mv-scrape" title="在媒体库文件夹里按番号找视频文件并绑定到本页（重扫后仍生效）" onclick="matchMovieFiles('${libEsc(x.code)}', this)">📂 匹配文件</button>
         </div>
         </div><!-- /mv-panel -->
       </div><!-- /mv-top-in -->
@@ -7465,6 +7564,7 @@ function renderMovie(codeEnc) {
   if (PREF('srcpath') === '1') movieSrcPathLoad(x.code)   // 设置里开了「来源标注绝对路径」才拉
   // 本地影片没有海报也没刮过 → 后台静默刮削一次（结果统一进离线数据）
   if (!x.virtual && !x.relPoster && !x.webPoster && !x.scraped) autoScrapeQuiet(x.code)
+  w115WatchPage(x.code)   // 115 推送自动认领：任务完成后本页自动变在库
   stDecorate()   // 装修工作台：给详情页各模块挂标记与把手
 }
 
@@ -7541,6 +7641,7 @@ async function renderOnlineMovie(codeEnc, libPending) {
           ${inLib ? '' : `<button class="btn btn-fav" title="多源刮削元数据 + 封面 + 剧照，存进离线数据" onclick="subsScrape('${libEsc(m.code || code)}')">⇩ 加入离线数据</button>`}
           <button class="btn btn-fav${FAVS.has(m.code) ? ' on' : ''}" onclick="toggleFav('${libEsc(m.code || code)}', this);this.classList.toggle('on')"><span class="h">♥</span> 收藏</button>
           <button class="btn btn-fav" title="重新从线上读一遍" onclick="renderOnlineMovie('${encodeURIComponent(code)}')">⟳ 重新读取</button>
+          <button class="btn btn-fav" title="在媒体库文件夹里找文件名含该番号的视频，绑定后触发重扫入库（115 推送下载完成后用）" onclick="matchMovieFiles('${libEsc(m.code || code)}', this)">📂 找媒体文件</button>
         </div>
         <div class="mv-links">
           <span class="lk-label">番号链接页</span>
@@ -7563,6 +7664,7 @@ async function renderOnlineMovie(codeEnc, libPending) {
   loadMagnets(m.code || code)
   renderMovieLinks(m.code || code)
   movieReviewsLoad(m.code || code)
+  w115WatchPage(m.code || code)   // 115 推送自动认领：任务完成后本页自动变在库
   try { stDecorate() } catch (_) {}
 }
 
@@ -9981,7 +10083,13 @@ window.testProxy = async function () {
   try {
     const r = await fetch('/api/config/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proxy: optProxy.value.trim() }) })
     const j = await r.json()
-    proxyStatus.textContent = j.ok ? `连通正常（经 ${j.via}，${j.ms}ms）` : `不通：经 ${j.via} 访问 minnano 失败`
+    if (j.ok) {
+      const list = (j.samples || []).map(x => x.ms).join(' / ')
+      const label = j.via && j.via !== 'direct' ? '代理线路 ' + j.via : '直连线路'
+      proxyStatus.textContent = `✓ ${label}：平均 ${j.avg}ms（${list}）`
+    } else {
+      proxyStatus.textContent = '✕ 不通：' + (j.error || '无响应')
+    }
   } catch (e) { proxyStatus.textContent = '测试失败：' + e.message }
 }
 
@@ -10540,7 +10648,10 @@ window.mdcTestAll = async function (btn) {
     try {
       const r = await fetch('/api/source/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) })
       const j = await r.json()
-      if (dot) dot.className = 'mc-dot ' + (j.ok ? 'ok' : 'bad')
+      if (dot) {
+        dot.className = 'mc-dot ' + (j.ok ? 'ok' : 'bad')
+        dot.title = s.name + '：' + (j.ok ? '连通 ' + j.ms + 'ms' : (j.error || '连不上'))
+      }
     } catch (_) { if (dot) dot.className = 'mc-dot bad' }
   }
   const stamp = document.getElementById('mdcTestTime')
@@ -10609,6 +10720,7 @@ const optRankAuto = document.getElementById('optRankAuto')
 const optRankHour = document.getElementById('optRankHour')
 const rankUpInfo = document.getElementById('rankUpInfo')
 const optAutoScrapeNew = document.getElementById('optAutoScrapeNew')
+const optAuto115 = document.getElementById('optAuto115')
 const optAutoAvatar = document.getElementById('optAutoAvatar')
 const optAutoRescan = document.getElementById('optAutoRescan')
 const optAutoRescanHour = document.getElementById('optAutoRescanHour')
@@ -10641,6 +10753,7 @@ async function spLoadScrape() {
     if (optRankHour) { optRankHour.value = String(j.rankHour == null ? 4 : j.rankHour); optRankHour.disabled = !(j.rankAuto !== false) }
     spRankInfo(j.rankUpdatedAt, j.rankRunning)
     if (optAutoScrapeNew) optAutoScrapeNew.checked = j.autoScrapeNew !== false
+    if (optAuto115) optAuto115.checked = j.auto115Watch !== false
     if (optAutoAvatar) optAutoAvatar.checked = j.autoAvatar !== false
     if (optAutoRescan) optAutoRescan.checked = j.autoRescan === true
     if (optAutoRescanHour) { optAutoRescanHour.value = String(j.autoRescanHour == null ? 5 : j.autoRescanHour); optAutoRescanHour.disabled = !(j.autoRescan === true) }
@@ -10660,6 +10773,7 @@ if (optRankAuto) optRankAuto.addEventListener('change', () => {
 })
 if (optRankHour) optRankHour.addEventListener('change', () => { spSaveCfg({ rankHour: parseInt(optRankHour.value, 10) || 0 }) })
 if (optAutoScrapeNew) optAutoScrapeNew.addEventListener('change', () => { spSaveCfg({ autoScrapeNew: optAutoScrapeNew.checked }) })
+if (optAuto115) optAuto115.addEventListener('change', () => { spSaveCfg({ auto115Watch: optAuto115.checked }) })
 if (optAutoAvatar) optAutoAvatar.addEventListener('change', () => { spSaveCfg({ autoAvatar: optAutoAvatar.checked }) })
 if (optAutoRescan) optAutoRescan.addEventListener('change', () => {
   spSaveCfg({ autoRescan: optAutoRescan.checked })
