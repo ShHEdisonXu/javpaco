@@ -2471,7 +2471,10 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   /* ============ 装修工作台的「画布模式」（iframed 预览里才生效，body.st-canvas）============
      模块可点选、可拖把手直接改尺寸；点卡片不再跳转，避免装修时误触。 */
   body.st-canvas { cursor: default; }
-  body.st-canvas [data-st] { position: relative; }
+  /* 注意：.actors-page/.settings-page 是 position:fixed 全屏覆盖层（盖住主页内容），
+   * 它们身上也挂了 data-st="pgwrap"（页面留白模块），若被本条改成 relative，
+   * 覆盖层失效 → 装修台画布里当前页和主页内容叠在一起（「点列表编辑出现主页」的根因） */
+  body.st-canvas [data-st]:not(.actors-page):not(.settings-page) { position: relative; }
   body.st-canvas [data-st]::before {
     content: ""; position: absolute; inset: 0; z-index: 900; pointer-events: none;
     border: 1.5px dashed transparent; border-radius: 12px; transition: border-color .15s, background .15s;
