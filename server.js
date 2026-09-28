@@ -1694,6 +1694,17 @@ async function avatarOnline(key) {
  * 并发 3、张间 250ms 温和限速；已有头像（actresses/ 或 cache/actors/）直接跳过。开关 CFG.autoAvatar 默认开。 */
 let AVA_BACKFILL_RUNNING = false
 let AVA_BACKFILL_STATS = null      // {todo, ok, fail, done, startedAt} 供日志/排查
+/* relay 确实没有的头像：记在 cache/avatar-miss.json，3 天内不再重试。
+ * 背景：名册里有一部分条目（mongo id 命名、minnano 已删号或无 og:image）relay 永远没有对应图，
+ * 每轮启动都全量重试会白跑 8~13 分钟、日志刷满 fail。3 天后再试一次，relay 补图后能自动收进来。 */
+const AVA_MISS_DAYS = 3
+function avaMissPath() { return path.join(cacheDir(), 'avatar-miss.json') }
+function avaMissLoad() {
+  try { const o = JSON.parse(fs.readFileSync(avaMissPath(), 'utf8')); return new Map(Object.entries(o)) } catch (_) { return new Map() }
+}
+function avaMissSave(m) {
+  try { fs.mkdirSync(path.dirname(avaMissPath()), { recursive: true }); fs.writeFileSync(avaMissPath(), JSON.stringify(Object.fromEntries(m))) } catch (_) {}
+}
 async function avatarBackfillOnce(trigger) {
   if (AVA_BACKFILL_RUNNING || CFG.autoAvatar === false) return
   AVA_BACKFILL_RUNNING = true
@@ -1703,7 +1714,10 @@ async function avatarBackfillOnce(trigger) {
     try { raw.push(...JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) } catch (_) {}
     try { raw.push(...readExtraRoster()) } catch (_) {}
     const actorsDir = path.join(cacheDir(), 'actors')
+    const miss = avaMissLoad()
+    const missCut = Date.now() - AVA_MISS_DAYS * 86400 * 1000
     const seen = new Set()
+    let skipped = 0
     const todo = []
     for (const a of raw) {
       if (!a || !a.mnid) continue
@@ -1712,11 +1726,13 @@ async function avatarBackfillOnce(trigger) {
       seen.add(key)
       if (fs.existsSync(path.join(actorsDir, key + '.jpg'))) continue
       if (a.icon && fs.existsSync(path.join(AVA_DIR, path.basename(a.icon)))) continue
+      const mt = miss.get(key)
+      if (mt && mt > missCut) { skipped++; continue }   // 3 天内已知 relay 缺失 → 跳过，不白跑
       todo.push({ mnid: String(a.mnid).replace(/\D/g, ''), key })
     }
-    if (!todo.length) { if (trigger !== 'boot') console.log('[avatar-backfill] %s 无缺口，跳过', trigger) ; return }
+    if (!todo.length) { if (trigger !== 'boot' || skipped) console.log('[avatar-backfill] %s 无缺口（跳过 %d 个已知缺失），跳过', trigger, skipped) ; return }
     AVA_BACKFILL_STATS = { todo: todo.length, ok: 0, fail: 0, done: 0, startedAt: t0 }
-    console.log('[avatar-backfill] %s 开始：本地缺 %d 张，relay 直连预取中…', trigger, todo.length)
+    console.log('[avatar-backfill] %s 开始：本地缺 %d 张（另有 %d 个已知缺失跳过），relay 直连预取中…', trigger, todo.length, skipped)
     fs.mkdirSync(actorsDir, { recursive: true })
     let ptr = 0
     const worker = async () => {
@@ -1724,9 +1740,9 @@ async function avatarBackfillOnce(trigger) {
         const it = todo[ptr++]
         try {
           const b = await relayBuf('avatars/' + it.mnid + '.jpg', 12000)
-          if (isImgBuf(b)) { fs.writeFileSync(path.join(actorsDir, it.key + '.jpg'), b); AVA_BACKFILL_STATS.ok++ }
-          else AVA_BACKFILL_STATS.fail++
-        } catch (_) { AVA_BACKFILL_STATS.fail++ }
+          if (isImgBuf(b)) { fs.writeFileSync(path.join(actorsDir, it.key + '.jpg'), b); AVA_BACKFILL_STATS.ok++; miss.delete(it.key) }
+          else { AVA_BACKFILL_STATS.fail++; miss.set(it.key, Date.now()) }
+        } catch (_) { AVA_BACKFILL_STATS.fail++; miss.set(it.key, Date.now()) }
         AVA_BACKFILL_STATS.done++
         if (AVA_BACKFILL_STATS.done % 500 === 0)
           console.log('[avatar-backfill] 进度 %d/%d (ok=%d fail=%d)', AVA_BACKFILL_STATS.done, AVA_BACKFILL_STATS.todo, AVA_BACKFILL_STATS.ok, AVA_BACKFILL_STATS.fail)
@@ -1734,6 +1750,7 @@ async function avatarBackfillOnce(trigger) {
       }
     }
     await Promise.all(Array.from({ length: 3 }, worker))
+    avaMissSave(miss)
     const st = AVA_BACKFILL_STATS
     console.log('[avatar-backfill] %s 完成：ok=%d fail=%d 用时 %d 分钟', trigger, st.ok, st.fail, Math.round((Date.now() - t0) / 60000))
   } catch (e) {
