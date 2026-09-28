@@ -505,7 +505,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
     transition: color .2s;
   }
   .nav-links a:hover, .nav-links a.active { color: var(--text); }
-  /* 「更多」下拉：观看历史 / 标签管理 / 目录树 */
+  /* 「更多」下拉：观看历史 / 标签管理 */
   .nav-more-wrap { position: relative; flex: none; }
   .nav-more { position: absolute; right: 0; top: calc(100% + 10px); min-width: 150px; padding: 6px; z-index: 970;
     background: rgba(18,18,24,.97); border: 1px solid rgba(255,255,255,.12); border-radius: 12px;
@@ -2762,20 +2762,19 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
     <a href="#/stats" title="影片库统计：容量 / 年份 / 厂商 / 女优分布">统计</a>
   </div>
   <div class="nav-more-wrap">
-    <button class="icon-btn" id="navMoreBtn" title="更多：观看历史 / 标签管理 / 目录树">
+    <button class="icon-btn" id="navMoreBtn" title="更多：观看历史 / 标签管理">
       <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg>
     </button>
     <div class="nav-more" id="navMore">
       <a href="#/history">观看历史</a>
       <a href="#/tags">标签管理</a>
-      <a href="#/tree">目录树</a>
     </div>
   </div>
   <div class="nav-search" data-page-node-id="zvCkjWkppHinFjEdfoSGbC">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9b9ba6" stroke-width="2.4" data-page-node-id="agxrOAJ8FEs1cPsr2Drzqs"><circle cx="11" cy="11" r="7" data-page-node-id="07W9wzEmYAUY3FBDeC1UCV"></circle><path d="m20 20-3.5-3.5" data-page-node-id="osDYa5r8Xvmqam9ATP0pCW"></path></svg>
     <input type="text" placeholder="搜索标题、演员、番号…" data-page-node-id="9NkL2X7Y3M4djOzU0pWxiJ">
   </div>
-  <button class="icon-btn" title="添加影片（在线刮削）" onclick="location.hash='#/add'" data-page-node-id="AddBtnNav">
+  <button class="icon-btn" title="添加影片 / 视频目录" onclick="location.hash='#/add'" data-page-node-id="AddBtnNav">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
       <path d="M12 5v14M5 12h14"/>
     </svg>
@@ -2809,8 +2808,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   </div>
   <div class="sp-wrap" data-mod="spwrap" data-st="spwrap">
     <nav class="sp-nav" id="spNav" data-mod="spnav" data-st="spnav">
-      <a data-sec="library" class="active">媒体库</a>
-      <a data-sec="scrape">刮削与整理</a>
+      <a data-sec="scrape" class="active">刮削与整理</a>
       <a data-sec="prefs">偏好</a>
       <a data-sec="theme">外观</a>
       <a data-sec="network">网络</a>
@@ -2818,58 +2816,13 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
       <a data-sec="rtcache">缓存</a>
       <a data-sec="subs">订阅</a>
       <a data-sec="pan115">115 推送</a>
-      <a data-sec="imgup">图片升级</a>
-      <a data-sec="sources">数据源</a>
       <a data-sec="about">关于</a>
     </nav>
     <div class="sp-main">
-      <section class="sp-sec active" data-sec="library">
-        <h2>媒体库</h2>
-        <p class="hint" id="libHint">媒体库 = 你手动添加的文件夹，<b>不是整个挂载盘</b>。容器把宿主机某个目录挂到 <span id="libRootHint">/media</span> 后，你可以在它下面挑任意子文件夹逐个添加（可加多个），添加完立即开始扫描，进度条会显示扫到多少视频、成功多少、失败多少。每行右侧的「删除」会把这个文件夹移出媒体库，主页就不再显示它的海报。</p>
-        <div class="sp-card lib-card">
-          <div class="lib-top">
-            <div class="lib-ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#edd9a6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path><path d="M3 11h18"></path></svg></div>
-            <div class="lib-status" id="libStatus">未设置媒体库</div>
-          </div>
-          <div class="lib-btns">
-            <button class="lib-btn" id="rescanBtn" onclick="libRescan()">⟳ 全部重新扫描</button>
-            <button class="lib-btn danger" onclick="clearLibrary()">清空媒体库</button>
-          </div>
-          <div class="lib-mgr" id="libMgr">
-            <div class="lib-add">
-              <input id="libPathInput" placeholder="容器内绝对路径，如 /media/无码流出（点「浏览」可逐级挑子文件夹）" onkeydown="if(event.key==='Enter')libAdd()">
-              <button class="lib-btn primary" onclick="libAdd()">＋ 添加并扫描</button>
-              <button class="lib-btn" onclick="libBrowse()">浏览</button>
-            </div>
-            <div class="lib-browse" id="libBrowseBox" style="display:none"></div>
-            <div class="lib-list" id="libList"></div>
-            <button class="lib-btn" id="pickBtn" onclick="pickFolder()" style="display:none">本地模式：选择文件夹（无服务时的备用方式）</button>
-            <input type="file" id="dirInput" webkitdirectory multiple hidden>
-          </div>
-        </div>
-        <div class="sp-card">
-          <div class="sp-row" style="border-bottom:none;padding-bottom:6px">
-            <div class="l">回收站<small>详情页或批量管理里「删除」的影片文件夹都搬到这里（媒体库根目录的 _trash/，扫描时会跳过）。「还原」回到媒体库根目录；「彻底删除」从硬盘上删掉，不可恢复。</small></div>
-            <button class="lib-btn" onclick="trashReload()">⟳ 刷新</button>
-          </div>
-          <div id="trashBox"><span style="opacity:.6">（还没有加载，点「刷新」或重新进入设置页）</span></div>
-        </div>
-        <div class="sp-card">
-          <div class="sp-row" style="border-bottom:none;padding:2px 0">
-            <div class="l">封面来源<small>封面 / 主图既可以是影片目录内的 poster（竖版）/ fanart（横版）图片，也可以是离线数据里刮削到的图片 —— 影片目录里没有时自动改用缓存里的；NFO 元数据同理。同番号多版本（破解/中字/无码）会合并成一条，详情页里可分别播放</small></div>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="9" cy="10" r="2"></circle><path d="m21 15.5-4.5-4.5L7 20.5"></path></svg>
-          </div>
-        </div>
-      </section>
       <section class="sp-sec" data-sec="scrape">
         <h2>刮削与整理</h2>
         <p class="hint">这一页的动作都由服务自己完成，不需要外部脚本或定时任务；改完即时生效，设置随项目一起保存在 server-config.json。</p>
         <div class="sp-card">
-          <div class="sp-row">
-            <div class="l">刮削后自动原地整理
-              <small>每部影片刮削成功后，自动把视频改名为 <b>番号/番号-标签.mp4</b> 并建好番号文件夹（等同「添加 → 导入视频整理」里手动点一次整理）。识别不出番号的、目标已存在的会跳过并记在刮削日志里。</small></div>
-            <label class="sp-switch"><input type="checkbox" id="optAutoOrg"><i></i></label>
-          </div>
           <div class="sp-row">
             <div class="l">女优人气榜每日自动更新
               <small>服务每天在下面这个时间点自动刷新 minnano 日 / 周 / 月榜 Top100（内置动作，不依赖任何外部定时任务）；榜上没在名册里的女优会自动补进项目内置补充名册。</small></div>
@@ -2894,7 +2847,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
           </div>
           <div class="sp-row">
             <div class="l">115 推送自动认领
-              <small>线上详情页推送磁力到 115 后，服务自动盯梢媒体库（每 2 分钟一轮，24h 内有效）：文件下载完成 → 自动绑定番号 → 清理同目录垃圾文件（网页 / 种子 / 快捷方式）→ 原地整理成 番号/番号-标签.mp4 → 重扫入库。本机已有详情页的直接挂上；没有的自动走刮削通道补元数据和封面。</small></div>
+              <small>线上详情页推送磁力到 115 后，服务自动盯梢媒体库（每 2 分钟一轮，24h 内有效）：文件下载完成 → 自动绑定番号 → 重扫入库。视频文件一律不动（v0.3.0 只读媒体库）。本机已有详情页的直接挂上；没有的自动走刮削通道补元数据和封面。</small></div>
             <label class="sp-switch"><input type="checkbox" id="optAuto115" checked><i></i></label>
           </div>
           <div class="sp-row">
@@ -2915,6 +2868,12 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
           </div>
           <div class="sp-row">
             <div class="l">上次自动重扫<small id="autoRescanInfo">正在读取…</small></div>
+          </div>
+        </div>
+        <div class="sp-card">
+          <div class="sp-row" style="border-bottom:none;padding:2px 0">
+            <div class="l">封面来源<small>封面 / 主图既可以是影片目录内的 poster（竖版）/ fanart（横版）图片，也可以是离线数据里刮削到的图片 —— 影片目录里没有时自动改用缓存里的；NFO 元数据同理。同番号多版本（破解/中字/无码）会合并成一条，详情页里可分别播放</small></div>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="9" cy="10" r="2"></circle><path d="m21 15.5-4.5-4.5L7 20.5"></path></svg>
           </div>
         </div>
       </section>
@@ -3054,7 +3013,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
       </section>
       <section class="sp-sec" data-sec="rtcache">
         <h2>缓存</h2>
-        <p class="hint">服务运行过程中产生的<b>临时缓存</b>：播放进度条缩略图（<b>previews/</b>，ffmpeg 抽帧，拖动进度条时显示的小画面）、图片升级/候选探测中断残留的临时文件。清掉完全安全——下次播放/使用时按需自动重建，<b>不会影响离线数据</b>（刮削成果原样保留）。</p>
+        <p class="hint">服务运行过程中产生的<b>临时缓存</b>：播放进度条缩略图（<b>previews/</b>，ffmpeg 抽帧，拖动进度条时显示的小画面）、刮削中断残留的临时文件。清掉完全安全——下次播放/使用时按需自动重建，<b>不会影响离线数据</b>（刮削成果原样保留）。</p>
         <div class="sp-card">
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="lib-btn" onclick="loadRtCache()">刷新大小</button>
@@ -3105,88 +3064,6 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
               <span id="pan115DirPath" style="font-size:12px;color:var(--text-dim)"></span>
             </div>
             <div id="pan115Probe" style="font-size:12px;color:var(--text-dim);line-height:1.8"></div>
-          </div>
-        </div>
-      </section>
-      <section class="sp-sec" data-sec="imgup">
-        <h2>图片升级</h2>
-        <p class="hint">批量给离线数据里低清的封面 / 主图换上更高清的版本：番号来自已刮削的离线数据（封面宽 &lt;500 或主图宽 &lt;1600 视为待升级），候选图取自之前刮削时各数据源留下的地址，<b>不会重新访问站点</b>；下载候选择优，只有真的比现状清晰才替换。点待升级行可看新老图片对比；<b>线上候选不比本地大时会自动跳过，不再提示</b>。</p>
-        <div class="sp-card">
-          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-            <button class="lib-btn" onclick="imgUpLoad()">⟳ 刷新列表</button>
-            <button class="lib-btn primary" id="imgUpRunBtn" onclick="imgUpRun()">↑ 升级选中</button>
-            <button class="lib-btn" onclick="imgUpRun(true)">↑ 升级全部</button>
-            <label class="sp-row" style="margin-left:auto;border-bottom:none;padding:0"><span style="font-size:12px;color:var(--text-dim)" id="imgUpSummary"></span></label>
-          </div>
-          <div id="imgUpProgress" style="display:none;margin:10px 0 2px">
-            <div style="height:6px;border-radius:4px;background:rgba(255,255,255,.08);overflow:hidden"><div id="imgUpBar" style="height:100%;width:0;background:#e8b04b;transition:width .3s"></div></div>
-            <div id="imgUpStatus" style="font-size:12px;color:var(--text-dim);margin-top:6px"></div>
-          </div>
-          <div id="imgUpLog" style="display:none;margin-top:8px;max-height:200px;overflow:auto;font:11px/1.8 ui-monospace,Menlo,monospace;color:var(--text-dim);white-space:pre-wrap"></div>
-          <div id="imgUpList" style="margin-top:12px"></div>
-        </div>
-        <div class="sp-card" style="margin-top:14px">
-          <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
-            <b style="font-size:13.5px;color:var(--text)">按网站对比扫描</b>
-            <span style="font-size:12px;color:var(--text-dim)">逐站在线拉取刮削时留下的候选图，与本地封面 / 主图对比尺寸与大小；封面宽&lt;500、主图宽&lt;1600 视为待升级，列出的结果点「升级」才会真正替换</span>
-          </div>
-          <div id="srcScanRows" style="margin-top:10px;display:flex;flex-direction:column;gap:2px"></div>
-          <div id="srcScanResults" style="margin-top:12px"></div>
-        </div>
-      </section>
-      <section class="sp-sec" data-sec="sources">
-        <div class="mdc-page">
-          <div class="mdc-head">
-            <div>
-              <h2 class="mdc-title">数据源管理</h2>
-              <p class="mdc-hint">可点击卡片进行详细设置</p>
-            </div>
-            <div class="mdc-head-right">
-              <span id="mdcTestTime">状态更新时间：未检测</span>
-              <button class="mdc-btn-test" id="mdcTestAll" onclick="mdcTestAll(this)">⟳ 测试全部</button>
-            </div>
-          </div>
-          <div class="mdc-grid" id="mdcCards"></div>
-
-          <div class="mdc-sec">
-            <h3 class="mdc-sec-title">自定义识别词（番号）</h3>
-            <p class="mdc-sec-hint">检测番号前缀，检测到在列表中则覆盖内置的识别规则（忽略大小写）</p>
-            <div class="mdc-kw-grid" id="mdcKwCode"></div>
-          </div>
-
-          <div class="mdc-sec">
-            <h3 class="mdc-sec-title">自定义识别词（路径）</h3>
-            <p class="mdc-sec-hint">检测完整文件路径（包含文件名），存在对应关键字则覆盖内置的识别规则（忽略大小写）<br>注意：番号和路径同时都能匹配到识别词时，优先使用番号的识别结果</p>
-            <div class="mdc-kw-grid" id="mdcKwPath"></div>
-          </div>
-
-          <div class="mdc-sec">
-            <h3 class="mdc-sec-title">优先级设置（全局）</h3>
-            <p class="mdc-sec-hint">将番号类型与刮削器匹配。进行多源数据聚合时，最终结果根据优先级进行选取</p>
-            <div id="mdcPriGlobal"></div>
-          </div>
-
-          <div class="mdc-sec">
-            <div class="mdc-pri-head" style="margin-bottom:2px">
-              <h3 class="mdc-sec-title">优先级设置（字段）</h3>
-              <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#3f3f46;cursor:pointer">隐藏未配置字段<span class="mdc-sw"><input type="checkbox" id="mdcHideEmpty" onchange="mdcRenderFields()"><i></i></span></label>
-            </div>
-            <p class="mdc-sec-hint">为各个元数据字段配置刮削器优先级<br>当字段优先级中的刮削器未获取到数据时，会使用全局优先级中的刮削源进行补充</p>
-            <div id="mdcPriFields"></div>
-          </div>
-
-          <div class="mdc-sec">
-            <div class="mdc-pri-head" style="margin-bottom:2px">
-              <h3 class="mdc-sec-title">屏蔽刮削源（字段）</h3>
-              <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#3f3f46;cursor:pointer">隐藏未配置字段<span class="mdc-sw"><input type="checkbox" id="mdcHideIgnore" onchange="mdcRenderIgnore()"><i></i></span></label>
-            </div>
-            <p class="mdc-sec-hint">忽略配置的刮削源返回的相应字段结果</p>
-            <div id="mdcPriIgnore"></div>
-          </div>
-
-          <div class="mdc-foot">
-            <button class="mdc-btn ghost" onclick="mdcReset()">重置优先级</button>
-            <button class="mdc-btn primary" id="mdcSaveBtn" onclick="mdcSave(this)">保存修改</button>
           </div>
         </div>
       </section>
@@ -4063,6 +3940,7 @@ function clearLibrary() {
 
 function updateLibStatus() {
   const el = document.getElementById('libStatus')
+  if (!el) return
   if (!LIB.length) { el.textContent = LIB_CONNECTED ? '该文件夹中没有视频文件' : '未设置媒体库'; return }
   const total = LIB.reduce((s, x) => s + x.size, 0)
   const withCover = LIB.filter(x => x.posterUrl || x.fanartUrl).length
@@ -5602,9 +5480,8 @@ function bulkRenderBar() {
       <button onclick="bulkHide()" title="隐藏后默认不在片库显示，可在「👁 已隐藏」里恢复">隐藏 / 恢复</button>
       <button onclick="bulkFav()" title="加入 / 移出「我的收藏」">收藏 / 取消</button>
       <button onclick="bulkTagDlg()" title="自定义标签（存在 userdata.json，重刮不丢）">加标签</button>
-      <button onclick="bulkMoveDlg()" title="把影片文件夹整体移进媒体库内的某个子文件夹">移动到文件夹</button>
       <button onclick="bulkRescrape()" title="逐部重新联网刮削元数据与图片">重新刮削</button>
-      <button onclick="trashBulk()" title="有视频文件的移进 _trash/ 回收站（设置页可还原）；只有线上资料的直接清掉离线数据" style="border-color:rgba(229,20,40,.45)">删除</button>
+      <button onclick="removeMovieBulk()" title="视频文件不动：清离线资料并把条目从影片库隐藏" style="border-color:rgba(229,20,40,.45)">移除</button>
       <button class="bk-x" onclick="bulkExit()">退出批量</button>
     </div>
     <div class="bk-status" id="bulkStatus"></div>`
@@ -5687,33 +5564,6 @@ window.bulkTagApply = () => {
   }
   closeBulkModal(); lbRenderWall()
   bulkStatusMsg(`✓ 已给 ${n} 部影片${replace ? '设置' : '追加'}标签` + (tags.length ? '：' + tags.join('、') : ''))
-}
-window.bulkMoveDlg = () => {
-  if (!BULK.size) return alert('先勾选影片')
-  openBulkModal(`
-    <h3>把 ${BULK.size} 部影片移进子文件夹</h3>
-    <p class="bk-tip">按「一部影片一个文件夹」整体搬移（含封面 / NFO），播放记录跟着迁移。目标路径相对媒体库根目录（当前是挂载的所有库的根，可写多层，例如 <b>女优/森沢かな</b>）。文件夹里还混着别的影片的会跳过并说明原因，不会乱动别人的文件。</p>
-    <input id="bkTarget" placeholder="目标子文件夹，例如：女优/森沢かな">
-    <div class="bk-btns"><button class="bk-ok" onclick="bulkMoveApply()">开始移动</button><button onclick="closeBulkModal()">取消</button></div>
-    <div class="bk-status" id="bkMoveStatus"></div>`)
-  setTimeout(() => { const el = document.getElementById('bkTarget'); if (el) el.focus() }, 60)
-}
-window.bulkMoveApply = async () => {
-  const target = String(document.getElementById('bkTarget').value || '').trim()
-  if (!target) return
-  const st = document.getElementById('bkMoveStatus')
-  if (st) st.textContent = '移动中…'
-  try {
-    const r = await (await fetch('/api/bulk/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ codes: bulkItems().map(x => x.code), target }) })).json()
-    if (!r.ok) throw new Error(r.error || '接口返回失败')
-    const okN = (r.moved || []).length, skN = (r.skipped || []).length
-    closeBulkModal()
-    const keep = new Set((r.moved || []).map(m => uKey(m.code)))
-    BULK = new Set([...BULK].filter(k => !keep.has(k)))
-    bulkRenderBar()
-    bulkStatusMsg(`✓ 已移动 ${okN} 部到「${target}」` + (skN ? ` · 跳过 ${skN} 部：` + r.skipped.map(s => s.code + '（' + s.reason + '）').join('；') : ''))
-    await loadServerLib(); renderLibBrowse()
-  } catch (e) { if (st) st.textContent = '✕ ' + e.message; else alert('移动失败：' + e.message) }
 }
 window.bulkRescrape = async () => {
   const items = bulkItems().filter(x => x.code)
@@ -6280,7 +6130,7 @@ function pageLabelFor(h) {
   if (h === '#/search') { try { return OS_ST && OS_ST.q ? '搜索 · ' + OS_ST.q : '搜索' } catch (_) { return '搜索' } }
   const MAP = { '#/settings': '设置', '#/add': '添加影片', '#/actors': '女优', '#/ranking': '排行榜',
     '#/favorites': '收藏', '#/subs': '订阅', '#/top': '榜单', '#/lib': '影片库',
-    '#/stats': '统计', '#/history': '历史', '#/tags': '标签', '#/tree': '目录树' }
+    '#/stats': '统计', '#/history': '历史', '#/tags': '标签' }
   return MAP[h] || ''
 }
 function syncTitle() {
@@ -6312,10 +6162,9 @@ function route() {
   const statsOn = h === '#/stats'
   const histOn = h === '#/history'
   const tagsOn = h === '#/tags'
-  const treeOn = h === '#/tree'
   const movieOn = h.startsWith('#/movie/')
   acPage.classList.toggle('open', actorsOn || rankOn)
-  listPage.classList.toggle('open', seriesOn || favOn || subsOn || osOn || libOn || statsOn || histOn || tagsOn || treeOn)
+  listPage.classList.toggle('open', seriesOn || favOn || subsOn || osOn || libOn || statsOn || histOn || tagsOn)
   moviePage.classList.toggle('open', movieOn)
   if (actorsListOn) renderActors()
   else if (actorsDetailOn) renderActorDetail(decodeURIComponent(h.slice('#/actor/'.length)))
@@ -6329,7 +6178,6 @@ function route() {
   else if (statsOn) renderStats()
   else if (histOn) renderHistory()
   else if (tagsOn) renderTags()
-  else if (treeOn) renderTree()
   else if (movieOn) renderMovie(h.slice('#/movie/'.length))
   if (settingsOn) { try { trashReload() } catch (_) {} }
   /* 子页面渲染完统一接管封面懒加载 —— 原来只有主页 #rows 和影片墙调了 lazyAssign，
@@ -6337,7 +6185,7 @@ function route() {
   if (listPage.classList.contains('open')) lazyAssign(listPage)
   if (acPage.classList.contains('open')) lazyAssign(acPage)       // 女优列表 / 女优详情 / 排行榜
   if (addOn) lazyAssign(addPageEl)                               // 添加影片页（卡片是异步铺的）
-  const anyOn = settingsOn || addOn || actorsOn || rankOn || seriesOn || favOn || subsOn || osOn || libOn || statsOn || movieOn || histOn || tagsOn || treeOn
+  const anyOn = settingsOn || addOn || actorsOn || rankOn || seriesOn || favOn || subsOn || osOn || libOn || statsOn || movieOn || histOn || tagsOn
   document.body.style.overflow = anyOn ? 'hidden' : ''
   if (!anyOn) renderLibrary()   // 回到主页：刷新周榜 + 媒体库行
   else clearInterval(REC_TIMER) // 离开主页停掉今日推荐的自动滚动
@@ -7525,8 +7373,7 @@ function renderMovie(codeEnc) {
         <div class="mv-actions">
           ${!x.virtual ? `<button class="btn btn-fav" title="加入手动播放队列，播完当前片接着放" onclick="addQueue(${x.lid})">＋ 队列</button>` : ''}
           <button class="btn btn-fav${FAVS.has(x.code) ? ' on' : ''}" id="mvFavBtn" data-code="${libEsc(x.code)}" onclick="toggleFav('${x.code}', this)"><span class="h">♥</span> 收藏</button>
-          ${!x.virtual && x.relPath ? `<button class="btn btn-fav" title="把编辑的元数据写回影片目录里的 NFO 文件" onclick="openNfoEdit('${encodeURIComponent(x.relPath)}')">✎ 编辑元数据</button>` : ''}
-          ${x.code ? `<button class="btn btn-fav" style="border-color:rgba(229,20,40,.4)" title="彻底删除：库里的视频文件（全部版本）和整个番号的离线数据文件夹一起删除；网盘挂载权限不足会明确提示" onclick="deleteMovie('${libEsc(x.code)}')">删除</button>` : ''}
+          ${x.code ? `<button class="btn btn-fav" style="border-color:rgba(229,20,40,.4)" title="彻底删除：库里的视频文件（全部版本）和整个番号的离线数据文件夹一起删除；网盘挂载权限不足会明确提示" onclick="removeMovie('${libEsc(x.code)}')">删除</button>` : ''}
         </div>
         ${x.code ? `<div class="mv-myrating">
           <span class="mr-lab">我的评分</span>
@@ -8207,7 +8054,6 @@ function mvsRender() {
   const srcList = all.length ? `<div class="mvs-srcs">
     <div class="mvs-srcs-head">数据源一览<span>先按优先级抓；核心字段齐了就提前收工，剩下的源可在这里按需补抓</span>
       ${untriedN ? `<button class="mvs-fetchall" onclick="mvsFetchAll()">⇣ 补抓没试过的 ${untriedN} 个源</button>` : ''}
-      <button class="mvs-fetchall" style="margin-left:${untriedN ? '0' : 'auto'}" onclick="mvsProbeCands(this)" title="把每个站点留下的候选图下载量一下真实尺寸，用于下拉里与本地对比">📏 量候选尺寸</button>
     </div>
     <div class="mvs-urlrow">
       <input id="mvsUrlInput" placeholder="粘贴站点影片详情页网址，例如 https://www.javbus.com/SSIS-001" spellcheck="false" onkeydown="if(event.key==='Enter')mvsFetchUrl()">
@@ -8418,45 +8264,7 @@ window.openMvScrape = async function (code) {
     if (!r.ok) { box.innerHTML = `<div class="acm-head"><h3>刮削内容 · ${libEsc(code)}</h3><button onclick="mvsClose()" title="关闭">×</button></div><div class="mvs-status">✕ ${libEsc(r.error || '加载失败')}</div>`; return }
     MVS_STATE.code = code; MVS_STATE.data = r
     mvsRender()
-    mvsLoadCands(code, true)   // 候选图尺寸（下拉里显示「尺寸 · 大小 · 与本地对比」）后台量，量好自动重绘
   } catch (e) { box.innerHTML = `<div class="mvs-status">✕ ${libEsc(e.message)}</div>` }
-}
-/* ---- 候选图尺寸：先读服务端缓存，缺的触发放候探测并轮询（只读，不改图） ---- */
-let mvsCandTimer = null
-async function mvsLoadCands(code, kick) {
-  const pull = async () => {
-    try { return await (await fetch('/api/scrape/cand-info?code=' + encodeURIComponent(code), { cache: 'no-store' })).json() } catch (_) { return null }
-  }
-  let j = await pull()
-  if (!j || !j.ok) return
-  MVS_CAND.local = j.local || {}; MVS_CAND.cands = j.cands || {}; MVS_CAND.at = j.at || 0
-  if (kick && !j.running && MVS_STATE.code === code && MVS_STATE.data) {
-    try {
-      await fetch('/api/scrape/cand-probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })
-    } catch (_) {}
-  }
-  if (MVS_STATE.code === code && MVS_STATE.data) mvsRender()
-  clearInterval(mvsCandTimer)
-  mvsCandTimer = setInterval(async () => {
-    const s = await pull()
-    if (!s || !s.ok) return
-    const changed = JSON.stringify(s.cands) !== JSON.stringify(MVS_CAND.cands)
-    MVS_CAND.local = s.local || {}; MVS_CAND.cands = s.cands || {}; MVS_CAND.at = s.at || 0
-    if (changed && MVS_STATE.code === code && MVS_STATE.data) mvsRender()
-    if (!s.running) { clearInterval(mvsCandTimer); mvsCandTimer = null }
-  }, 1200)
-}
-window.mvsProbeCands = async function (btn) {
-  if (!MVS_STATE.code) return
-  const old = btn.textContent
-  btn.disabled = true; btn.textContent = '量尺寸中…'
-  try {
-    const r = await (await fetch('/api/scrape/cand-probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: MVS_STATE.code, force: true }) })).json()
-    if (!r.ok) { mvsStatus('✕ ' + (r.error || '启动失败')); btn.disabled = false; btn.textContent = old; return }
-    mvsStatus('正在量各站点候选图尺寸…')
-    await mvsLoadCands(MVS_STATE.code, false)
-  } catch (e) { mvsStatus('✕ ' + e.message) }
-  btn.disabled = false; btn.textContent = old
 }
 /* ---- 粘贴站点详情页 → 只解析不落盘，结果并成「指定网址」源，供逐项挑选 ---- */
 window.mvsFetchUrl = async function () {
@@ -8475,7 +8283,6 @@ window.mvsFetchUrl = async function () {
     hint.innerHTML = `✓ 已解析《${libEsc(r.title || '')}》，已并入「指定网址」源 → 在下方字段 / 主图的下拉里挑选，点「确认并覆盖详情页」生效`
     mvsStatus('✓ 指定网址已加入可换源列表（还没有覆盖任何东西）')
     await mvsReload()
-    mvsLoadCands(MVS_STATE.code, true)
   } catch (e) { hint.innerHTML = '✕ ' + libEsc(e.message) }
 }
 
@@ -8516,28 +8323,27 @@ function renderAdd() {
         <details class="ap-logwrap" id="addLogWrap"><summary>站点明细（诊断用 · 每站返回结果实时刷）</summary><div class="ap-log" id="addProgLog"></div></details>
       </div>
     </div>
-    <h3 class="add-list-title">导入视频整理</h3>
-    <div class="add-card">
-      <p class="add-hint">把散落的原始视频整理成规范结构：扫描 → 解析番号 → <b>原地</b>改名为 <b>番号/番号-标签.mp4</b>（如 <b>ISIS-156/ISIS-156-无码-破解.mp4</b>）→ 勾选后一键整理并逐部刮削。<b>已整理完的番号文件夹会自动跳过</b>，目录会被记住、再次进入自动扫一遍。识别不出番号的文件保持原样，可在此手填。</p>
-      <div class="add-row">
-        <div class="add-f"><label>视频目录（容器内绝对路径，递归扫描）</label><input type="text" id="impDir" spellcheck="false" placeholder="如 /media/无码流出"><div class="add-hint" id="impMounts" style="margin:6px 0 0"></div></div>
+    <h3 class="add-list-title">视频目录</h3>
+    <p class="add-hint">在这里添加挂载目录下的子文件夹（可加多个），添加完自动扫描：只识别视频文件、按文件名解析番号去刮削，<b>视频文件不动</b>，元数据与海报全部存进离线数据。</p>
+    <div class="sp-card lib-card">
+      <div class="lib-top">
+        <div class="lib-ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#edd9a6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path><path d="M3 11h18"></path></svg></div>
+        <div class="lib-status" id="libStatus">未设置媒体库</div>
       </div>
-      <div class="add-row">
-        <div class="add-f"><label>刮削产物位置</label>
-          <div style="display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:2px">
-            <label class="add-chk" style="margin:0"><input type="radio" name="impMetaMode" value="inline" onchange="impSaveMetaDir()"> 跟视频放一起（番号文件夹内）</label>
-            <label class="add-chk" style="margin:0"><input type="radio" name="impMetaMode" value="off" onchange="impSaveMetaDir()"> 仅离线数据，不外发</label>
-          </div>
+      <div class="lib-btns">
+        <button class="lib-btn" id="rescanBtn" onclick="libRescan()">⟳ 全部重新扫描</button>
+        <button class="lib-btn danger" onclick="clearLibrary()">清空媒体库</button>
+      </div>
+      <div class="lib-mgr" id="libMgr">
+        <div class="lib-add">
+          <input id="libPathInput" placeholder="容器内绝对路径，如 /media/无码流出（点「浏览」可逐级挑子文件夹）" onkeydown="if(event.key==='Enter')libAdd()">
+          <button class="lib-btn primary" onclick="libAdd()">＋ 添加并扫描</button>
+          <button class="lib-btn" onclick="libBrowse()">浏览</button>
         </div>
-      </div>
-      <div class="add-actions">
-        <button class="add-btn" onclick="impScanUI()">⟳ 扫描</button>
-        <span id="impStatus" class="add-status"></span>
-      </div>
-      <div id="impList"></div>
-      <div class="add-actions" id="impRunBar" style="display:none">
-        <button class="add-btn primary" id="impRunBtn" onclick="impRun()">▶ 整理并刮削（勾选项）</button>
-        <span id="impRunStatus" class="add-status"></span>
+        <div class="lib-browse" id="libBrowseBox" style="display:none"></div>
+        <div class="lib-list" id="libList"></div>
+        <button class="lib-btn" id="pickBtn" onclick="pickFolder()" style="display:none">本地模式：选择文件夹（无服务时的备用方式）</button>
+        <input type="file" id="dirInput" webkitdirectory multiple hidden>
       </div>
     </div>
     <h3 class="add-list-title">加载离线数据</h3>
@@ -8559,101 +8365,7 @@ function renderAdd() {
   fillAddSources()
   loadAddList()
   addResume()   // 切走再回来：批量状态还在内存 / 空闲任务继续显示进度
-  fetch('/api/config').then(r => r.json()).then(c => {
-    const v = c.metaMode === 'inline' ? 'inline' : 'off'   // 旧版 dir 模式已并入缓存
-    const r = document.querySelector(`input[name="impMetaMode"][value="${v}"]`)
-    if (r) r.checked = true
-    // 容器是隔离的：只有挂进来的目录才看得见，这里直接把可用目录列出来
-    const m = document.getElementById('impMounts')
-    if (m && (c.mounts || []).length) m.textContent = '容器可见目录：' + c.mounts.join('、')
-  }).catch(() => {})
-  // 记住上次的视频目录 → 再次进入添加页自动扫一遍，新拷进来的未整理视频立刻列出（已整理文件夹会被跳过）
-  try {
-    const savedImp = localStorage.getItem('javpaco.impDir') || ''
-    if (savedImp) {
-      const el = document.getElementById('impDir')
-      if (el) el.value = savedImp
-      setTimeout(() => { try { impScanUI() } catch (_) {} }, 80)
-    }
-  } catch (_) {}
-}
-/* ---- 导入视频整理：扫描 → 预览（可手填番号）→ 整理 → 复用批量刮削队列 ---- */
-let _IMP_ITEMS = []
-const IMP_ST = { ready: ['可整理', '#6cc06c'], ok: ['已符合', '#8a93a6'], unknown: ['无法识别', '#e0a030'], conflict: ['目标已存在', '#ff6b6b'] }
-window.impSaveMetaDir = async function () {
-  const st = document.getElementById('impStatus')
-  const v = (document.querySelector('input[name="impMetaMode"]:checked') || {}).value || 'off'
-  try {
-    const j = await (await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ metaMode: v === 'inline' ? 'inline' : '' }) })).json()
-    if (st) st.textContent = j.ok
-      ? (v === 'inline' ? '✓ 已选：跟视频放一起（刮削产物存入各番号文件夹）' : '✓ 已选：仅离线数据（不外发到媒体目录）')
-      : '✕ ' + (j.error || '保存失败')
-  } catch (e) { if (st) st.textContent = '✕ ' + e.message }
-}
-window.impScanUI = async function () {
-  const st = document.getElementById('impStatus'), box = document.getElementById('impList'), bar = document.getElementById('impRunBar')
-  const dirInp = document.getElementById('impDir')
-  let dir = ((dirInp && dirInp.value) || '').trim()
-  if (!dir) { try { dir = localStorage.getItem('javpaco.impDir') || '' } catch (_) {} ; if (dir && dirInp) dirInp.value = dir }
-  if (!dir) { if (st) st.textContent = '请先填写视频目录'; return }
-  try { localStorage.setItem('javpaco.impDir', dir) } catch (_) {}
-  if (st) st.textContent = '扫描中…'
-  try {
-    const j = await (await fetch('/api/import/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir }) })).json()
-    if (!j.ok) { if (st) st.textContent = '✕ ' + (j.error || '扫描失败'); if (box) box.innerHTML = ''; if (bar) bar.style.display = 'none'; _IMP_ITEMS = []; return }
-    _IMP_ITEMS = j.items || []
-    const n = { ready: 0, unknown: 0, conflict: 0, ok: 0 }
-    _IMP_ITEMS.forEach(it => n[it.status] = (n[it.status] || 0) + 1)
-    const skipTxt = j.skipped ? ` · 已跳过 ${j.skipped} 个已整理文件夹` : ''
-    if (!_IMP_ITEMS.length) { if (st) st.textContent = (j.skipped ? '没有发现散落的新视频（已跳过 ' + j.skipped + ' 个已整理文件夹）' : '该目录下没有找到视频文件'); if (bar) bar.style.display = 'none'; if (box) box.innerHTML = ''; return }
-    if (st) st.textContent = `共 ${_IMP_ITEMS.length} 个视频：可整理 ${n.ready || 0} · 已符合 ${n.ok || 0} · 目标冲突 ${n.conflict || 0} · 无法识别 ${n.unknown || 0}${skipTxt}`
-    if (box) box.innerHTML = _IMP_ITEMS.map((it, i) => {
-      const [lab, col] = IMP_ST[it.status] || IMP_ST.unknown
-      return `<label class="add-chk" style="display:flex;align-items:center;gap:8px;margin:4px 0">
-        <input type="checkbox" ${it.status === 'ready' ? 'checked' : ''} data-imp="${i}">
-        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-dim)" title="${libEsc(it.file)}">${libEsc(it.file)}</span>
-        ${it.code
-          ? `<b style="min-width:110px">${libEsc(it.code)}</b><span style="color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">→ ${libEsc(it.target)}</span>`
-          : `<input class="imp-code" data-imp-i="${i}" placeholder="手填番号 如 STARS-238" style="width:170px;background:var(--input-bg);border:1px solid rgba(255,255,255,.1);border-radius:6px;color:var(--text);padding:4px 8px;font-size:12px;outline:none">`}
-        <span style="color:${col};flex:none">${lab}</span>
-      </label>`
-    }).join('')
-    if (bar) bar.style.display = ''
-  } catch (e) { if (st) st.textContent = '扫描失败：' + e.message }
-}
-window.impRun = async function () {
-  const st = document.getElementById('impRunStatus'), btn = document.getElementById('impRunBtn')
-  const picks = [...document.querySelectorAll('[data-imp]')].filter(c => c.checked).map(c => {
-    const it = _IMP_ITEMS[+c.dataset.imp]
-    const manual = document.querySelector(`.imp-code[data-imp-i="${c.dataset.imp}"]`)
-    return { file: it.file, code: (manual && manual.value.trim()) || it.code || '' }
-  })
-  if (!picks.length) { if (st) st.textContent = '没有勾选任何文件'; return }
-  if (btn) btn.disabled = true
-  if (st) st.textContent = '整理中（0/' + picks.length + '）…'
-  try {
-    const dirInp = document.getElementById('impDir')
-    let dir = ((dirInp && dirInp.value) || '').trim()
-    if (!dir) { try { dir = localStorage.getItem('javpaco.impDir') || '' } catch (_) {} }
-    const j = await (await fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir, items: picks }) })).json()
-    if (!j.ok) { if (st) st.textContent = '✕ ' + (j.error || '整理失败'); if (btn) btn.disabled = false; return }
-    if (st) st.textContent = `整理完成：移动 ${j.moved} 个` + ((j.results || []).filter(r => !r.ok).length ? `，未处理 ${(j.results || []).filter(r => !r.ok).length} 个` : '')
-    impScanUI()   // 重扫列表刷新状态
-    if ((j.codes || []).length && !_addBusy) {
-      addRunBatch(j.codes.map(c => ({ code: c })))   // 复用上方批量刮削（进度面板通用）
-      const okN = (j.results || []).filter(r => r.ok).length
-      if (st) st.textContent += ` · 已提交 ${j.codes.length} 部刮削`
-    } else if ((j.codes || []).length) {
-      if (st) st.textContent += ' · 刮削队列正忙，稍后请到上方手动刮削：' + j.codes.join(' ')
-    }
-    loadServerLib()   // 新路径进媒体库
-  } catch (e) { if (st) st.textContent = '✕ ' + e.message }
-  if (btn) btn.disabled = false
-}
-window.addNfoPick = async function (inp) {
-  const f = inp.files && inp.files[0]
-  if (!f) return
-  try { document.getElementById('addNfo').value = await f.text(); document.getElementById('addNfoName').textContent = f.name + '（' + f.size + ' 字节）' } catch (_) {}
+  libRender(); if (!scanTimer) checkScanOnce()   // 媒体库卡片已迁到本页：刷新逐库统计 + 若在扫描接上进度
 }
 /* ---- 离线数据：扫描 → 勾选 → 导入回缓存 ---- */
 let _OFF_ITEMS = []
@@ -9683,415 +9395,8 @@ document.querySelectorAll('#spNav a').forEach(a => {
     if (a.dataset.sec === 'rtcache') loadRtCache()    // 进入缓存分区自动显示大小
     if (a.dataset.sec === 'subs') { onlineCfgLoad(); onlineCfgAutoProbe() }   // 进入订阅分区自动读线上源配置 + 探线路
     if (a.dataset.sec === 'pan115') pan115Load()   // 进入 115 推送分区自动读配置
-    if (a.dataset.sec === 'library') { libRender(); if (!scanTimer) checkScanOnce() }   // 进入媒体库：刷新逐库统计 + 若在扫描接着显示进度
-    if (a.dataset.sec === 'imgup') { imgUpLoad(); srcScanLoad() }   // 进入图片升级分区自动扫描待升级列表 + 渲染网站扫描列表
-    if (a.dataset.sec === 'sources') srcRender()      // 进入数据源分区自动加载列表
   })
 })
-
-/* ================= 设置 → 图片升级（批量给低清封面/主图换高清候选） ================= */
-let imgUpItems = []
-function imgUpCell(v, need) {
-  return '<span style="font-size:12px;' + (need ? 'color:#e8b04b' : 'color:var(--text-dim)') + '">' + libEsc(v) + (need ? ' ↑' : '') + '</span>'
-}
-window.imgUpLoad = async function () {
-  const box = document.getElementById('imgUpList')
-  const sum = document.getElementById('imgUpSummary')
-  if (!box) return
-  box.innerHTML = '<div style="font-size:12px;color:var(--text-dim)">扫描缓存中…</div>'
-  try {
-    const j = await (await fetch('/api/images/upgrade-list', { cache: 'no-store' })).json()
-    imgUpItems = j.items || []
-    const extra = []
-    if (j.noCands) extra.push(j.noCands + ' 个低清但无候选（需重刮）')
-    if (j.noBetter) extra.push(j.noBetter + ' 个已试过、现有图已是候选里最大的')
-    sum.textContent = imgUpItems.length
-      ? ('待升级 ' + imgUpItems.length + ' 个' + (extra.length ? ' · ' + extra.join(' · ') : ''))
-      : (extra.length ? '没有可升级的（' + extra.join(' · ') + '）' : '全部已是高清，无需升级')
-    if (!imgUpItems.length) {
-      box.innerHTML = '<div style="font-size:13px;color:var(--text-dim)">✓ 没有待升级的封面 / 主图</div>'
-      return
-    }
-    box.innerHTML = `
-      <div style="display:grid;grid-template-columns:24px 1fr 2.2fr .9fr .9fr 1fr;gap:4px 10px;font-size:11px;color:var(--text-dim);padding:4px 6px;border-bottom:1px solid rgba(255,255,255,.07)">
-        <span></span><span>番号</span><span>标题</span><span>封面</span><span>主图</span><span>候选来源</span>
-      </div>` + imgUpItems.map((it, i) => `
-      <div class="imgup-row" title="点这一行看新老对比（本地图 vs 线上最优候选）" onclick="imgUpCompareRow(event,${i})" style="display:grid;grid-template-columns:24px 1fr 2.2fr .9fr .9fr 1fr;gap:4px 10px;align-items:center;font-size:12.5px;padding:7px 6px;border-bottom:1px solid rgba(255,255,255,.05);cursor:pointer">
-        <input type="checkbox" class="imgup-chk" data-i="${i}" checked style="accent-color:#e8b04b" onclick="event.stopPropagation()">
-        <b style="color:var(--text)">${libEsc(it.code)}</b>
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-dim)" title="${libEsc(it.title)}">${libEsc(it.title)}</span>
-        ${imgUpCell(it.poster, it.posterNeed)}${imgUpCell(it.fanart, it.fanartNeed)}
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-dim)" title="${libEsc(it.srcs)}">${libEsc(it.srcs)}</span>
-      </div>`).join('')
-  } catch (e) { box.innerHTML = '<div style="font-size:13px;color:#e07a7a">读取失败：' + libEsc(e.message) + '</div>' }
-}
-/* 点「待升级」一行 → 弹出新老对比卡片（本地图 vs 各源最优候选：尺寸 / 大小 / 谁更清晰，点升级才落盘） */
-window.imgUpCompareRow = function (ev, i) {
-  const it = imgUpItems[i]
-  if (!it) return
-  const role = it.posterNeed && !it.fanartNeed ? 'poster' : (it.fanartNeed ? 'fanart' : 'poster')
-  imgUpCompare(it.code, role, it)
-}
-window.imgUpCompare = async function (code, role, item) {
-  const box = document.getElementById('cmpBox')
-  const modal = document.getElementById('cmpModal')
-  const side = r => (r === 'poster' ? '封面（竖版）' : '主图（横版）')
-  const tab = (r, on) => `<button class="lib-btn${on ? ' primary' : ''}" style="padding:3px 12px;font-size:11.5px" onclick="imgUpCompare('${libEsc(code)}','${r}')">${side(r)}</button>`
-  box.innerHTML = `<div class="acm-head"><h3>图片升级对比 · ${libEsc(code)}</h3><button onclick="cmpClose()" title="关闭">×</button></div>
-    <div class="cmp-row" style="margin-top:0">
-      ${tab('fanart', role === 'fanart')}${tab('poster', role === 'poster')}
-      <span style="font-size:11.5px;color:var(--text-dim)">${libEsc((item && item.title) || '')}</span>
-    </div>
-    <div id="cmpBody" class="cmp-meta">正在拉取线上候选图并量尺寸…（每个源下 1 张，几秒内）</div>`
-  modal.classList.add('open')
-  let d = null
-  try {
-    d = await (await fetch('/api/images/cand-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, role }) })).json()
-  } catch (e) { }
-  if (!d || !d.ok) {
-    document.getElementById('cmpBody').innerHTML = '<span style="color:#e07a7a">✕ ' + libEsc((d && d.error) || '读取失败') + '</span>'
-    return
-  }
-  const loc = d.local, best = d.best
-  const tall = role === 'poster'
-  /* 线上候选图多半防盗链（直接 <img> 加载不出来），统一经服务端代取；本地 /cache 路径原样用 */
-  const imgUrl = u => !u ? '' : (u.startsWith('/') ? u : '/api/actor/thumb?u=' + encodeURIComponent(u))
-  const cell = (title, info, cls, url) => `<div class="cmp-side ${cls}">
-    <div class="cmp-hd">${title}${info && info.id ? `<em>· ${libEsc(SRC_NAME[info.id] || info.id)}</em>` : ''}</div>
-    <div class="cmp-pic${tall ? ' tall' : ''}" style="${url ? `background-image:url('${imgUrl(url)}')` : ''}">${url ? '' : '无图'}</div>
-    <div class="cmp-meta">${info ? `<b>${info.w} × ${info.h}</b> px · <b>${fmtKB(info.bytes)}</b>` : '本地没有这张图'}</div>
-  </div>`
-  const up = d.better
-  const alt = (d.all || []).slice(1).map(x => `<div>· <b>${libEsc(SRC_NAME[x.id] || x.id)}</b> ${x.w}×${x.h} · ${fmtKB(x.bytes)}${loc && x.w * x.h > loc.w * loc.h ? ' <span style="color:#5fd39b">（也比本地清晰）</span>' : ''}</div>`).join('')
-  document.getElementById('cmpBody').innerHTML = `
-    <div class="cmp-grid">
-      ${cell('本地（当前）', loc, '', loc ? loc.url : '')}
-      ${cell('线上最优候选', best, up ? 'new' : '', best ? best.url : '')}
-    </div>
-    <div class="cmp-meta ${up ? 'cmp-win' : ''}" style="margin-top:12px;font-size:12.5px">
-      ${!best ? '该影片没有留下这个角色的候选图（需重新刮削该番号）。'
-        : !loc ? '本地还没有这张图 → 升级即可补上。'
-          : up ? `线上候选更大：<b>${loc.w}×${loc.h}（${fmtKB(loc.bytes)}）</b> → <b>${best.w}×${best.h}（${fmtKB(best.bytes)}）</b>`
-            : `线上最大的候选也只到 <b>${best.w}×${best.h}</b>，不比本地 <b>${loc.w}×${loc.h}</b> 更大${d.marked ? ' → <b>已自动跳过</b>，这个番号不再出现在待升级列表' : ' → 无需升级（已跳过）'}。`}
-    </div>
-    <div class="cmp-row">
-      ${best && up ? `<button class="lib-btn primary" id="cmpApply" onclick="imgUpCompareApply('${libEsc(code)}','${role}','${libEsc(best.url)}',this)">↑ 升级为这张</button>` : ''}
-      ${role === 'poster' ? `<button class="lib-btn" onclick="cmpClose();openPosterCrop('${libEsc(code)}')">✂ 手动裁剪海报</button>` : ''}
-      <button class="lib-btn" onclick="cmpClose()">关闭</button>
-    </div>
-    ${alt ? `<div class="cmp-alt">其它候选：${alt}</div>` : ''}
-    ${d.posterManual ? '<div class="cmp-meta">注意：该海报是手动裁剪的，升级主图后会按原构图自动重裁海报。</div>' : ''}`
-  if (d.marked) imgUpLoad()   // 刚记了「不再提示」→ 待升级列表刷新，这一行会消失
-}
-window.imgUpCompareApply = async function (code, role, url, btn) {
-  btn.disabled = true; btn.textContent = '升级中…'
-  try {
-    const j = await (await fetch('/api/images/src-apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, role, url }) })).json()
-    if (!j.ok) throw new Error(j.error || '升级失败')
-    btn.textContent = j.recrop && j.recrop.ok ? '✓ 已升级+重裁' : '✓ 已升级'
-    imgUpLoad()
-    setTimeout(() => imgUpCompare(code, role, null), 400)
-  } catch (e) { btn.disabled = false; btn.textContent = '↑ 升级为这张'; alert(e.message) }
-}
-window.cmpClose = () => document.getElementById('cmpModal').classList.remove('open')
-window.imgUpRun = async function (all) {
-  let codes
-  if (all) codes = imgUpItems.map(x => x.code)
-  else {
-    codes = [...document.querySelectorAll('.imgup-chk:checked')].map(c => imgUpItems[+c.dataset.i].code)
-    if (!codes.length) { alert('先勾选要升级的番号'); return }
-  }
-  if (!codes.length) return
-  const btn = document.getElementById('imgUpRunBtn')
-  btn.disabled = true
-  try {
-    const r = await fetch('/api/images/upgrade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ codes }) })
-    const j = await r.json()
-    if (!j.ok) { alert(j.error || '启动失败'); btn.disabled = false; return }
-    document.getElementById('imgUpProgress').style.display = 'block'
-    document.getElementById('imgUpLog').style.display = 'block'
-    document.getElementById('imgUpLog').textContent = ''
-    imgUpPoll()
-  } catch (e) { alert('启动失败：' + e.message); btn.disabled = false }
-}
-let imgUpTimer = null
-function imgUpPoll() {
-  clearInterval(imgUpTimer)
-  const tick = async () => {
-    try {
-      const j = await (await fetch('/api/images/upgrade-status', { cache: 'no-store' })).json()
-      document.getElementById('imgUpBar').style.width = (j.total ? Math.round(j.done / j.total * 100) : 0) + '%'
-      document.getElementById('imgUpStatus').textContent = j.running
-        ? ('升级中 ' + j.done + '/' + j.total + ' · ' + (j.current || ''))
-        : '已完成 ' + j.done + '/' + j.total
-      document.getElementById('imgUpLog').textContent = (j.log || []).join('\n')
-      if (!j.running) {
-        clearInterval(imgUpTimer)
-        const btn = document.getElementById('imgUpRunBtn')
-        if (btn) btn.disabled = false
-        imgUpLoad()   // 升级完刷新列表，已升级的会从列表里消失
-      }
-    } catch (_) {}
-  }
-  tick()
-  imgUpTimer = setInterval(tick, 1500)
-}
-
-/* ================= 设置 → 图片升级 → 按网站对比扫描 =================
- * 逐站在线拉候选图与本地对比（尺寸/大小），列出的结果点「升级」才落盘。 */
-let SRC_FOUND = []            // 累计的扫描结果（跨多次扫描追加）
-let srcScanTimer = null
-const SRC_NAME = {}           // id → 显示名
-function fmtKB(b) { return b >= 1048576 ? (b / 1048576).toFixed(2) + ' MB' : b ? Math.round(b / 1024) + ' KB' : '—' }
-function srcDimCell(d, bytes, better) {
-  if (!d || !d.w) return '<span style="color:var(--text-dim)">无</span>'
-  return `<span style="${better ? 'color:#7ec97e;font-weight:600' : 'color:var(--text-dim)'}">${d.w}×${d.h} · ${fmtKB(bytes)}</span>`
-}
-window.srcScanLoad = async function () {
-  const box = document.getElementById('srcScanRows')
-  if (!box) return
-  try {
-    const j = await (await fetch('/api/sources', { cache: 'no-store' })).json()
-    const list = (j.sources || []).slice().sort((a, b) => (b.enabled - a.enabled) || a.id.localeCompare(b.id))
-    list.forEach(s => SRC_NAME[s.id] = s.name || s.id)
-    box.innerHTML = list.map(s => `
-      <div class="ss-row" data-id="${libEsc(s.id)}" style="display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:center;padding:7px 8px;border-bottom:1px solid rgba(255,255,255,.05)">
-        <div style="min-width:0">
-          <b style="font-size:12.5px;color:${s.enabled ? 'var(--text)' : 'var(--text-dim)'}">${libEsc(s.name || s.id)}</b>
-          <span style="font-size:11px;color:var(--text-dim);margin-left:8px">${s.enabled ? '' : '已在数据源停用'}</span>
-        </div>
-        <button class="lib-btn${s.enabled ? ' primary' : ''}" onclick="srcScanStart('${libEsc(s.id)}')" ${s.enabled ? '' : 'disabled style="opacity:.4;cursor:not-allowed"'}>扫描</button>
-        <div style="grid-column:1/-1;height:4px;border-radius:3px;background:rgba(255,255,255,.07);overflow:hidden;display:none"><div class="ss-bar" style="height:100%;width:0;background:#e8b04b;transition:width .3s"></div></div>
-        <div class="ss-status" style="grid-column:1/-1;font-size:11px;color:var(--text-dim);display:none"></div>
-      </div>`).join('') || '<div style="font-size:12px;color:var(--text-dim)">没有数据源</div>'
-    srcScanRestore()
-  } catch (e) { box.innerHTML = '<div style="font-size:12px;color:#e07a7a">数据源读取失败：' + libEsc(e.message) + '</div>' }
-}
-function srcScanRow(id) { return document.querySelector(`.ss-row[data-id="${CSS.escape(id)}"]`) }
-async function srcScanRestore() {   // 进设置页时若有扫描正在进行，接着轮询
-  try {
-    const j = await (await fetch('/api/images/src-scan-status', { cache: 'no-store' })).json()
-    if (j.running) srcScanPoll()
-    else if (j.sourceId && j.total) srcScanDone(j)
-  } catch (_) {}
-}
-window.srcScanStart = async function (id) {
-  const row = srcScanRow(id)
-  try {
-    const r = await fetch('/api/images/src-scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: id }) })
-    const j = await r.json()
-    if (!j.ok) { alert(j.error || '启动失败'); return }
-    if (row) {
-      const bar = row.querySelector('.ss-bar'), st = row.querySelector('.ss-status')
-      bar.parentElement.style.display = 'block'; st.style.display = 'block'
-      bar.style.width = '0'; st.textContent = '启动中…'
-      row.querySelector('button').textContent = '扫描中…'
-    }
-    srcScanPoll()
-  } catch (e) { alert('启动失败：' + e.message) }
-}
-function srcScanPoll() {
-  clearInterval(srcScanTimer)
-  document.querySelectorAll('.ss-row button').forEach(b => b.disabled = true)
-  const tick = async () => {
-    try {
-      const j = await (await fetch('/api/images/src-scan-status', { cache: 'no-store' })).json()
-      const row = srcScanRow(j.sourceId)
-      if (row) {
-        const bar = row.querySelector('.ss-bar'), st = row.querySelector('.ss-status')
-        bar.parentElement.style.display = 'block'; st.style.display = 'block'
-        bar.style.width = (j.total ? Math.round(j.done / j.total * 100) : 0) + '%'
-        st.textContent = j.running
-          ? `对比中 ${j.done}/${j.total} · ${j.current || ''} · 已发现 ${j.found} 张可升级`
-          : `完成：${j.done}/${j.total} 个番号，发现 ${j.found} 张可升级`
-      }
-      if (!j.running) { clearInterval(srcScanTimer); srcScanDone(j) }
-    } catch (_) {}
-  }
-  tick()
-  srcScanTimer = setInterval(tick, 1500)
-}
-function srcScanDone(j) {
-  document.querySelectorAll('.ss-row button').forEach(b => { b.disabled = false; if (b.textContent !== '扫描') b.textContent = '扫描' })
-  if ((j.results || []).length) {
-    SRC_FOUND = SRC_FOUND.concat(j.results)
-    srcRenderResults()
-  }
-}
-function srcRenderResults() {
-  const box = document.getElementById('srcScanResults')
-  if (!box) return
-  if (!SRC_FOUND.length) { box.innerHTML = ''; return }
-  box.innerHTML = `
-    <div style="display:flex;align-items:baseline;gap:10px">
-      <b style="font-size:12.5px;color:var(--text)">可升级对比（${SRC_FOUND.length} 张）</b>
-      <span style="font-size:11px;color:var(--text-dim)">绿色 = 更高清的一侧</span>
-      <button class="lib-btn" style="margin-left:auto;padding:3px 10px;font-size:11px" onclick="srcClearResults()">清空列表</button>
-    </div>
-    <div style="display:grid;grid-template-columns:110px 60px 70px 1fr 1fr 86px;gap:4px 10px;font-size:11px;color:var(--text-dim);padding:6px 6px;border-bottom:1px solid rgba(255,255,255,.07);margin-top:6px">
-      <span>番号</span><span>角色</span><span>来源</span><span>本地</span><span>线上</span><span></span>
-    </div>` + SRC_FOUND.map((r, i) => `
-    <div style="display:grid;grid-template-columns:110px 60px 70px 1fr 1fr 86px;gap:4px 10px;align-items:center;font-size:12px;padding:6px;border-bottom:1px solid rgba(255,255,255,.05)">
-      <b style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${libEsc(r.title)}">${libEsc(r.code)}</b>
-      <span title="${r.recrop ? '该影片海报是按横版主图手动裁剪的，升级后将按原构图自动重裁' : ''}">${r.role === 'poster' ? '封面' : '主图'}${r.recrop ? ' <b style="color:var(--accent)" title="升级后将按原构图自动重裁海报">↻</b>' : ''}</span>
-      <span style="font-size:11px;color:var(--text-dim)">${libEsc(SRC_NAME[r.sourceId] || r.sourceId)}</span>
-      <span>${srcDimCell(r.local, r.local.bytes, false)}</span>
-      <span>${srcDimCell(r.online, r.online.bytes, true)}</span>
-      <button class="lib-btn primary" style="padding:3px 10px;font-size:11px" onclick="event.stopPropagation();srcApply(${i},this)">升级</button>
-    </div>`).join('')
-}
-window.srcClearResults = () => { SRC_FOUND = []; srcRenderResults() }
-window.srcApply = async function (i, btn) {
-  const r = SRC_FOUND[i]
-  if (!r) return
-  btn.disabled = true; btn.textContent = '升级中…'
-  try {
-    const j = await (await fetch('/api/images/src-apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: r.code, role: r.role, url: r.online.url }) })).json()
-    if (!j.ok) throw new Error(j.error || '升级失败')
-    btn.textContent = j.recrop && j.recrop.ok ? '✓ 已升级+重裁' : '✓ 已升级'
-    SRC_FOUND.splice(i, 1)
-    setTimeout(srcRenderResults, 600)
-    imgUpLoad()   // 已升级的会从「待升级」列表里消失
-  } catch (e) { btn.disabled = false; btn.textContent = '升级'; alert(e.message) }
-}
-
-// 隐私模式
-const optPrivacy = document.getElementById('optPrivacy')
-optPrivacy.checked = PREF('privacy') === '1'
-document.body.classList.toggle('privacy', optPrivacy.checked)
-optPrivacy.addEventListener('change', () => {
-  document.body.classList.toggle('privacy', optPrivacy.checked)
-  setPref('privacy', optPrivacy.checked ? '1' : '0')
-})
-/* 海报墙横竖版开关（与导航栏 🖼 按钮同一偏好 wallpic） */
-const optWallFan = document.getElementById('optWallFan')
-if (optWallFan) {
-  optWallFan.checked = wallFan()
-  optWallFan.addEventListener('change', () => {
-    if ((wallFan() ? '1' : '0') !== (optWallFan.checked ? '1' : '0')) window.wallToggle()
-  })
-  document.getElementById('navWallBtn').addEventListener('click', () => { optWallFan.checked = wallFan() })
-}
-/* 主题（外观）：data-theme 挂 <html> 上，CSS 变量整体换肤；head 里有早执行脚本防闪白 */
-const THEMES = [
-  { id: 'glass',  name: '毛玻璃', bg: '#eef0f4', card: '#ffffff', accent: '#0a84ff', text: '#1d1d1f' },
-  { id: 'neon',   name: '霓虹',   bg: '#08060f', card: '#171026', accent: '#b26bff', text: '#d3cbec' }
-]
-function applyTheme(id) {
-  if (id) document.documentElement.setAttribute('data-theme', id)
-  else document.documentElement.removeAttribute('data-theme')
-  setPref('theme', id || '')
-}
-function themeRender() {
-  const grid = document.getElementById('themeGrid'); if (!grid) return
-  const cur = PREF('theme') || 'neon'   // 默认霓虹：没存过主题（或存了空）都算 neon
-  grid.innerHTML = THEMES.map(t => {
-    const on = cur === t.id
-    return '<div class="theme-card" data-t="' + t.id + '" style="cursor:pointer;border:2px solid ' + (on ? t.accent : 'rgba(0,0,0,.12)') + ';border-radius:12px;overflow:hidden;background:var(--bg-elev);transition:border-color .15s,transform .15s">'
-      + '<div style="height:64px;background:' + t.bg + ';position:relative;padding:8px">'
-      + '<span style="position:absolute;top:8px;left:8px;right:8px;bottom:20px;border-radius:8px;background:' + t.card + '"></span>'
-      + '<span style="position:absolute;left:14px;bottom:6px;width:20px;height:20px;border-radius:50%;background:' + t.accent + ';box-shadow:0 0 10px ' + t.accent + '99"></span>'
-      + '<span style="position:absolute;left:40px;bottom:12px;width:34px;height:8px;border-radius:4px;background:' + t.text + ';opacity:.85"></span>'
-      + '<span style="position:absolute;left:40px;bottom:26px;width:22px;height:8px;border-radius:4px;background:' + t.text + ';opacity:.45"></span>'
-      + '</div>'
-      + '<div style="padding:8px 10px;font-size:12.5px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px">' + t.name
-      + (on ? '<span style="margin-left:auto;font-size:12px;color:' + t.accent + '">✓</span>' : '')
-      + '</div></div>'
-  }).join('')
-  grid.querySelectorAll('.theme-card').forEach(el => el.addEventListener('click', () => {
-    if (cur === el.dataset.t) return   // 已是当前主题（含默认霓虹）再点不动，避免「取消选中」退回旧暗色
-    applyTheme(el.dataset.t)
-    themeRender()
-  }))
-}
-themeRender()
-
-// 轮播自动播放
-const optAuto = document.getElementById('optAuto')
-optAuto.checked = PREF('autoplay') !== '0'
-if (!optAuto.checked) clearInterval(timer)
-optAuto.addEventListener('change', () => {
-  setPref('autoplay', optAuto.checked ? '1' : '0')
-  optAuto.checked ? restart() : clearInterval(timer)
-})
-
-// 代理设置（服务端持久化 server-config.json，刮削接口即时生效）
-const optProxy = document.getElementById('optProxy')
-const optProxyOn = document.getElementById('optProxyOn')
-const proxyStatus = document.getElementById('proxyStatus')
-fetch('/api/config', { cache: 'no-store' }).then(r => r.json()).then(j => {
-  optProxy.value = j.proxy || ''
-  optProxyOn.checked = j.proxyEnabled !== false
-  optProxy.disabled = !optProxyOn.checked
-  const cd = document.getElementById('optCacheDir'); if (cd) cd.value = j.cacheDir || ''
-  const ao = document.getElementById('optAccessOn')
-  if (ao) { ao.checked = !!j.accessOn; window.accessToggleUI() }
-}).catch(() => {})
-optProxyOn.addEventListener('change', async () => {
-  optProxy.disabled = !optProxyOn.checked
-  proxyStatus.textContent = '切换中…'
-  try {
-    const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proxyEnabled: optProxyOn.checked }) })
-    const j = await r.json()
-    proxyStatus.textContent = j.ok ? (optProxyOn.checked ? '✓ 已开启，所有出网请求走代理' : '✓ 已关闭，全部直连') : (j.error || '切换失败')
-  } catch (e) { proxyStatus.textContent = '切换失败：' + e.message }
-})
-window.saveProxy = async function () {
-  proxyStatus.textContent = '保存中…'
-  try {
-    const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proxy: optProxy.value.trim() }) })
-    const j = await r.json()
-    proxyStatus.textContent = j.ok ? '已保存，刮削接口即时生效' : (j.error || '保存失败')
-  } catch (e) { proxyStatus.textContent = '保存失败：' + e.message }
-}
-/* ---------- 访问口令 ---------- */
-window.accessToggleUI = function () {
-  const row = document.getElementById('accessRow')
-  if (row) row.style.display = document.getElementById('optAccessOn').checked ? '' : 'none'
-}
-window.saveAccess = async function () {
-  const st = document.getElementById('accessStatus')
-  const code = document.getElementById('optAccess').value.trim()
-  st.textContent = '保存中…'
-  try {
-    const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessCode: code }) })
-    const j = await r.json()
-    if (!j.ok) { st.textContent = j.error || '保存失败'; return }
-    st.textContent = code ? '✓ 已开启口令，其他设备访问需先验证（本机 localhost 不受影响）' : '✓ 已关闭口令'
-    if (code) setTimeout(() => { location.href = '/login' }, 1200)   // 让本机也拿一把有效 cookie
-  } catch (e) { st.textContent = '保存失败：' + e.message }
-}
-/* ---------- 备份 / 恢复 ---------- */
-window.backupDownload = () => { location.href = '/api/backup' }
-window.restoreUpload = async input => {
-  const f = input.files && input.files[0]
-  if (!f) return
-  const st = document.getElementById('backupStatus')
-  try {
-    const bundle = JSON.parse(await f.text())
-    if (!confirm('导入这份备份并覆盖当前配置 / 播放记录 / 个人数据？（媒体文件不动，导入后自动重扫）')) { input.value = ''; return }
-    st.textContent = '恢复中…'
-    const r = await fetch('/api/backup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bundle) })
-    const j = await r.json()
-    if (!j.ok) { st.textContent = j.error || '恢复失败'; return }
-    st.textContent = '✓ 已恢复：' + (j.applied || []).join('、')
-    setTimeout(() => location.reload(), 1500)
-  } catch (e) { st.textContent = '文件不是有效的备份 JSON：' + e.message }
-}
-window.testProxy = async function () {
-  proxyStatus.textContent = '测试中…'
-  try {
-    const r = await fetch('/api/config/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proxy: optProxy.value.trim() }) })
-    const j = await r.json()
-    if (j.ok) {
-      const list = (j.samples || []).map(x => x.ms).join(' / ')
-      const label = j.via && j.via !== 'direct' ? '代理线路 ' + j.via : '直连线路'
-      proxyStatus.textContent = `✓ ${label}：平均 ${j.avg}ms（${list}）`
-    } else {
-      proxyStatus.textContent = '✕ 不通：' + (j.error || '无响应')
-    }
-  } catch (e) { proxyStatus.textContent = '测试失败：' + e.message }
-}
 
 /* ================= 使用文档（设置 → 关于，点击展开卡片阅读） ================= */
 const DOC_SECTIONS = [
@@ -10131,14 +9436,12 @@ const DOC_SECTIONS = [
     '收藏：详情页「♥ 收藏」加入收藏，在「我的收藏」页统一查看影片 / 女优 / 系列。'
   ]],
   ['添加影片（导入整理）', [
-    '导入视频整理：扫描视频目录里的散落视频 → 解析番号 → 原地整理成 番号/番号-标签.mp4（如 ISIS-156-无码-破解.mp4），已整理的文件夹自动跳过。',
     '刮削产物位置：跟视频放一起（Kodi/Emby 结构）或仅存缓存；「刮削后自动原地整理」开关在 设置 → 刮削与整理。'
   ]],
   ['设置', [
     '媒体库：多文件夹管理、逐库统计（视频 / 成功 / 失败 / 封面）、删除即从主页移除该库海报。',
     '网络：代理总开关，开启后刮削 / 图片 / 磁力 / 女优资料全部走代理，关闭则直连。',
     '缓存：刮削数据落盘目录（可改到媒体盘），一部影片一个番号文件夹，可整体备份迁移。',
-    '图片升级：低清封面 / 主图批量换高清候选；待升级行点开看新老对比，线上不比本地大时自动跳过不再提示。',
     '数据源：各站点开关、测试连通、番号 / 路径识别词、字段级刮削优先级。'
   ]],
   ['常见问题', [
@@ -10427,295 +9730,8 @@ window.pan115Tasks = async function () {
   } catch (err) { if (st) st.textContent = '失败：' + err.message }
 }
 
-/* ================= 设置 → 数据源（1:1 复刻 NAS MDC-NG 数据源管理页） ================= */
-let _MDC = { sources: [], priorities: null, keywords: null, types: [], fields: [] }
-let _MDC_OPEN = {}   // 优先级盒子展开状态
-function mdcName(id) { const s = _MDC.sources.find(x => x.id === id); return s ? s.name : id }
-function mdcEnabledIds() { return _MDC.sources.filter(s => s.enabled).map(s => s.id) }
-
-window.srcRender = async function () {
-  const cards = document.getElementById('mdcCards'); if (!cards) return
-  try {
-    const d = await (await fetch('/api/sources', { cache: 'no-store' })).json()
-    if (d.ok) _MDC = { sources: d.sources || [], priorities: d.priorities, keywords: d.keywords, types: d.types || [], fields: d.fields || [] }
-  } catch (_) {}
-  if (!_MDC.priorities) return
-  mdcRenderCards(); mdcRenderKw(); mdcRenderGlobal(); mdcRenderFields(); mdcRenderIgnore()
-}
-
-/* ---- 站点卡片（名称 + 状态圆点 + 开关 + 网址） ---- */
-function mdcRenderCards() {
-  const cards = document.getElementById('mdcCards'); if (!cards) return
-  cards.innerHTML = _MDC.sources.map(s => `
-    <div class="mdc-card" data-id="${libEsc(s.id)}" onclick="mdcOpenEdit('${libEsc(s.id)}')">
-      <div class="mc-top">
-        <span class="mc-name"><span class="mc-dot" id="mdcdot-${libEsc(s.id)}"></span>${libEsc(s.name)}</span>
-        <span class="mdc-sw" onclick="event.stopPropagation()"><input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="mdcToggle('${libEsc(s.id)}',this.checked)"><i></i></span>
-      </div>
-      <div class="mc-url">${libEsc(s.base_url || '')}</div>
-    </div>`).join('')
-}
-window.mdcToggle = function (id, on) {
-  const s = _MDC.sources.find(x => x.id === id); if (!s) return
-  s.enabled = on
-  mdcRenderGlobal(); mdcRenderFields(); mdcRenderIgnore()
-}
-
-/* ---- 站点详情弹窗（字段与 MDC-NG provider 配置一致） ---- */
-window.mdcOpenEdit = function (id) {
-  const s = _MDC.sources.find(x => x.id === id); if (!s) return
-  const old = document.getElementById('mdcModal'); if (old) old.remove()
-  const sw = (k, label) => `<div class="mm-switch-row"><span>${label}</span><span class="mdc-sw"><input type="checkbox" id="mm-${k}" ${s[k] ? 'checked' : ''}><i></i></span></div>`
-  const el = document.createElement('div')
-  el.className = 'mdc-modal'; el.id = 'mdcModal'
-  el.innerHTML = `<div class="mm-box">
-    <h3 class="mm-title">${libEsc(s.name)}</h3>
-    <div class="mm-sub">${libEsc(s.id)} · 点遮罩关闭</div>
-    <div class="mm-f"><label>网址 (base_url)</label><input type="text" id="mm-base_url" value="${libEsc(s.base_url || '')}"></div>
-    <div class="mm-f"><label>番号搜索模板（{code} 占位，用于详情页番号链接）</label><input type="text" id="mm-search" value="${libEsc(s.search || '')}" placeholder="如 https://www.javbus.com/{code}"></div>
-    <div class="mm-f"><label>测试链接（留空用网址）</label><input type="text" id="mm-test" value="${libEsc(s.test || '')}"></div>
-    <div class="mm-row">
-      <div class="mm-f"><label>Cookies</label><input type="text" id="mm-cookies" value="${libEsc(s.cookies || '')}"></div>
-      <div class="mm-f"><label>User-Agent</label><input type="text" id="mm-user_agent" value="${libEsc(s.user_agent || '')}"></div>
-      <div class="mm-f"><label>冷却秒数 (cooldown_seconds)</label><input type="number" id="mm-cooldown_seconds" value="${s.cooldown_seconds || 0}" min="0"></div>
-      <div class="mm-f"><label>重试次数 (retry_times)</label><input type="number" id="mm-retry_times" value="${s.retry_times || 0}" min="0"></div>
-      <div class="mm-f"><label>代理 (proxy)</label><input type="text" id="mm-proxy" value="${libEsc(s.proxy || '')}" placeholder="留空用全局代理"></div>
-      <div class="mm-f"><label>API Key</label><input type="text" id="mm-api_key" value="${libEsc(s.api_key || '')}"></div>
-    </div>
-    ${sw('retry_times_override', '重试次数覆盖全局 (retry_times_override)')}
-    ${sw('disable_hash_match', '禁用哈希匹配 (disable_hash_match)')}
-    <div class="mm-foot">
-      <button class="mdc-btn ghost" onclick="document.getElementById('mdcModal').remove()">取消</button>
-      <button class="mdc-btn primary" onclick="mdcSaveEdit('${libEsc(s.id)}')">保存</button>
-    </div>
-  </div>`
-  el.addEventListener('click', e => { if (e.target === el) el.remove() })
-  document.body.appendChild(el)
-}
-window.mdcSaveEdit = function (id) {
-  const s = _MDC.sources.find(x => x.id === id); if (!s) return
-  const g = k => { const el = document.getElementById('mm-' + k); return el ? el.value : undefined }
-  s.base_url = (g('base_url') || '').trim()
-  s.search = (g('search') || '').trim()
-  s.test = (g('test') || '').trim()
-  s.cookies = (g('cookies') || '').trim()
-  s.user_agent = (g('user_agent') || '').trim()
-  s.cooldown_seconds = Math.max(0, parseInt(g('cooldown_seconds'), 10) || 0)
-  s.retry_times = Math.max(0, parseInt(g('retry_times'), 10) || 0)
-  s.proxy = (g('proxy') || '').trim()
-  s.api_key = (g('api_key') || '').trim()
-  s.retry_times_override = document.getElementById('mm-retry_times_override').checked
-  s.disable_hash_match = document.getElementById('mm-disable_hash_match').checked
-  document.getElementById('mdcModal').remove()
-  mdcRenderCards()
-  mdcSave()
-}
-
-/* ---- 自定义识别词（番号 / 路径） ---- */
-function mdcRenderKw() {
-  for (const [mode, boxId] of [['code', 'mdcKwCode'], ['path', 'mdcKwPath']]) {
-    const box = document.getElementById(boxId); if (!box) continue
-    const kw = (_MDC.keywords && _MDC.keywords[mode]) || {}
-    box.innerHTML = _MDC.types.map(t => `
-      <div class="mdc-kw-row">
-        <span class="mk-label">${libEsc(t.name.replace(' 番号', '').replace('影片', ''))}</span>
-        <span class="mk-chips">${(kw[t.key] || []).map((w, i) => `<span class="mdc-chip">${libEsc(w)}<button title="删除" onclick="mdcKwDel('${mode}','${t.key}',${i})">✕</button></span>`).join('')}</span>
-        <button class="mdc-btn-add" onclick="mdcKwAdd(this,'${mode}','${t.key}')">添加</button>
-      </div>`).join('')
-  }
-}
-window.mdcKwAdd = function (btn, mode, type) {
-  const row = btn.closest('.mdc-kw-row')
-  let inp = row.querySelector('.mk-inp')
-  if (!inp) {
-    inp = document.createElement('input')
-    inp.className = 'mk-inp'; inp.placeholder = '回车添加'
-    inp.style.cssText = 'font:inherit;font-size:12px;padding:4px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:var(--input-bg);color:var(--text);outline:none;width:110px'
-    row.insertBefore(inp, btn)
-    inp.focus()
-    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { mdcKwCommit(mode, type, inp.value); inp.value = ''; inp.remove() } })
-    inp.addEventListener('blur', () => { if (!inp.value.trim()) inp.remove() })
-    return
-  }
-  mdcKwCommit(mode, type, inp.value); inp.remove()
-}
-function mdcKwCommit(mode, type, val) {
-  const w = (val || '').trim(); if (!w) return
-  const kw = _MDC.keywords[mode]
-  if (!kw[type]) kw[type] = []
-  if (!kw[type].includes(w)) { kw[type].push(w); mdcRenderKw(); mdcSave() }
-}
-window.mdcKwDel = function (mode, type, i) {
-  _MDC.keywords[mode][type].splice(i, 1)
-  mdcRenderKw(); mdcSave()
-}
-
-/* ---- 优先级盒子（全局 6 类 / 字段 8 项 / 屏蔽字段），展开后可排序增删 ---- */
-function priBox(key) {
-  const P = _MDC.priorities
-  const arr = Array.isArray(P[key]) ? P[key] : (P.by_fields && P.by_fields[key]) || (P.ignore_fields && P.ignore_fields[key]) || []
-  const open = !!_MDC_OPEN[key]
-  const chips = arr.length
-    ? arr.map((id, i) => `<span class="mdc-chip">${libEsc(mdcName(id))}${open ? `<button class="pc-arrow" title="上移" onclick="mdcPriMove('${key}',${i},-1)">▲</button><button class="pc-arrow" title="下移" onclick="mdcPriMove('${key}',${i},1)">▼</button><button class="pc-arrow" title="移除" onclick="mdcPriDel('${key}',${i})">✕</button>` : ''}</span>`).join('')
-    : '<span style="font-size:12px;color:#a1a1aa">未配置</span>'
-  let extra = ''
-  if (open) {
-    const rest = mdcEnabledIds().filter(id => !arr.includes(id))
-    extra = `<div class="mdc-pri-extra"><select onchange="mdcPriAdd('${key}',this.value);this.selectedIndex=0"><option value="">＋ 添加站点…</option>${rest.map(id => `<option value="${libEsc(id)}">${libEsc(mdcName(id))}</option>`).join('')}</select></div>`
-  }
-  return `<div class="mdc-pri-box"><span class="mp-chips">${chips}</span><button class="mp-toggle${open ? ' open' : ''}" title="展开/收起" onclick="mdcPriToggle('${key}')">▼</button></div>${extra}`
-}
-window.mdcPriToggle = function (key) { _MDC_OPEN[key] = !_MDC_OPEN[key]; mdcRenderAllPri() }
-function mdcPriArrRef(key) {
-  const P = _MDC.priorities
-  if (Array.isArray(P[key])) return P[key]
-  for (const nest of ['by_fields', 'ignore_fields']) {
-    if (P[nest]) {
-      if (!Array.isArray(P[nest][key])) P[nest][key] = []
-      return P[nest][key]
-    }
-  }
-  return null
-}
-window.mdcPriMove = function (key, i, dir) {
-  const arr = mdcPriArrRef(key); if (!arr) return
-  const to = i + dir
-  if (to < 0 || to >= arr.length) return
-  ;[arr[i], arr[to]] = [arr[to], arr[i]]
-  mdcRenderAllPri(); mdcSave()
-}
-window.mdcPriDel = function (key, i) {
-  const arr = mdcPriArrRef(key); if (!arr) return
-  arr.splice(i, 1)
-  mdcRenderAllPri(); mdcSave()
-}
-window.mdcPriAdd = function (key, id) {
-  if (!id) return
-  const arr = mdcPriArrRef(key); if (!arr) return
-  if (!arr.includes(id)) { arr.push(id); mdcRenderAllPri(); mdcSave() }
-}
-function mdcRenderAllPri() { mdcRenderGlobal(); mdcRenderFields(); mdcRenderIgnore() }
-window.mdcRenderGlobal = function () {
-  const box = document.getElementById('mdcPriGlobal'); if (!box) return
-  box.innerHTML = _MDC.types.map(t => `<div class="mdc-pri-head" style="margin:16px 0 0"><span class="mph-left"><b>${libEsc(t.name)}</b></span></div>` + priBox(t.key)).join('')
-}
-window.mdcRenderFields = function () {
-  const box = document.getElementById('mdcPriFields'); if (!box) return
-  const hide = document.getElementById('mdcHideEmpty') && document.getElementById('mdcHideEmpty').checked
-  box.innerHTML = _MDC.fields.filter(f => !hide || (_MDC.priorities.by_fields[f.key] || []).length)
-    .map(f => `<div class="mdc-pri-head" style="margin:16px 0 0"><span class="mph-left"><b>${libEsc(f.name)}</b></span></div>` + priBox(f.key)).join('') || '<p class="mdc-sec-hint" style="margin-top:14px">暂无已配置字段</p>'
-}
-window.mdcRenderIgnore = function () {
-  const box = document.getElementById('mdcPriIgnore'); if (!box) return
-  const hide = document.getElementById('mdcHideIgnore') && document.getElementById('mdcHideIgnore').checked
-  box.innerHTML = _MDC.fields.filter(f => !hide || (_MDC.priorities.ignore_fields[f.key] || []).length)
-    .map(f => `<div class="mdc-pri-head" style="margin:16px 0 0"><span class="mph-left"><b>${libEsc(f.name)}</b></span></div>` + priBox(f.key)).join('') || '<p class="mdc-sec-hint" style="margin-top:14px">暂无屏蔽配置</p>'
-}
-window.mdcReset = async function () {
-  try { await fetch('/api/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resetPriorities: true }) }) } catch (_) {}
-  _MDC_OPEN = {}
-  await srcRender()
-}
-
-/* ---- 保存修改（站点 + 优先级 + 识别词一次落盘） ---- */
-window.mdcSave = async function (btn) {
-  if (btn) { btn.disabled = true; btn.textContent = '保存中…' }
-  try {
-    const r = await fetch('/api/sources', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sources: _MDC.sources, priorities: _MDC.priorities, keywords: _MDC.keywords })
-    })
-    const j = await r.json()
-    if (j.ok) {
-      if (j.sources) _MDC.sources = j.sources
-      if (j.priorities) _MDC.priorities = j.priorities
-      _SOURCES = null   // 详情页外链按新数据重取
-      if (btn) { btn.textContent = '已保存'; setTimeout(() => { btn.textContent = '保存修改'; btn.disabled = false }, 1500) }
-    } else if (btn) { btn.textContent = j.error || '保存失败'; btn.disabled = false }
-  } catch (e) { if (btn) { btn.textContent = '保存失败：' + e.message; btn.disabled = false } }
-}
-
-/* ---- 测试全部：逐站经代理连通性检测，卡片圆点变绿/红 ---- */
-window.mdcTestAll = async function (btn) {
-  if (!btn) return
-  btn.disabled = true; btn.textContent = '⟳ 测试中…'
-  for (const s of _MDC.sources) {
-    const dot = document.getElementById('mdcdot-' + s.id)
-    if (dot) dot.className = 'mc-dot'
-    const url = s.test || s.base_url
-    if (!url) continue
-    if (!s.enabled) { if (dot) dot.className = 'mc-dot bad'; continue }
-    try {
-      const r = await fetch('/api/source/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) })
-      const j = await r.json()
-      if (dot) {
-        dot.className = 'mc-dot ' + (j.ok ? 'ok' : 'bad')
-        dot.title = s.name + '：' + (j.ok ? '连通 ' + j.ms + 'ms' : (j.error || '连不上'))
-      }
-    } catch (_) { if (dot) dot.className = 'mc-dot bad' }
-  }
-  const stamp = document.getElementById('mdcTestTime')
-  if (stamp) stamp.textContent = '状态更新时间：' + new Date().toLocaleTimeString('zh-CN', { hour12: false })
-  btn.disabled = false; btn.textContent = '⟳ 测试全部'
-}
-
-// 罩杯徽章（女优头像右下角）
-const optCup = document.getElementById('optCup')
-optCup.checked = cupBadgeOn()
-optCup.addEventListener('change', () => {
-  setPref('cupbadge', optCup.checked ? '1' : '0')
-  if (acPage.classList.contains('open')) renderActors()   // 正在看女优页就即时刷新
-})
-const optMvPoster = document.getElementById('optMvPoster')
-optMvPoster.value = PREF('mvposter') === '1' ? 'portrait' : 'landscape'
-optMvPoster.addEventListener('change', () => {
-  setPref('mvposter', optMvPoster.value === 'portrait' ? '1' : '0')
-  if (location.hash.startsWith('#/movie/')) route()   // 正在看详情页就即时重渲染
-})
-
-// 刮削内容面板：是否标注来源绝对路径（默认关）
-const optSrcPath = document.getElementById('optSrcPath')
-optSrcPath.checked = PREF('srcpath') === '1'
-optSrcPath.addEventListener('change', () => {
-  setPref('srcpath', optSrcPath.checked ? '1' : '0')
-  // 面板开着就即时刷新（路径行随开关显隐）
-  const box = document.getElementById('mvScrapeModal')
-  if (box && box.classList.contains('open') && MVS_STATE.data) mvsRender()
-})
-
-// 可视化编辑按钮（主页 / 影片详情页右下角）
-const optEditBtn = document.getElementById('optEditBtn')
-optEditBtn.checked = PREF('editbtn') !== '0'
-optEditBtn.addEventListener('change', () => {
-  setPref('editbtn', optEditBtn.checked ? '1' : '0')
-  if (!optEditBtn.checked) {
-    const p = document.getElementById('homeTunePanel'); if (p) p.classList.remove('open')
-  }
-  updateHomeEditBtn()
-})
-
-/* 影片卡片磨砂 + 悬停动效（默认开）：关掉 → body.no-cardfx，退回朴素平面样式 */
-const optCardFx = document.getElementById('optCardFx')
-const applyCardFx = () => document.body.classList.toggle('no-cardfx', PREF('cardfx') === '0')
-optCardFx.checked = PREF('cardfx') !== '0'
-applyCardFx()
-optCardFx.addEventListener('change', () => {
-  setPref('cardfx', optCardFx.checked ? '1' : '0')
-  applyCardFx()
-})
-/* 显示已隐藏的影片：默认不显示被「隐藏」按钮藏起来的条目，勾上后可看回并逐条恢复 */
-const optShowHidden = document.getElementById('optShowHidden')
-optShowHidden.checked = showHidden()
-optShowHidden.addEventListener('change', () => {
-  setPref('showhidden', optShowHidden.checked ? '1' : '0')
-  LIB = libVisibleList(LIB_ALL)
-  if (location.hash === '#/lib') lbRenderWall()
-  renderLibrary()
-})
-
 /* 刮削与整理：各内置动作的开关 + 榜单立即更新
    （动作本身跑在服务端，不依赖任何外部定时任务；这里只是开关与手动触发） */
-const optAutoOrg = document.getElementById('optAutoOrg')
 const optRankAuto = document.getElementById('optRankAuto')
 const optRankHour = document.getElementById('optRankHour')
 const rankUpInfo = document.getElementById('rankUpInfo')
@@ -10748,7 +9764,6 @@ function spRankInfo(ts, running) {
 async function spLoadScrape() {
   try {
     const j = await (await fetch('/api/config', { cache: 'no-store' })).json()
-    if (optAutoOrg) optAutoOrg.checked = !!j.autoOrganize
     if (optRankAuto) optRankAuto.checked = j.rankAuto !== false
     if (optRankHour) { optRankHour.value = String(j.rankHour == null ? 4 : j.rankHour); optRankHour.disabled = !(j.rankAuto !== false) }
     spRankInfo(j.rankUpdatedAt, j.rankRunning)
@@ -10766,7 +9781,6 @@ async function spLoadScrape() {
 spLoadScrape()
 const spSaveCfg = patch => fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) })
   .then(r => r.json()).catch(() => ({}))
-if (optAutoOrg) optAutoOrg.addEventListener('change', () => { spSaveCfg({ autoOrganize: optAutoOrg.checked }) })
 if (optRankAuto) optRankAuto.addEventListener('change', () => {
   spSaveCfg({ rankAuto: optRankAuto.checked })
   if (optRankHour) optRankHour.disabled = !optRankAuto.checked
@@ -11629,7 +10643,6 @@ function renderHistory() {
       <div class="lb-bar" style="margin-bottom:14px"><span>共 ${rows.length} 条观看记录</span><span style="flex:1"></span>
         <button class="lb-ctl" onclick="histClear()">清空全部记录</button>
         <a class="lb-ctl" href="#/tags" style="text-decoration:none">标签管理</a>
-        <a class="lb-ctl" href="#/tree" style="text-decoration:none">目录树</a>
       </div>
       ${rows.length ? html : '<div class="lb-none">还没有观看记录 —— 播放影片后这里会按时间列出</div>'}
     </div>`
@@ -11644,121 +10657,33 @@ window.histClear = () => { if (!confirm('清空全部观看记录？续播进度
   document.addEventListener('click', e => { if (!menu.contains(e.target) && e.target !== btn) menu.classList.remove('open') })
   menu.addEventListener('click', () => menu.classList.remove('open'))
 })()
-/* ---- 删除影片（移进媒体库 _trash 回收站）---- */
-/* ---- 彻底删除影片（详情页「删除」按钮）----
- * 与回收站不同：视频文件（含同番号多版本）真删 + 整个番号离线数据文件夹一起删。
- * 网盘挂载权限不足时，服务端会把 errno 翻译成人话并带上具体路径，这里明确弹出来。 */
-window.deleteMovie = code => {
-  if (!confirm('彻底删除 ' + code + ' ？\n\n· 库里若存在视频文件（含破解/中字等多版本），会一并删除\n· 离线数据（元数据/图片）整个番号文件夹一起删除\n· 真删，不进回收站，不可恢复')) return
+/* ---- 移除影片（详情页 / 批量管理「删除」，v0.3.0 只读媒体库）----
+ * 视频文件一律不动：只清离线数据（cache/movies/<番号>/）+ 把条目从影片库隐藏。 */
+window.removeMovie = code => {
+  if (!confirm('移除 ' + code + ' ？\n\n· 视频文件不动（挂载目录只读原则）\n· 清掉离线数据（元数据 / 图片 / 磁力缓存）\n· 条目从影片库隐藏（设置 → 离线数据可恢复显示）')) return
   fetch('api/movie/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })
     .then(r => r.json()).then(d => {
-      if (!d.ok) {
-        alert('删除没有全部完成：\n' + (d.error || '') +
-          (d.videos && d.videos.length ? '\n\n已删掉的视频：' + d.videos.join('、') : '') +
-          (d.offlineErr ? '\n' + d.offlineErr : ''))
-        return
-      }
-      if (d.offlineErr) { alert('视频已删除，但离线数据清理失败：' + d.offlineErr); return }
-      playToast('已删除 ' + code + (d.videos && d.videos.length ? '（含 ' + d.videos.length + ' 个视频文件）' : ''), 2800)
-      setTimeout(() => { location.hash = '#/'; setTimeout(() => location.reload(), 150) }, 900)
+      if (!d.ok) { alert('移除失败：' + (d.error || '') + (d.offlineErr ? '\n' + d.offlineErr : '')); return }
+      playToast('已移除 ' + code + (d.offline ? '（离线数据已清）' : ''), 2600)
+      setTimeout(() => location.reload(), 1100)
     }).catch(() => alert('网络错误'))
 }
-window.trashMovie = code => {
-  if (!confirm('删除 ' + code + ' ？\n有视频文件的会移进媒体库根目录的 _trash/（设置页可还原）；只有线上资料的直接清掉离线数据，不进回收站。')) return
-  fetch('api/trash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ codes: [code] }) })
-    .then(r => r.json()).then(d => {
-      if (!d.ok) { alert('删除失败：' + (d.error || '')); return }
-      const sk = (d.skipped || [])[0]
-      if (sk) { alert('没删成：' + sk.reason); return }
-      playToast(((d.offline || []).length ? '已清掉线上资料：' : '已移入回收站：') + code, 2600)
-      setTimeout(() => location.reload(), 1200)
-    }).catch(() => alert('网络错误'))
-}
-window.trashBulk = () => {
+window.removeMovieBulk = () => {
   if (!BULK || !BULK.size) return
-  if (!confirm('删除选中的 ' + BULK.size + ' 部影片？\n\n· 清掉它们的离线资料（元数据 / 图片），条目从影片库消失\n· 库里有视频文件的，连视频一起删（视频先进回收站，设置页可还原）')) return
-  /* 勾选集合里存的是 uKey（去掉了短横线），删除要的是条目真实番号 —— 否则服务端按
-   * 「VRKM625」去 cache/movies 找离线文件夹必然找不到，批量删除就会全部跳过 */
+  if (!confirm('移除选中的 ' + BULK.size + ' 部影片？\n\n· 视频文件一律不动\n· 清掉离线资料（元数据 / 图片），条目从影片库隐藏')) return
   const delCodes = [...BULK].map(k => (LIB_ALL.find(x => uKey(x.code) === k) || {}).code || k)
-  fetch('api/trash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ codes: delCodes }) })
-    .then(r => r.json()).then(d => {
-      if (!d.ok) { alert('删除失败：' + (d.error || '')); return }
-      const nT = (d.trashed || []).length, nO = (d.offline || []).length, nS = (d.skipped || []).length
-      const parts = []
-      if (nT) parts.push('含视频进回收站 ' + nT + ' 部')
-      if (nO) parts.push('清掉离线资料 ' + nO + ' 部')
-      if (nS) parts.push('跳过 ' + nS + ' 部（' + d.skipped[0].reason + '）')
-      playToast('已删除 ' + (nT + nO) + ' 部' + (parts.length ? '：' + parts.join('，') : ''), 3600)
-      BULK = new Set(); bulkRenderBar()
-      setTimeout(() => location.reload(), 1400)
-    }).catch(() => alert('网络错误'))
-}
-/* ---- 回收站管理（设置页「媒体库」里的卡片）---- */
-window.trashReload = () => {
-  const box = document.getElementById('trashBox'); if (!box) return
-  box.innerHTML = '<span style="opacity:.6">加载中…</span>'
-  fetch('api/trash').then(r => r.json()).then(d => {
-    const items = (d.ok && d.items) || []
-    if (!items.length) { box.innerHTML = '<span style="opacity:.6">回收站是空的</span>'; return }
-    box.innerHTML = items.map(it => `<div class="trash-row">
-      <span class="trash-name" title="${libEsc(it.name)}">${libEsc(it.name)}</span>
-      <span class="trash-meta">${it.videos} 个视频 · ${lbFmtSize(it.size)} · ${fmtDT(it.mtime)}</span>
-      <button class="lb-ctl" onclick="trashRestore('${libEsc(it.name)}')">还原</button>
-      <button class="lb-ctl" style="border-color:rgba(229,20,40,.45)" onclick="trashPurge('${libEsc(it.name)}')">彻底删除</button>
-    </div>`).join('')
-  }).catch(() => { box.innerHTML = '<span style="opacity:.6">读取失败</span>' })
-}
-window.trashRestore = n => {
-  fetch('api/trash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ restore: n }) })
-    .then(r => r.json()).then(d => { playToast(d.ok ? '已还原到媒体库根目录：' + n : '还原失败：' + d.error, 2800); trashReload() })
-}
-window.trashPurge = n => {
-  if (!confirm('彻底删除「' + n + '」？文件会从硬盘上删掉，不可恢复！')) return
-  fetch('api/trash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ purge: n }) })
-    .then(r => r.json()).then(d => { playToast(d.ok ? '已彻底删除：' + n : '删除失败：' + d.error, 2800); trashReload() })
-}
-/* ---- NFO 回写编辑器（详情页「✎ 编辑元数据」）---- */
-window.openNfoEdit = relEnc => {
-  const rel = decodeURIComponent(relEnc)
-  const x = relItemOf(rel)
-  if (!x) { alert('找不到这部影片的数据'); return }
-  const fld = (id, lab, val) => `<label class="nfo-l"><span>${lab}</span><input id="${id}" value="${libEsc(val || '')}"></label>`
-  let m = document.getElementById('nfoMask')
-  if (!m) {
-    m = document.createElement('div'); m.id = 'nfoMask'; m.className = 'bk-mask'
-    m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open') })
-    document.body.appendChild(m)
-  }
-  m.innerHTML = `<div class="bk-card" style="width:min(560px,94vw)">
-    <div class="bk-head"><b>编辑元数据（写回 NFO）</b><button class="bk-x" onclick="document.getElementById('nfoMask').classList.remove('open')">✕</button></div>
-    <div class="bk-body">
-      <p class="hint" style="margin:0 0 12px">保存后写回影片目录里的 NFO 文件并自动重扫 —— 换软件 / 重扫都不会丢。文件：${libEsc(rel)}</p>
-      ${fld('nfoTitle', '标题', x.scrapeTitle || x.title)}
-      <div class="nfo-2col">${fld('nfoYear', '年份', x.year)}${fld('nfoStudio', '厂商', x.studio)}</div>
-      <div class="nfo-2col">${fld('nfoDirector', '导演', x.director)}${fld('nfoRating', '评分 0-10', '')}</div>
-      ${fld('nfoGenres', '类别（逗号分隔）', (x.genres || []).join(', '))}
-      <label class="nfo-l"><span>剧情简介</span><textarea id="nfoPlot" rows="4">${libEsc(x.plot || '')}</textarea></label>
-      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
-        <button class="lb-ctl" onclick="document.getElementById('nfoMask').classList.remove('open')">取消</button>
-        <button class="lb-ctl on" id="nfoSaveBtn" onclick="nfoSave('${encodeURIComponent(rel)}')">保存并写回</button>
-      </div>
-    </div>
-  </div>`
-  m.classList.add('open')
-}
-window.nfoSave = relEnc => {
-  const rel = decodeURIComponent(relEnc)
-  const g = v => (document.getElementById(v) || {}).value || ''
-  const patch = { title: g('nfoTitle'), year: g('nfoYear'), studio: g('nfoStudio'), director: g('nfoDirector'), plot: g('nfoPlot') }
-  const rating = parseFloat(g('nfoRating'))
-  if (!isNaN(rating)) patch.rating = rating
-  patch.genres = g('nfoGenres').split(/[,，、]/).map(s => s.trim()).filter(Boolean)
-  const btn = document.getElementById('nfoSaveBtn'); if (btn) { btn.disabled = true; btn.textContent = '保存中…' }
-  fetch('api/nfo/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rel, patch }) })
-    .then(r => r.json()).then(d => {
-      playToast(d.ok ? '已写回 NFO 并重新扫描 —— 稍后刷新页面可见新数据' : '写回失败：' + (d.error || ''), 3600)
-      document.getElementById('nfoMask').classList.remove('open')
-    }).catch(() => { alert('网络错误'); if (btn) { btn.disabled = false; btn.textContent = '保存并写回' } })
+  ;(async () => {
+    let okN = 0, fail = []
+    for (const c of delCodes) {
+      try {
+        const d = await fetch('api/movie/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: c }) }).then(r => r.json())
+        if (d.ok) okN++; else fail.push(c + '：' + (d.error || d.offlineErr || '失败'))
+      } catch (_) { fail.push(c + '：网络错误') }
+    }
+    playToast('已移除 ' + okN + ' 部' + (fail.length ? '，失败 ' + fail.length + ' 部（' + fail[0] + '）' : ''), 3600)
+    BULK = new Set(); bulkRenderBar()
+    setTimeout(() => location.reload(), 1300)
+  })()
 }
 /* ---- 标签管理页（#/tags）---- */
 function renderTags() {
@@ -11777,13 +10702,14 @@ function renderTags() {
     .map(([t, list]) => `<div class="tag-row">
       <b class="tag-name" onclick="tagJump('${kind}','${libEsc(t).replace(/'/g, "\\'")}')" title="点击查看该标签下的影片">${libEsc(t)}</b>
       <span class="tag-n">${list.length} 部</span>
-      <button class="lb-ctl" onclick="tagRename('${kind}','${libEsc(t).replace(/'/g, "\\'")}')">重命名</button>
+      ${kind === 'user' ? `<button class="lb-ctl" onclick="tagRename('${kind}','${libEsc(t).replace(/'/g, "\\'")}')">重命名</button>
       <button class="lb-ctl" onclick="tagMerge('${kind}','${libEsc(t).replace(/'/g, "\\'")}')">合并到…</button>
-      <button class="lb-ctl" style="border-color:rgba(229,20,40,.4)" onclick="tagRemove('${kind}','${libEsc(t).replace(/'/g, "\\'")}')">删除</button>
+      <button class="lb-ctl" style="border-color:rgba(229,20,40,.4)" onclick="tagRemove('${kind}','${libEsc(t).replace(/'/g, "\\'")}')">删除</button>`
+        : '<span class="tag-n" style="opacity:.55">跟随刮削 · 只读</span>'}
     </div>`).join('') || '<div class="lb-none">暂无</div>'
   listPage.innerHTML = acHead('#/', '标签管理') + `
     <div class="sr-wrap">
-      <p class="ac-fnote" style="padding:0 0 6px">NFO 类别改的是每部影片目录里的 NFO 文件（写回，永久生效）；我的标签改的是本机个人数据（userdata）。数量多的排前面。点击标签名可跳到影片列表。</p>
+      <p class="ac-fnote" style="padding:0 0 6px">NFO 类别来自刮削数据（只读媒体库，不写回影片目录）；我的标签改的是本机个人数据（userdata）。数量多的排前面。点击标签名可跳到影片列表。</p>
       <div class="sta-cols">
         <div class="sta-sec"><h3>NFO 类别</h3>${rowHtml(nfoM, 'nfo')}</div>
         <div class="sta-sec"><h3>我的标签</h3>${rowHtml(userM, 'user')}</div>
@@ -11813,22 +10739,8 @@ window.tagRemove = (kind, tag) => {
   tagApply(kind, tag, t => t === tag ? null : t, '删除')
 }
 async function tagApply(kind, tag, mapFn, label) {
-  if (kind === 'nfo') {
-    const list = LIB_ALL.filter(x => !x.virtual && (x.genres || []).includes(tag))
-    let done = 0
-    for (const x of list) {
-      const genres = [...new Set((x.genres || []).map(mapFn).filter(Boolean))]
-      try {
-        const rel = x.relVideo || ((x.files || [])[0] || {}).relVideo
-        const r = await fetch('api/nfo/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rel, patch: { genres } }) })
-        const d = await r.json()
-        if (!d.ok) { playToast('「' + x.code + '」写回失败：' + (d.error || ''), 3000) }
-      } catch (_) {}
-      done++
-      playToast(label + '标签中… ' + done + ' / ' + list.length, 1200)
-    }
-    playToast(label + '完成（' + done + ' 部已写回 NFO），正在刷新', 2400)
-  } else {
+  if (kind === 'nfo') { playToast('NFO 类别跟随刮削数据（只读媒体库，不再写回 NFO 文件）', 3000); return }
+  {
     const keys = Object.keys(UDB).filter(k => (UDB[k].tags || []).includes(tag))
     keys.forEach(k => {
       const tags = [...new Set((UDB[k].tags || []).map(mapFn).filter(Boolean))]
@@ -11839,52 +10751,6 @@ async function tagApply(kind, tag, mapFn, label) {
   }
   setTimeout(() => location.reload(), 1200)
 }
-/* ---- 目录树（#/tree）：按文件夹层级浏览，点影片进详情，点「筛选」进影片库 ---- */
-function renderTree() {
-  const root = { dirs: new Map(), movies: [] }
-  LIB.filter(x => !x.virtual).forEach(x => {
-    const parts = (x.relPath || '').split('/'); parts.pop()
-    let node = root, path = ''
-    for (const seg of parts) {
-      path = path ? path + '/' + seg : seg
-      if (!node.dirs.has(seg)) node.dirs.set(seg, { name: seg, path, dirs: new Map(), movies: [] })
-      node = node.dirs.get(seg)
-    }
-    node.movies.push(x)
-  })
-  const dirSize = node => node.movies.reduce((s, x) => s + (x.size || 0), 0) +
-    [...node.dirs.values()].reduce((s, d) => s + dirSize(d), 0)
-  const dirCount = node => node.movies.length + [...node.dirs.values()].reduce((s, d) => s + dirCount(d), 0)
-  const movRow = x => {
-    const w = watchOfItem(x)
-    return `<div class="tree-mv" onclick="location.hash='#/movie/${encodeURIComponent(x.code)}'">
-      <span class="tm-code">${libEsc(x.code || x.title || '?')}</span>
-      <span class="tm-title">${libEsc((x.title || '').slice(0, 46))}</span>
-      ${w && !watchDone(w) && w.ratio > 0.02 ? `<span class="tm-prog">${Math.round(w.ratio * 100)}%</span>` : watchDone(w) ? '<span class="tm-prog" style="color:var(--accent-tint)">已看</span>' : ''}
-      <span class="tm-size">${lbFmtSize(x.size)}</span>
-    </div>`
-  }
-  const dirHtml = (node, depth) => {
-    const open = depth < 1 ? ' open' : ''
-    return `<details class="tree-dir"${open} data-path="${libEsc(node.path || '')}">
-      <summary>
-        <span class="td-name">${libEsc(node.name)}</span>
-        <span class="td-meta">${dirCount(node)} 部 · ${lbFmtSize(dirSize(node))}</span>
-        ${node.path ? `<button class="lb-ctl" onclick="event.preventDefault();event.stopPropagation();lbSetPath('${libEsc(node.path).replace(/'/g, "\\'")}')">筛选</button>` : ''}
-      </summary>
-      <div class="td-body">
-        ${[...node.dirs.values()].sort((a, b) => a.name.localeCompare(b.name)).map(d => dirHtml(d, depth + 1)).join('')}
-        ${node.movies.sort((a, b) => String(a.code).localeCompare(String(b.code))).map(movRow).join('')}
-      </div>
-    </details>`
-  }
-  listPage.innerHTML = acHead('#/', '目录树') + `
-    <div class="sr-wrap">
-      <p class="ac-fnote" style="padding:0 0 6px">按硬盘里的文件夹层级浏览；点影片进详情，点文件夹右侧「筛选」跳到影片库只看这个目录。</p>
-      ${[...root.dirs.values()].sort((a, b) => a.name.localeCompare(b.name)).map(d => dirHtml(d, 0)).join('')}
-      ${root.movies.length ? root.movies.map(movRow).join('') : ''}
-    </div>`
-}
 /* ---- 移动端手势（长按菜单 / 边缘滑返回）已随移动端支持一起移除：本项目只服务电脑端 ---- */
 
 
@@ -11894,7 +10760,8 @@ function renderTree() {
 try {
   const saved = JSON.parse(localStorage.getItem(LS_KEY) || 'null')
   if (saved && saved.count) {
-    document.getElementById('libStatus').innerHTML =
+    const _ls = document.getElementById('libStatus')
+    if (_ls) _ls.innerHTML =
       `<span class="okdot"></span>上次连接 <b>${saved.count}</b> 个影片<br><span class="lib-path">${saved.root}</span><br><span style="opacity:.7">刷新后需重新选择文件夹连接</span>`
   }
 } catch (_) {}
@@ -12123,7 +10990,8 @@ async function loadServerLib(rescan = false) {
     if (!d || !d.items) return false
     if (!d.items.length && !d.scanning) {
       SERVER_MODE = true; setBrowserPicker(false); libRender()
-      document.getElementById('libStatus').innerHTML =
+      const _ls1 = document.getElementById('libStatus')
+      if (_ls1) _ls1.innerHTML =
         '<span class="okdot" style="background:#f59e0b;box-shadow:0 0 8px rgba(245,158,11,.75)"></span>还没有添加媒体文件夹 · 在下方添加后自动扫描收录'
       const rb0 = document.getElementById('rescanBtn'); if (rb0) rb0.style.display = ''
       return true
@@ -12173,7 +11041,8 @@ async function applyServerItems(items, lite = false, root = '') {
     await acDataReady                            // 等 netflav 女优资料就绪再匹配
     const libIcoFilm = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:-1.5px;margin-right:2px"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M7 5v14M17 5v14M3 10h4M3 14h4M17 10h4M17 14h4"></path></svg>'
     const libIcoImg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1.5px;margin-right:2px"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="9" cy="10" r="2"></circle><path d="m21 15.5-4.5-4.5L7 20.5"></path></svg>'
-    document.getElementById('libStatus').innerHTML =
+    const _ls2 = document.getElementById('libStatus')
+    if (_ls2) _ls2.innerHTML =
       `<span class="okdot"></span><span class="lib-path">${root || LIB_ROOT || ''}</span>`
     const rb = document.getElementById('rescanBtn'); if (rb) rb.style.display = ''
   }
@@ -12213,7 +11082,7 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
   try { setTimeout(subsBadgeRefresh, 1200) } catch (_) {}   // 导航「订阅」角标：线上新作数
   if (!ok) {
     const el = document.getElementById('libStatus')
-    if (el.textContent === '未设置媒体库' || el.textContent === '')
+    if (el && (el.textContent === '未设置媒体库' || el.textContent === ''))
       el.innerHTML = '<span class="okdot" style="background:#6a6a76;box-shadow:none"></span>未连接本地服务<br><span style="opacity:.6;font-size:11px">运行 server.js 后刷新即自动连接；或直接添加媒体文件夹（纯浏览器模式）</span>'
   }
 })

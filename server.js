@@ -3197,422 +3197,6 @@ async function scSaveOne(dir, cands, role) {
   return { url: web(role + '.jpg'), w: best.sz.w, h: best.sz.h, bytes }
 }
 
-/* ================= 批量图片升级：给缓存里低清的封面/主图换上更高清的候选 =================
- * 标准（与抓取链路的 pick 一致）：竖版封面宽 <500、横版主图宽 <1600 视为"待升级"；
- * 候选取 meta.sourceData 里各源已存的 posterCands / fanartCands（不必重新访问站点），
- * 下载候选择优（面积最大），只有真的比现状大才落盘，绝不降级。 */
-const IMG_GOOD_W = { poster: 500, fanart: 1600 }
-const IMGUP = { running: false, total: 0, done: 0, current: '', log: [], error: '', finishedAt: 0 }
-
-/* 扫描缓存：返回待升级列表（低清且有候选且没试过白跑）、无候选需重刮、试过无更大的数量 */
-function imgUpList() {
-  const mdir = path.join(cacheDir(), 'movies')
-  let dirs = []
-  try { dirs = fs.readdirSync(mdir) } catch (_) {}
-  const items = []
-  let noCands = 0, noBetter = 0
-  for (const d of dirs) {
-    const m = readMovieCache(d)
-    if (!m || !m.images) continue
-    const pm = m.images.posterMeta && m.images.posterMeta.w ? m.images.posterMeta : null
-    const fm = m.images.fanartMeta && m.images.fanartMeta.w ? m.images.fanartMeta : null
-    /* 手动裁剪过的海报（posterManual）是用户亲自定的构图，不参与批量升级、也不算待升级 */
-    /* poster 字段为空但 posterMeta 有残留（角色修复清图时留下的尺寸）→ 同样算待升级 */
-    const pNeed = !m.images.posterManual && (!m.images.poster || !pm || pm.w < IMG_GOOD_W.poster)
-    const fNeed = !fm || fm.w < IMG_GOOD_W.fanart
-    if (!pNeed && !fNeed) continue
-    const sd = m.sourceData || {}
-    let np = 0, nf = 0
-    const srcs = []
-    for (const [id, s] of Object.entries(sd)) {
-      const a = (s.posterCands || []).length, b = (s.fanartCands || []).length
-      if (a || b) srcs.push(id)
-      np += a; nf += b
-    }
-    const pUp = pNeed && np > 0 && !m.images.posterUpTried
-    const fUp = fNeed && nf > 0 && !m.images.fanartUpTried
-    if (!pUp && !fUp) {
-      if (!np && !nf) noCands++      // 低清但没存任何候选 → 只能重刮
-      else noBetter++                // 试过了，现有图已是候选里最大的
-      continue
-    }
-    items.push({
-      code: d, title: m.title || '',
-      poster: pm ? pm.w + '×' + pm.h : '无', posterNeed: pNeed,
-      fanart: fm ? fm.w + '×' + fm.h : '无', fanartNeed: fNeed,
-      cands: (pUp ? np : 0) + (fUp ? nf : 0), srcs: srcs.slice(0, 3).join(', ')
-    })
-  }
-  items.sort((a, b) => a.code.localeCompare(b.code))
-  return { items, noCands, noBetter }
-}
-
-/* 单张升级：从候选里挑最大的符合朝向的图，仅当面积大于现状才覆盖；返回 {url,w,h,bytes} 或 null */
-async function imgUpOne(dir, role, cands, curSz, log) {
-  const imgDir = path.join(dir, 'images')
-  fs.mkdirSync(imgDir, { recursive: true })
-  const web = f => '/cache/movies/' + path.basename(dir) + '/images/' + f
-  const PORTRAIT = sz => sz.h > sz.w * 1.06
-  const LANDSCAPE = sz => sz.w > sz.h * 1.06
-  const want = role === 'poster' ? PORTRAIT : LANDSCAPE
-  const label = role === 'poster' ? '封面' : '主图'
-  const goodW = IMG_GOOD_W[role]
-  const area = sz => sz.w * sz.h
-  let best = null, attempt = 0
-  for (const u of cands) {
-    if (best) {
-      if (best.sz.w >= goodW) break                                   // 已达标准，不再抓
-      if (curSz && area(best.sz) > area(curSz) && attempt >= 4) break // 已优于现状且试了 4 个，够了
-    }
-    if (attempt >= 6) break
-    attempt++
-    try {
-      const b = await scFetch(u, { bin: true, hdrs: { referer: u } })
-      if (b.length < 2500) throw new Error('图片太小')
-      const fp = path.join(imgDir, '.up' + (Math.random() * 1e9 | 0) + '.jpg')
-      fs.writeFileSync(fp, b)
-      const sz = imgSize(fp)
-      if (!sz) { try { fs.unlinkSync(fp) } catch (_) {} throw new Error('不是有效图片') }
-      if (want(sz) && (!best || area(sz) > area(best.sz))) {
-        if (best) { try { fs.unlinkSync(best.fp) } catch (_) {} }
-        best = { fp, sz, u }
-      } else { try { fs.unlinkSync(fp) } catch (_) {} }
-    } catch (_) {}
-  }
-  if (!best) { log(label + '：候选里没有可用的图'); return { noBetter: true } }
-  if (curSz && area(best.sz) <= area(curSz)) {
-    try { fs.unlinkSync(best.fp) } catch (_) {}
-    log(label + '：现有 ' + curSz.w + '×' + curSz.h + ' 已是候选里最大的，不动')
-    return { noBetter: true }
-  }
-  const dst = path.join(imgDir, role + '.jpg')
-  fs.renameSync(best.fp, dst)
-  let bytes = 0
-  try { bytes = fs.statSync(dst).size } catch (_) {}
-  log(label + '：' + (curSz ? curSz.w + '×' + curSz.h + ' → ' : '') + best.sz.w + '×' + best.sz.h + ' ← ' + best.u.split('/').pop())
-  return { url: web(role + '.jpg'), w: best.sz.w, h: best.sz.h, bytes }
-}
-
-/* 批量升级任务：逐番号 → 逐字段（封面/主图），日志走 scLog（把 SCRAPE.log 指到本任务） */
-async function imgUpAsync(codes) {
-  IMGUP.running = true; IMGUP.total = codes.length; IMGUP.done = 0; IMGUP.current = ''
-  IMGUP.log = []; IMGUP.error = ''; IMGUP.finishedAt = 0
-  const oldLog = SCRAPE.log
-  SCRAPE.log = IMGUP.log   // scLog 直接写进本任务日志（与刮削任务互斥，见 start 入口守卫）
-  const t0 = Date.now()
-  try {
-    for (const code of codes) {
-      IMGUP.current = code
-      const m = readMovieCache(code)
-      if (!m) { scLog(code + '：离线数据里没有元数据，跳过'); IMGUP.done++; continue }
-      const dir = path.join(cacheDir(), 'movies', code.replace(/[^\w.-]/g, '_'))
-      const sd = m.sourceData || {}
-      const pc = [], fc = [], seenP = new Set(), seenF = new Set()
-      for (const s of Object.values(sd)) {
-        for (const u of (s.posterCands || [])) if (!seenP.has(u)) { seenP.add(u); pc.push(u) }
-        for (const u of (s.fanartCands || [])) if (!seenF.has(u)) { seenF.add(u); fc.push(u) }
-      }
-      /* DMM 图床直链也进候选池（站点抓不到，但图床直连可用）：老片子能借它把 100 多像素的小封面换成高清 */
-      const dmmU = scDmmCdnCands(code)
-      for (const u of dmmU.poster) if (!seenP.has(u)) { seenP.add(u); pc.push(u) }
-      for (const u of dmmU.fanart) if (!seenF.has(u)) { seenF.add(u); fc.push(u) }
-      if (!pc.length && !fc.length) { scLog(code + '：没有图片候选（需重新刮削才有），跳过'); IMGUP.done++; continue }
-      scLog('—— ' + code + ' ——')
-      const im = m.images = m.images || {}
-      const curP = im.posterMeta && im.posterMeta.w ? im.posterMeta : null
-      const curF = im.fanartMeta && im.fanartMeta.w ? im.fanartMeta : null
-      let changed = false, marked = false
-      const mark = role => { im[role + 'UpTried'] = new Date().toISOString(); marked = true }   // 已试过且候选里没有更大的
-      try {
-        if (!im.posterManual && (!im.poster || !curP || curP.w < IMG_GOOD_W.poster) && pc.length) {
-          const r = await imgUpOne(dir, 'poster', pc, curP, scLog)
-          if (r && r.noBetter) mark('poster')
-          else if (r) { im.poster = r.url; im.posterMeta = { w: r.w, h: r.h, bytes: r.bytes }; im.posterSrc = '图片升级'; changed = true }
-        }
-        if (!im.poster && !im.posterManual) {   // 候选里也没有竖图 → 尝试从合拼封面拆出正封面当竖版海报
-          if (await splitCoverPoster(im, path.join(dir, 'images'), pc, scLog)) { changed = true; delete im.posterUpTried }
-        }
-        if ((!curF || curF.w < IMG_GOOD_W.fanart) && fc.length) {
-          const r = await imgUpOne(dir, 'fanart', fc, curF, scLog)
-          if (r && r.noBetter) mark('fanart')
-          else if (r) {
-            im.fanart = r.url; im.fanartMeta = { w: r.w, h: r.h, bytes: r.bytes }; im.fanartSrc = '图片升级'; changed = true
-            const rr = recropPosterWith(im, path.join(dir, 'images'), scLog)
-            if (rr && !rr.ok) scLog(code + ' 海报重裁跳过：' + rr.reason)
-          }
-        }
-      } catch (e) { scLog(code + ' 升级出错：' + e.message) }
-      if (changed) {
-        m.scrapedAt = new Date().toISOString()   // 改版本号，详情页/影片墙的图立即刷新
-        delete im.posterUpTried; delete im.fanartUpTried
-      }
-      if (changed || marked) {
-        try { fs.mkdirSync(path.dirname(movieCacheFile(code)), { recursive: true }); fs.writeFileSync(movieCacheFile(code), JSON.stringify(m, null, 2)) } catch (_) {}
-        mirrorMeta(code)
-        if (changed) patchDataItem(code)
-        if (changed) scLog('✓ ' + code + ' 完成')
-      }
-      IMGUP.done++
-    }
-    scLog('全部完成：' + codes.length + ' 个番号，用时 ' + Math.round((Date.now() - t0) / 1000) + 's')
-  } catch (e) {
-    IMGUP.error = e.message
-    scLog('失败：' + e.message)
-  } finally {
-    SCRAPE.log = oldLog
-    IMGUP.running = false
-    IMGUP.finishedAt = Date.now()
-    console.log('[imgup]', codes.length, '个，', Date.now() - t0 + 'ms')
-  }
-}
-
-/* ================= 按网站对比扫描：逐站在线拉候选图，与本地封面/主图对比尺寸·大小 =================
- * 只扫「该源留过候选」的番号；本地低于标准（封面宽<500 / 主图宽<1600）的角色才参与对比；
- * 每角色最多试 5 个候选（下载后量真实宽高），线上同朝向面积大于本地才算「可升级」并列出。
- * 结果只是清单，用户点「升级」才真正落盘（src-apply，绝不自动改图）。 */
-const SRCSCAN = { running: false, sourceId: '', total: 0, done: 0, current: '', found: 0, results: [], log: [], error: '', finishedAt: 0 }
-
-async function srcProbeImg(url) {   // → { w, h, bytes } 或 null（下载到内存量尺寸，不落盘）
-  try {
-    const b = await scFetch(url, { bin: true, hdrs: { referer: url } })
-    if (!b || b.length < 2500) return null
-    const fp = path.join(cacheDir(), 'movies', '.probe' + (Math.random() * 1e9 | 0) + '.jpg')
-    try {
-      fs.writeFileSync(fp, b)
-      const sz = imgSize(fp)
-      return sz ? { w: sz.w, h: sz.h, bytes: b.length } : null
-    } finally { try { fs.unlinkSync(fp) } catch (_) {} }
-  } catch (_) { return null }
-}
-
-async function srcScanAsync(sourceId) {
-  SRCSCAN.running = true; SRCSCAN.sourceId = sourceId
-  SRCSCAN.total = 0; SRCSCAN.done = 0; SRCSCAN.current = ''; SRCSCAN.found = 0
-  SRCSCAN.results = []; SRCSCAN.log = []; SRCSCAN.error = ''; SRCSCAN.finishedAt = 0
-  const oldLog = SCRAPE.log
-  SCRAPE.log = SRCSCAN.log
-  const t0 = Date.now()
-  try {
-    const mdir = path.join(cacheDir(), 'movies')
-    let dirs = []
-    try { dirs = fs.readdirSync(mdir) } catch (_) {}
-    const jobs = []
-    for (const d of dirs) {
-      const m = readMovieCache(d)
-      const s = m && m.sourceData && m.sourceData[sourceId]
-      if (!s) continue
-      if (!((s.posterCands || []).length || (s.fanartCands || []).length)) continue
-      jobs.push({ code: d, m, s })
-    }
-    SRCSCAN.total = jobs.length
-    scLog('按「' + sourceId + '」扫描：' + jobs.length + ' 个番号留有该源候选')
-    for (const job of jobs) {
-      if (!SRCSCAN.running) { scLog('已手动停止'); break }
-      SRCSCAN.current = job.code
-      const im = job.m.images || {}
-      const curP = im.posterMeta && im.posterMeta.w ? im.posterMeta : null
-      const curF = im.fanartMeta && im.fanartMeta.w ? im.fanartMeta : null
-      const needP = !im.posterManual && (!curP || curP.w < IMG_GOOD_W.poster) && (job.s.posterCands || []).length
-      const needF = (!curF || curF.w < IMG_GOOD_W.fanart) && (job.s.fanartCands || []).length
-      if (!needP && !needF) { SRCSCAN.done++; continue }
-      const imgDir = path.join(cacheDir(), 'movies', job.code.replace(/[^\w.-]/g, '_'), 'images')
-      const localBytes = role => { try { return fs.statSync(path.join(imgDir, role + '.jpg')).size } catch (_) { return 0 } }
-      for (const [role, need, cands, cur] of [['poster', needP, job.s.posterCands || [], curP], ['fanart', needF, job.s.fanartCands || [], curF]]) {
-        if (!need) continue
-        let best = null
-        let tried = 0
-        for (const u of cands) {
-          if (tried >= 5) break
-          tried++
-          const sz = await srcProbeImg(u)
-          if (!sz) continue
-          const portrait = sz.h > sz.w * 1.06, landscape = sz.w > sz.h * 1.06
-          if (role === 'poster' ? !portrait : !landscape) continue
-          if (cur && sz.w * sz.h <= cur.w * cur.h) continue   // 不比本地大 → 不算可升级
-          if (!best || sz.w * sz.h > best.w * best.h) best = Object.assign({ url: u }, sz)
-          if (best.w >= IMG_GOOD_W[role]) break
-        }
-        if (best) {
-          SRCSCAN.found++
-          SRCSCAN.results.push({
-            code: job.code, title: job.m.title || '', role, sourceId,
-            local: { w: cur ? cur.w : 0, h: cur ? cur.h : 0, bytes: localBytes(role), url: im[role] || '' },
-            online: best,
-            /* 海报是按横版主图手动裁剪的 → 提示用户升级后会自动重裁 */
-            recrop: role === 'fanart' && !!im.posterManual && !!(im.posterCrop && im.posterCrop.src === 'fanart')
-          })
-          scLog('△ ' + job.code + ' ' + (role === 'poster' ? '封面' : '主图') + '：本地 ' + (cur ? cur.w + '×' + cur.h : '无') + ' → 线上 ' + best.w + '×' + best.h)
-        }
-      }
-      SRCSCAN.done++
-    }
-    scLog('扫描完成：' + SRCSCAN.done + '/' + SRCSCAN.total + ' 个番号，发现 ' + SRCSCAN.found + ' 张可升级，用时 ' + Math.round((Date.now() - t0) / 1000) + 's')
-  } catch (e) {
-    SRCSCAN.error = e.message
-    scLog('失败：' + e.message)
-  } finally {
-    SCRAPE.log = oldLog
-    SRCSCAN.running = false
-    SRCSCAN.finishedAt = Date.now()
-    console.log('[src-scan]', sourceId, SRCSCAN.found + ' 张，', Date.now() - t0 + 'ms')
-  }
-}
-
-/* 手动裁剪海报的构图重放：横版主图升级成更高清后，用新图按存储的归一化裁剪框（posterCrop）自动重裁竖版海报。
- * 只处理底图是「横版主图」的裁剪（posterCrop.src==='fanart'）；失败静默返回原因，不影响主图升级本身。 */
-function recropPosterWith(im, imgDir, log) {
-  try {
-    const c = im.posterCrop
-    if (!im.posterManual || !c || c.src !== 'fanart') return null
-    const fp = path.join(imgDir, 'fanart.jpg')
-    if (!fs.existsSync(fp)) return { ok: false, reason: '本地没有横版主图文件' }
-    const jpeg = require('jpeg-js')
-    const raw = jpeg.decode(fs.readFileSync(fp), { useTArray: true, maxMemoryUsageInMB: 2048 })
-    const px = Math.max(0, Math.min(raw.width - 8, Math.round((c.x || 0) * raw.width)))
-    const py = Math.max(0, Math.min(raw.height - 8, Math.round((c.y || 0) * raw.height)))
-    const pw = Math.max(16, Math.min(raw.width - px, Math.round((c.w || 0.66) * raw.width)))
-    const ph = Math.max(16, Math.min(raw.height - py, Math.round((c.h || 1) * raw.height)))
-    const data = Buffer.alloc(pw * ph * 4)
-    for (let y = 0; y < ph; y++) {
-      const src = ((py + y) * raw.width + px) * 4
-      data.set(raw.data.subarray(src, src + pw * 4), y * pw * 4)   // jpeg-js 返回 Uint8Array，用 set 拷贝
-    }
-    const enc = jpeg.encode({ data, width: pw, height: ph }, 92)
-    fs.writeFileSync(path.join(imgDir, 'poster.jpg'), enc.data)
-    im.poster = '/cache/movies/' + path.basename(path.dirname(imgDir)) + '/images/poster.jpg'
-    im.posterMeta = { w: pw, h: ph, bytes: enc.data.length, src: 'auto-recrop' }
-    im.posterSrc = '自动重裁（横版主图升级后按原构图）'
-    if (log) log('↻ 海报已按原构图自动重裁：' + pw + '×' + ph)
-    return { ok: true, w: pw, h: ph, bytes: enc.data.length }
-  } catch (e) { return { ok: false, reason: e.message } }
-}
-
-/* 扫描结果里点「升级」：下载该张线上图并落盘（仅当仍比本地大；手动裁剪的海报不允许覆盖） */
-async function srcApplyOne(code, role, url) {
-  if (!['poster', 'fanart'].includes(role)) throw new Error('角色不合法')
-  const m = readMovieCache(code)
-  if (!m) throw new Error('缓存里没有这部影片的元数据')
-  const im = m.images = m.images || {}
-  if (role === 'poster' && im.posterManual) throw new Error('该海报是手动裁剪的，不能自动覆盖')
-  const b = await scFetch(url, { bin: true, hdrs: { referer: url } })
-  if (!b || b.length < 2500) throw new Error('线上图片下载失败')
-  const safe = code.replace(/[^\w.-]/g, '_')
-  const imgDir = path.join(cacheDir(), 'movies', safe, 'images')
-  fs.mkdirSync(imgDir, { recursive: true })
-  const tmp = path.join(imgDir, '.sa' + (Math.random() * 1e9 | 0) + '.jpg')
-  fs.writeFileSync(tmp, b)
-  const sz = imgSize(tmp)
-  if (!sz) { try { fs.unlinkSync(tmp) } catch (_) {} ; throw new Error('不是有效图片') }
-  const PORTRAIT = s => s.h > s.w * 1.06, LANDSCAPE = s => s.w > s.h * 1.06
-  if (role === 'poster' ? !PORTRAIT(sz) : !LANDSCAPE(sz)) { try { fs.unlinkSync(tmp) } catch (_) {} ; throw new Error('图片朝向与「' + (role === 'poster' ? '封面' : '主图') + '」不符') }
-  const cur = im[role + 'Meta'] && im[role + 'Meta'].w ? im[role + 'Meta'] : null
-  if (cur && sz.w * sz.h <= cur.w * cur.h) { try { fs.unlinkSync(tmp) } catch (_) {} ; throw new Error('本地已是更大版本，无需升级') }
-  const dst = path.join(imgDir, role + '.jpg')
-  fs.renameSync(tmp, dst)
-  im[role] = '/cache/movies/' + safe + '/images/' + role + '.jpg'
-  im[role + 'Meta'] = { w: sz.w, h: sz.h, bytes: b.length }
-  im[role + 'Src'] = '按网站升级'
-  m.scrapedAt = new Date().toISOString()
-  /* 主图升级成功且海报是按主图手动裁剪的 → 用新主图按原构图自动重裁海报 */
-  let recrop = null
-  if (role === 'fanart') recrop = recropPosterWith(im, imgDir, null)
-  try { fs.mkdirSync(path.dirname(movieCacheFile(code)), { recursive: true }); fs.writeFileSync(movieCacheFile(code), JSON.stringify(m, null, 2)) } catch (_) {}
-  mirrorMeta(code)
-  patchDataItem(code)
-  return Object.assign({ w: sz.w, h: sz.h, bytes: b.length }, recrop ? { recrop } : {})
-}
-
-/* ================= 候选图信息探测（下拉里显示「尺寸 · 大小」并与本地对比） =================
- * 各数据源在 meta.sourceData 里只留了候选图 URL，没留尺寸。这里把每个源每个角色的候选
- * （最多 CAND_MAX 张）下载后量真实宽高与字节数，结果缓存进 meta.imgCands 复用（重复开面板不再重下）。
- * 纯只读探测：只写 meta 的 imgCands 字段，不动任何图片文件。 */
-const CANDINFO = { running: false, code: '', total: 0, done: 0, error: '', startedAt: 0, finishedAt: 0 }
-const CANDCACHE = new Map()   // code|role → {at, data}，新老对比卡片的内存缓存（10 分钟）
-const CAND_MAX = 2
-function candJobsOf(m) {
-  const out = []
-  for (const [id, s] of Object.entries((m && m.sourceData) || {})) {
-    for (const role of ['poster', 'fanart']) {
-      const list = (role === 'poster' ? (s.posterCands || []) : (s.fanartCands || [])).slice(0, CAND_MAX)
-      list.forEach((url, i) => out.push({ id, role, url, i }))
-    }
-  }
-  return out
-}
-async function candProbeAsync(code, force) {
-  const m = readMovieCache(code)
-  if (!m) return
-  CANDINFO.running = true; CANDINFO.code = code; CANDINFO.error = ''
-  CANDINFO.total = 0; CANDINFO.done = 0; CANDINFO.startedAt = Date.now(); CANDINFO.finishedAt = 0
-  try {
-    const jobs = candJobsOf(m)
-    CANDINFO.total = jobs.length
-    const cache = m.imgCands = m.imgCands || {}
-    for (const job of jobs) {
-      const slot = (cache[job.id] = cache[job.id] || {})
-      if (!force && slot[job.role]) { CANDINFO.done++; continue }   // 第一候选已量过
-      const info = await srcProbeImg(job.url)
-      if (info) {
-        const key = job.i === 0 ? job.role : job.role + 'Alt'
-        slot[key] = Object.assign({ url: job.url }, info)
-        delete slot[job.role + 'Err']
-      } else if (job.i === 0) {
-        slot[job.role + 'Err'] = '下载失败或站点拒绝'
-      }
-      CANDINFO.done++
-    }
-    m.imgCandsAt = Date.now()
-    try { fs.writeFileSync(movieCacheFile(code), JSON.stringify(m, null, 2)) } catch (_) {}
-  } catch (e) { CANDINFO.error = e.message }
-  CANDINFO.running = false; CANDINFO.finishedAt = Date.now()
-}
-/* 本地图信息：优先 meta 里记的，缺了按磁盘文件实测（老缓存） */
-function localImgInfo(m, role) {
-  const im = (m && m.images) || {}
-  const mt = im[role + 'Meta']
-  let w = mt && mt.w ? mt.w : 0, h = mt && mt.h ? mt.h : 0, bytes = (mt && mt.bytes) || 0
-  if (!w) {
-    const u = im[role] || ''
-    const mm = /^\/cache\/movies\/([^/?#]+)\/images\/([^/?#]+)/.exec(u)
-    if (mm) {
-      try {
-        const fp = path.join(cacheDir(), 'movies', mm[1], 'images', mm[2])
-        const sz = imgSize(fp)
-        if (sz) { w = sz.w; h = sz.h; bytes = fs.statSync(fp).size }
-      } catch (_) {}
-    }
-  }
-  return w ? { url: im[role] || '', w, h, bytes } : null
-}
-function candInfoOut(code) {
-  const m = readMovieCache(code) || {}
-  return {
-    local: { poster: localImgInfo(m, 'poster'), fanart: localImgInfo(m, 'fanart') },
-    cands: m.imgCands || {}, at: m.imgCandsAt || 0,
-    posterManual: !!(m.images && m.images.posterManual)
-  }
-}
-/* 待升级行 / 下拉里的「新老对比」：对某番号现下候选（不走 meta 缓存）算最优候选，供行内卡片即时预览 */
-async function bestCandOf(m, role) {
-  const list = []
-  for (const [id, s] of Object.entries(m.sourceData || {})) {
-    const arr = (role === 'poster' ? (s.posterCands || []) : (s.fanartCands || [])).slice(0, CAND_MAX)
-    const cached = ((m.imgCands || {})[id] || {})[role]
-    if (cached) list.push(Object.assign({ id }, cached))
-    else {
-      const info = await srcProbeImg(arr[0])
-      if (info) list.push(Object.assign({ id, url: arr[0] }, info))
-    }
-  }
-  if (!list.length) return null
-  const cur = localImgInfo(m, role)
-  list.sort((a, b) => b.w * b.h - a.w * a.h)
-  const best = list[0]
-  return {
-    best, all: list,
-    better: !!(cur && best.w * best.h > cur.w * cur.h) || !cur
-  }
-}
 async function scrapeAsync(job) {
   const t0 = Date.now()
   SCRAPE.running = true; SCRAPE.code = job.code; SCRAPE.phase = '准备'; SCRAPE.pct = 2
@@ -3783,12 +3367,6 @@ async function scrapeAsync(job) {
     fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2))
     mirrorMeta(job.code)   // 设置了封面/元数据目录 → 镜像一份（视频与封面分离）
     patchDataItem(job.code)   // 并回内存条目：本地影片详情/系列页立刻见新数据
-    /* 设置里开了「刮削后自动整理」→ 顺手把这个番号的视频原地整理成 <番号>/<番号>-标签.ext */
-    if (CFG.autoOrganize === true) {
-      const og = autoOrganizeCode(job.code)
-      if (og.moved.length) { scLog('已自动整理 ' + og.moved.length + ' 个文件：' + og.moved.map(m => m.to).join('、')); rescan() }
-      else if (og.failed.length) scLog('自动整理跳过：' + og.failed.map(f => f.file + '（' + f.msg + '）').join('、'))
-    }
     SCRAPE.pct = 100; SCRAPE.phase = '完成'
     scLog(`完成：《${got.title}》 竖版封面${imgs.poster ? '✓' : '✕'} 横版主图${imgs.fanart ? '✓' : '✕'} 剧照 ${imgs.samples.length} 张 磁力 ${magnets.length} 条`)
   } catch (e) {
@@ -3977,7 +3555,7 @@ async function handleActorApi(req, res, p) {
     if (req.method === 'GET') return json(res, {
       proxy: CFG.proxy || '', proxyEnabled: CFG.proxyEnabled !== false,
       cacheDir: CFG.cacheDir || '', metaMode: CFG.metaMode === 'inline' ? 'inline' : '',
-      autoOrganize: CFG.autoOrganize === true, rankAuto: CFG.rankAuto !== false,
+      rankAuto: CFG.rankAuto !== false,
       rankHour: rankHour(), rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running,
       autoScrapeNew: CFG.autoScrapeNew !== false,
       autoAvatar: CFG.autoAvatar !== false,
@@ -3988,7 +3566,6 @@ async function handleActorApi(req, res, p) {
       mounts: containerMounts(), mediaRoot: MEDIA_ROOT
     })
     // 各字段独立保存：body 里带哪个就更新哪个，互不覆盖
-    if ('autoOrganize' in body) CFG.autoOrganize = !!body.autoOrganize
     if ('autoScrapeNew' in body) CFG.autoScrapeNew = !!body.autoScrapeNew
     if ('autoAvatar' in body) {
       CFG.autoAvatar = !!body.autoAvatar
@@ -4033,7 +3610,7 @@ async function handleActorApi(req, res, p) {
     return json(res, {
       ok: true, proxy: CFG.proxy || '', proxyEnabled: CFG.proxyEnabled !== false,
       cacheDir: CFG.cacheDir || '', metaMode: CFG.metaMode === 'inline' ? 'inline' : '',
-      autoOrganize: CFG.autoOrganize === true, autoScrapeNew: CFG.autoScrapeNew !== false,
+      autoScrapeNew: CFG.autoScrapeNew !== false,
       autoRescan: CFG.autoRescan === true, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
       rankAuto: CFG.rankAuto !== false, rankHour: rankHour(),
       rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running
@@ -4573,193 +4150,6 @@ async function handleActorApi(req, res, p) {
     res.writeHead(200, { 'Content-Type': 'text/vtt; charset=utf-8', 'Content-Length': b.length, 'Cache-Control': 'no-store' })
     return res.end(b)
   }
-  /* ---------- 回收站：删除 = 影片文件夹移进所在库的 _trash/（扫描会跳过），可还原或彻底删除 ----------
-   * 注意 /media/测试 这类独立挂载和 /media 不是同一块设备，rename 会 EXDEV —— 所以回收站
-   * 跟着影片所在的顶层库走：/media/_trash、/media/测试/_trash，保证同盘移动。
-   * GET               → 回收站列表 { name, size, videos, mtime, base }
-   * POST {codes}      → 删除（WATCH key 前缀跟着迁移）
-   * POST {restore}    → 还原到所在库根目录
-   * POST {purge}      → 彻底删除（不可恢复） */
-  if (p === '/api/trash') {
-    const trashRoots = () => {
-      const roots = [path.join(MEDIA_ROOT, '_trash')]
-      try {
-        for (const lib of (LIBS || [])) { const t = path.join(lib, '_trash'); if (!roots.includes(t)) roots.push(t) }
-        /* DATA 里可能还有别的顶层目录（手动加过的库） */
-        ;(DATA && DATA.items || []).forEach(it => {
-          const rel = it.relVideo || (it.files && it.files[0] && it.files[0].relVideo) || ''
-          const top = rel.split('/')[0]
-          if (top && !top.startsWith('_trash')) { const t = path.join(MEDIA_ROOT, top, '_trash'); if (!roots.includes(t)) roots.push(t) }
-        })
-      } catch (_) {}
-      return roots.filter(r => { try { return fs.statSync(path.dirname(r)).isDirectory() } catch (_) { return false } })
-    }
-    if (req.method === 'GET') {
-      let out = []
-      for (const root of trashRoots()) {
-        let names = []
-        try { names = fs.readdirSync(root).filter(n => n !== '_trash' && !n.startsWith('.')) } catch (_) { continue }
-        for (const n of names) {
-          const fp = path.join(root, n)
-          let size = 0, m = 0, vids = 0
-          try { m = fs.statSync(fp).mtimeMs } catch (_) {}
-          try {
-            const walkT = d => fs.readdirSync(d).forEach(x => {
-              const xp = path.join(d, x)
-              let s; try { s = fs.statSync(xp) } catch (_) { return }
-              if (s.isDirectory()) return walkT(xp)
-              size += s.size
-              if (VIDEO_EXT.includes(extOf(x))) vids++
-            })
-            walkT(fp)
-          } catch (_) {}
-          out.push({ name: n, size, videos: vids, mtime: m, base: root })
-        }
-      }
-      out.sort((a, b) => b.mtime - a.mtime)
-      return json(res, { ok: true, items: out })
-    }
-    if (body.restore) {
-      const name = String(body.restore).replace(/[/\\]/g, '')
-      let src = null
-      for (const root of trashRoots()) { const c = path.join(root, name); if (fs.existsSync(c)) { src = c; break } }
-      if (!name || !src) return json(res, { ok: false, error: '回收站里没有：' + name })
-      const dst = path.join(path.dirname(path.dirname(src)), name)   // 库的 _trash → 该库根目录
-      if (fs.existsSync(dst)) return json(res, { ok: false, error: '目标已有同名文件夹：' + name })
-      try {
-        fs.renameSync(src, dst)
-        const oldPrefix = path.relative(MEDIA_ROOT, src).split(path.sep).join('/')
-        const newPrefix = path.relative(MEDIA_ROOT, dst).split(path.sep).join('/')
-        /* 内存里的 DATA 指向也要跟着改，否则重扫完成前再删一次会找不到 */
-        const remapD = r => typeof r === 'string' && (r === oldPrefix || r.startsWith(oldPrefix + '/')) ? newPrefix + r.slice(oldPrefix.length) : r
-        ;(DATA && DATA.items || []).forEach(x => {
-          const rv = x.relVideo || (x.files && x.files[0] && x.files[0].relVideo) || ''
-          if (!rv || !(rv === oldPrefix || rv.startsWith(oldPrefix + '/'))) return
-          x.relVideo = remapD(x.relVideo)
-          if (Array.isArray(x.files)) x.files.forEach(f => { f.relVideo = remapD(f.relVideo) })
-          if (Array.isArray(x.relSamples)) x.relSamples = x.relSamples.map(remapD)
-          x.trashed = false
-        })
-        Object.keys(WATCH).forEach(k => { if (k === oldPrefix || k.startsWith(oldPrefix + '/')) { WATCH[newPrefix + k.slice(oldPrefix.length)] = WATCH[k]; delete WATCH[k] } })
-        watchSaveSoon()
-        try { rescan() } catch (_) {}
-        return json(res, { ok: true, restored: name, to: newPrefix })
-      } catch (e) { return json(res, { ok: false, error: '还原失败：' + e.message }) }
-    }
-    if (body.purge) {
-      const name = String(body.purge).replace(/[/\\]/g, '')
-      let src = null
-      for (const root of trashRoots()) { const c = path.join(root, name); if (fs.existsSync(c)) { src = c; break } }
-      if (!name || !src) return json(res, { ok: false, error: '回收站里没有：' + name })
-      try { fs.rmSync(src, { recursive: true, force: true }) } catch (e) { return json(res, { ok: false, error: '删除失败：' + e.message }) }
-      const pref = path.relative(MEDIA_ROOT, src).split(path.sep).join('/') + '/'
-      Object.keys(WATCH).forEach(k => { if (k.startsWith(pref)) delete WATCH[k] })
-      watchSaveSoon()
-      /* 彻底删除时元数据/图片的离线番号文件夹也一并清掉 */
-      const offSafe = String(name).replace(/[^\w.-]/g, '_')
-      try { fs.rmSync(path.join(cacheDir(), 'movies', offSafe), { recursive: true, force: true }) } catch (_) {}
-      return json(res, { ok: true, purged: name })
-    }
-    const codes = (Array.isArray(body.codes) ? body.codes : []).map(x => String(x || '').trim()).filter(Boolean)
-    if (!codes.length) return json(res, { ok: false, error: '没有要删除的影片' })
-    const trashed = [], skipped = [], offline = []
-    const sameDev = (a, b) => { try { return fs.statSync(a).dev === fs.statSync(b).dev } catch (_) { return false } }
-    for (const c of codes) {
-      const it = (DATA && Array.isArray(DATA.items) ? DATA.items : []).find(x => bare(x.code) === bare(c))
-      const offDir = offlineCodeDir(c, it)   // 传进来的可能是 uKey 形态，按候选名/反查定位真实文件夹
-      const rel = it && (it.relVideo || (it.files && it.files[0] && it.files[0].relVideo))
-      const fp = rel && safeMediaPath(rel)
-      const dir = fp && path.dirname(fp)
-      /* 线上条目（库里没有视频文件）：不碰视频，只清掉离线数据文件夹（meta.json / 图片 / 磁力缓存）。
-       * 该条目就是由这个文件夹派生出来的，删掉文件夹它自然从影片库消失。 */
-      if (!dir || dir === MEDIA_ROOT) {
-        let had = false
-        try { if (fs.existsSync(offDir)) { fs.rmSync(offDir, { recursive: true, force: true }); had = true } }
-        catch (e) { skipped.push({ code: c, reason: '离线数据删除失败：' + e.message }); continue }
-        if (DATA && Array.isArray(DATA.items)) DATA.items = DATA.items.filter(x => bare(x.code) !== bare(c))
-        if (had) offline.push({ code: c })
-        else skipped.push({ code: c, reason: '既没有视频文件夹，也没有离线数据' })
-        continue
-      }
-      if (!dir.startsWith(MEDIA_ROOT + path.sep) || /(^|\/)_trash(\/|$)/.test(path.relative(MEDIA_ROOT, dir))) { skipped.push({ code: c, reason: '路径异常' }); continue }
-      const name = path.basename(dir)
-      /* 找一块和影片同盘的回收站：顶层库根 / 所属库根 */
-      let trashDir = null
-      const cands = []
-      const topSeg = path.relative(MEDIA_ROOT, dir).split(path.sep)[0]
-      cands.push(path.join(MEDIA_ROOT, topSeg, '_trash'))
-      for (const lib of (LIBS || [])) if (dir.startsWith(lib + path.sep) || dir === lib) cands.push(path.join(lib, '_trash'))
-      cands.push(path.join(MEDIA_ROOT, '_trash'))
-      for (const t of cands) {
-        try { fs.mkdirSync(t, { recursive: true }) } catch (_) { continue }
-        if (sameDev(dir, t)) { trashDir = t; break }
-      }
-      if (!trashDir) { skipped.push({ code: c, reason: '找不到同盘的回收站目录（挂载只读？）' }); continue }
-      const dst = path.join(trashDir, name)
-      if (fs.existsSync(dst)) { skipped.push({ code: c, reason: '回收站已有同名文件夹：' + name }); continue }
-      /* 同文件夹里还有别的影片 → 不整体搬，让用户先单独整理 */
-      const siblings = (DATA.items || []).filter(x => bare(x.code) !== bare(c)).some(x => {
-        const r2 = x.relVideo || (x.files && x.files[0] && x.files[0].relVideo)
-        return r2 && path.dirname(safeMediaPath(r2) || '') === dir
-      })
-      if (siblings) { skipped.push({ code: c, reason: '文件夹「' + name + '」里还有别的影片' }); continue }
-      try {
-        fs.renameSync(dir, dst)
-        const oldPrefix = path.relative(MEDIA_ROOT, dir).split(path.sep).join('/')
-        const newPrefix = path.relative(MEDIA_ROOT, dst).split(path.sep).join('/')
-        const remap = r => typeof r === 'string' && (r === oldPrefix || r.startsWith(oldPrefix + '/')) ? newPrefix + r.slice(oldPrefix.length) : r
-        ;(DATA.items || []).forEach(x => {
-          if (bare(x.code) !== bare(c)) return
-          x.relVideo = remap(x.relVideo)
-          if (Array.isArray(x.files)) x.files.forEach(f => { f.relVideo = remap(f.relVideo) })
-          if (Array.isArray(x.relSamples)) x.relSamples = x.relSamples.map(remap)
-          x.trashed = true
-        })
-        Object.keys(WATCH).forEach(k => { const nk = remap(k); if (nk !== k) { WATCH[nk] = WATCH[k]; delete WATCH[k] } })
-        watchSaveSoon()
-        trashed.push({ code: c, name })
-        /* 移进回收站的同时，把元数据/图片的离线番号文件夹一并删掉（还原后重新刮一次即可） */
-        try { fs.rmSync(offDir, { recursive: true, force: true }) } catch (_) {}
-      } catch (e) { skipped.push({ code: c, reason: e.message }) }
-    }
-    try { rescan() } catch (_) {}
-    return json(res, { ok: true, trashed, skipped, offline })
-  }
-  /* ---------- NFO 回写：详情页编辑的标题/简介/年份/厂商/导演/评分/类别写回 Kodi 格式 NFO ---------- */
-  if (p === '/api/nfo/write') {
-    const rel = String(body.rel || '')
-    const fp = safeMediaPath(rel)
-    if (!fp) return json(res, { ok: false, error: '路径越界' })
-    const dir = path.dirname(fp), base = path.basename(fp, path.extname(fp))
-    let nfo = null
-    const cands = [path.join(dir, base + '.nfo'), path.join(dir, path.basename(dir) + '.nfo')]
-    try { const first = fs.readdirSync(dir).find(n => extOf(n) === 'nfo'); if (first) cands.push(path.join(dir, first)) } catch (_) {}
-    for (const c of cands) { try { if (c && extOf(c) === 'nfo' && fs.statSync(c).isFile()) { nfo = c; break } } catch (_) {} }
-    if (!nfo) return json(res, { ok: false, error: '影片目录里没有 NFO 文件' })
-    let xml = fs.readFileSync(nfo, 'utf8')
-    const escXml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    const setTag = (x, tag, val) => {
-      const re = new RegExp('[ \\t]*<' + tag + '(?:\\s[^>]*)?>[\\s\\S]*?</' + tag + '>\\r?\\n?', 'g')
-      const line = '  <' + tag + '>' + escXml(val) + '</' + tag + '>\n'
-      if (re.test(x)) return x.replace(new RegExp(re.source, 'g'), line)
-      return x.replace(/(<\/movie>\s*)$/, line + '$1')
-    }
-    const pa = body.patch && typeof body.patch === 'object' ? body.patch : {}
-    if ('title' in pa) xml = setTag(xml, 'title', String(pa.title).slice(0, 300))
-    if ('plot' in pa) xml = setTag(xml, 'plot', String(pa.plot).slice(0, 4000))
-    if ('year' in pa) xml = setTag(xml, 'year', String(pa.year).slice(0, 12))
-    if ('studio' in pa) xml = setTag(xml, 'studio', String(pa.studio).slice(0, 120))
-    if ('director' in pa) xml = setTag(xml, 'director', String(pa.director).slice(0, 120))
-    if ('rating' in pa && pa.rating !== '' && pa.rating != null) xml = setTag(xml, 'rating', String(Number(pa.rating) || 0))
-    if (Array.isArray(pa.genres)) {
-      xml = xml.replace(/[ \t]*<genre(?:\s[^>]*)?>[\s\S]*?<\/genre>\r?\n?/g, '')
-      const lines = pa.genres.slice(0, 60).map(g => '  <genre>' + escXml(String(g).slice(0, 80)) + '</genre>').filter(l => l.length > 12).join('\n')
-      xml = xml.replace(/(<\/movie>\s*)$/, lines + '\n$1')
-    }
-    try { fs.writeFileSync(nfo, xml) } catch (e) { return json(res, { ok: false, error: '写入 NFO 失败：' + e.message }) }
-    try { rescan() } catch (_) {}
-    return json(res, { ok: true, nfo: path.basename(nfo), tip: '已写回并重新扫描' })
-  }
   /* ---------- 女优人气榜：手动更新 / 状态（每日自动更新由内置定时器负责） ---------- */
   if (p === '/api/rank/update') {
     if (RANKUP.running) return json(res, { ok: false, error: '排行榜正在更新中（' + (RANKUP.phase || '') + '）' })
@@ -4767,67 +4157,6 @@ async function handleActorApi(req, res, p) {
     return json(res, { ok: true, started: true })
   }
   if (p === '/api/rank/status') return json(res, { ok: true, running: RANKUP.running, phase: RANKUP.phase, error: RANKUP.error, added: RANKUP.added, count: RANKUP.count, finishedAt: RANKUP.finishedAt, updatedAt: rankUpdatedAt(), rankAuto: CFG.rankAuto !== false, rankHour: rankHour() })
-  /* ---------- 数据源（刮削站点管理，规则抄 MDC/Movie_Data_Capture 的站点布局体系） ---------- */
-  if (p === '/api/sources') {
-    if (req.method === 'GET') {
-      const d = getSourcesData()
-      return json(res, { ok: true, ...d, types: MDC_TYPES, fields: MDC_BY_FIELDS })
-    }
-    let dirty = false
-    if ('sources' in body) {
-      const list = body.sources
-      if (!Array.isArray(list)) return json(res, { ok: false, error: '数据源格式错误' })
-      const clean = list.map(s => {
-        const o = { id: String(s.id || '').trim().slice(0, 30) }
-        if (!o.id) return null
-        o.name = String(s.name || o.id).trim().slice(0, 30)
-        o.base_url = String(s.base_url || s.base || '').trim().slice(0, 160)
-        for (const k of ['search', 'test', 'layout', 'cookies', 'user_agent', 'proxy', 'api_key']) o[k] = String(s[k] || '').slice(0, 400)
-        for (const k of ['enabled', 'retry_times_override', 'disable_hash_match']) o[k] = !!s[k]
-        for (const k of ['cooldown_seconds', 'retry_times']) o[k] = Math.max(0, Math.min(600, parseInt(s[k], 10) || 0))
-        return o
-      }).filter(Boolean)
-      CFG.sources = clean
-      dirty = true
-    }
-    if ('priorities' in body) { CFG.priorities = cleanPriorities(body.priorities); dirty = true }
-    if (body.resetPriorities) { CFG.priorities = DEFAULT_PRIORITIES; dirty = true }   // 重置优先级按钮
-    if ('keywords' in body) {
-      const k = body.keywords || {}
-      CFG.keywords = { code: cleanKeywords(k.code), path: cleanKeywords(k.path) }
-      dirty = true
-    }
-    if (!dirty) return json(res, { ok: false, error: '没有要保存的内容' })
-    try { writeCfg() } catch (e) { return json(res, { ok: false, error: '保存失败：' + e.message }) }
-    return json(res, { ok: true, ...getSourcesData() })
-  }
-  if (p === '/api/source/test') {
-    let url = String(body.url || '').trim()
-    if (!url) return json(res, { ok: false, error: '缺少测试链接' })
-    if (!/^https?:\/\//.test(url)) url = 'https://' + url
-    const t0 = Date.now()
-    try {
-      const pv = proxyUrl()
-      let cur = url, status = 0
-      for (let hop = 0; hop < 5; hop++) {
-        const r = await srcProbeOnce(cur, pv)
-        status = r.status
-        if (status >= 300 && status < 400 && r.location) {
-          try { const next = new URL(r.location, cur).href; if (next !== cur) { cur = next; continue } } catch (_) {}
-        }
-        break
-      }
-      const ms = Date.now() - t0
-      if (status >= 200 && status < 300) return json(res, { ok: true, ms, status })
-      if (status === 403) return json(res, { ok: false, ms, status, error: '线路通（' + ms + 'ms）但站点反爬拦截 403，刮削可能被拒' })
-      if (status >= 300 && status < 400) return json(res, { ok: false, ms, status, error: '跳转 ' + (5 + 1) + ' 次仍未落地（' + status + '）' })
-      if (status >= 500) return json(res, { ok: false, ms, status, error: '站点服务器错误（' + status + '），线路本身是通的（' + ms + 'ms）' })
-      return json(res, { ok: false, ms, status, error: '站点返回 ' + status })
-    } catch (e) {
-      const msg = e.message || '无响应'
-      return json(res, { ok: false, ms: Date.now() - t0, error: /超时/.test(msg) ? '超时（线路不通或站点无响应）' : '连不上：' + msg })
-    }
-  }
   if (p === '/api/config/test') {
     /* 线路延迟测试（v0.2.29）：只测「这条代理线路本身」的延迟，不绑任何具体网站。
      * 目标用中立的连通性检测端点（微软 NCSI connecttest.txt，国内外直连/经代理都可达）。
@@ -5234,7 +4563,7 @@ async function handleActorApi(req, res, p) {
     const applied = []
     try {
       if (inc.config && typeof inc.config === 'object') {
-        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoOrganize', 'autoScrapeNew', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'auto115Watch', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
+        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoScrapeNew', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'auto115Watch', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
         SAFE.forEach(k => { if (inc.config[k] !== undefined) CFG[k] = inc.config[k] })
         LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
         writeCfg(); applied.push('配置')
@@ -5272,53 +4601,6 @@ async function handleActorApi(req, res, p) {
     if (!cur.rating && !cur.note && !(cur.tags || []).length) delete UD[k]; else UD[k] = cur
     udSaveSoon()
     return json(res, { ok: true, rec: UD[k] || null })
-  }
-  /* ---------- 批量把影片文件夹移进媒体库内的某个子文件夹（先在前端预览，这里执行） ---------- */
-  if (p === '/api/bulk/move') {
-    const codes = (Array.isArray(body.codes) ? body.codes : []).map(x => bare(x)).filter(Boolean)
-    const target = String(body.target || '').trim().replace(/^\/+|\/+$/g, '')
-    if (!codes.length) return json(res, { ok: false, error: '没有勾选影片' })
-    if (!target || target.split('/').some(s => !s || s === '.' || s === '..')) return json(res, { ok: false, error: '目标文件夹名不合法' })
-    const dstRoot = path.resolve(MEDIA_ROOT, target)
-    if (!(dstRoot === MEDIA_ROOT || dstRoot.startsWith(MEDIA_ROOT + path.sep))) return json(res, { ok: false, error: '目标必须在媒体库目录内：' + MEDIA_ROOT })
-    const moved = [], skipped = []
-    try { fs.mkdirSync(dstRoot, { recursive: true }) } catch (e) { return json(res, { ok: false, error: '建目录失败：' + e.message }) }
-    for (const b of codes) {
-      const it = (DATA && Array.isArray(DATA.items) ? DATA.items : []).find(x => bare(x.code) === b)
-      const rel = it && (it.relVideo || (it.files && it.files[0] && it.files[0].relVideo))
-      if (!rel) { skipped.push({ code: b, reason: '找不到视频文件' }); continue }
-      const src = safeMediaPath(rel)
-      if (!src) { skipped.push({ code: b, reason: '路径越界' }); continue }
-      const dir = path.dirname(src)
-      if (dir === MEDIA_ROOT || dir === dstRoot) { skipped.push({ code: b, reason: '文件散在媒体库根目录，请先用「导入视频整理」归档' }); continue }
-      const name = path.basename(dir)
-      const dst = path.join(dstRoot, name)
-      if (dir === dst) { skipped.push({ code: b, reason: '已在该文件夹里' }); continue }
-      if (fs.existsSync(dst)) { skipped.push({ code: b, reason: '目标已存在同名文件夹：' + name }); continue }
-      try {
-        // 同文件夹里还有别的影片 → 只搬这一个影片自己的文件，不动别人的
-        const siblings = (DATA.items || []).filter(x => bare(x.code) !== b).some(x => {
-          const r2 = x.relVideo || (x.files && x.files[0] && x.files[0].relVideo)
-          return r2 && path.dirname(safeMediaPath(r2) || '') === dir
-        })
-        if (siblings) { skipped.push({ code: b, reason: '文件夹「' + name + '」里还有别的影片，不整体搬移' }); continue }
-        fs.renameSync(dir, dst)
-        // 相对路径整体前缀替换：data.json 重扫前先把内存里的指向改掉，播放记录也跟着迁移
-        const oldPrefix = path.relative(MEDIA_ROOT, dir), newPrefix = path.relative(MEDIA_ROOT, dst)
-        const remap = r => typeof r === 'string' && (r === oldPrefix || r.startsWith(oldPrefix + '/')) ? newPrefix + r.slice(oldPrefix.length) : r
-        ;(DATA.items || []).forEach(x => {
-          if (bare(x.code) !== b) return
-          x.relVideo = remap(x.relVideo)
-          if (Array.isArray(x.files)) x.files.forEach(f => { f.relVideo = remap(f.relVideo) })
-          if (Array.isArray(x.relSamples)) x.relSamples = x.relSamples.map(remap)
-        })
-        Object.keys(WATCH).forEach(k => { const nk = remap(k); if (nk !== k) { WATCH[nk] = WATCH[k]; delete WATCH[k] } })
-        watchSaveSoon()
-        moved.push({ code: b, from: oldPrefix, to: newPrefix })
-      } catch (e) { skipped.push({ code: b, reason: e.message }) }
-    }
-    try { rescan() } catch (_) {}
-    return json(res, { ok: true, moved, skipped })
   }
   /* ---------- 影片库隐藏 / 恢复：刮削不到数据的条目先藏起来，设置页勾「显示已隐藏」可看回 ---------- */
   if (p === '/api/lib/hide') {
@@ -5411,67 +4693,6 @@ async function handleActorApi(req, res, p) {
     return json(res, { ok: true, code })
   }
   if (p === '/api/scrape/status') return json(res, Object.assign({ ok: true }, SCRAPE))
-  /* ---- 批量图片升级（设置 → 图片升级） ---- */
-  if (p === '/api/images/upgrade-list') return json(res, Object.assign({ ok: true }, imgUpList()))
-  if (p === '/api/images/upgrade-status') return json(res, Object.assign({ ok: true }, IMGUP))
-  if (p === '/api/images/upgrade') {
-    if (IMGUP.running) return json(res, { ok: false, error: '升级任务正在进行（' + IMGUP.done + '/' + IMGUP.total + '）' })
-    if (SCRAPE.running) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
-    const codes = (Array.isArray(body.codes) ? body.codes : []).map(x => String(x).trim()).filter(Boolean).slice(0, 500)
-    if (!codes.length) return json(res, { ok: false, error: '没有指定番号' })
-    imgUpAsync(codes).catch(() => {})
-    return json(res, { ok: true, total: codes.length })
-  }
-  /* ---- 按网站对比扫描（设置 → 图片升级 → 按网站对比扫描） ---- */
-  if (p === '/api/images/src-scan') {
-    if (SRCSCAN.running) return json(res, { ok: false, error: '正在扫描「' + SRCSCAN.sourceId + '」（' + SRCSCAN.done + '/' + SRCSCAN.total + '），请等它完成' })
-    if (IMGUP.running) return json(res, { ok: false, error: '正在批量升级图片（' + IMGUP.current + '），请等它完成' })
-    if (SCRAPE.running) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
-    const sourceId = String(body.sourceId || '').trim()
-    if (!sourceId || !getSourcesData().sources.some(s => s.id === sourceId)) return json(res, { ok: false, error: '未知的数据源：' + sourceId })
-    srcScanAsync(sourceId).catch(() => {})
-    return json(res, { ok: true, sourceId })
-  }
-  if (p === '/api/images/src-scan-status') return json(res, Object.assign({ ok: true }, SRCSCAN))
-  if (p === '/api/images/src-apply') {
-    if (SRCSCAN.running) return json(res, { ok: false, error: '扫描进行中，请等它完成再升级' })
-    try {
-      const r = await srcApplyOne(String(body.code || '').trim(), String(body.role || '').trim(), String(body.url || '').trim())
-      return json(res, Object.assign({ ok: true }, r))
-    } catch (e) { return json(res, { ok: false, error: e.message }) }
-  }
-  /* 「待升级」行点开的新老对比卡片：本地图 vs 各源最优候选（含尺寸/大小/是否更高清），不落盘 */
-  if (p === '/api/images/cand-preview') {
-    const code = String(body.code || '').trim()
-    const role = String(body.role || 'fanart').trim() === 'poster' ? 'poster' : 'fanart'
-    if (!code) return json(res, { ok: false, error: '缺少番号' })
-    const m = readMovieCache(code)
-    if (!m) return json(res, { ok: false, error: '离线数据里没有这部影片的元数据' })
-    const key = code + '|' + role
-    const hitc = CANDCACHE.get(key)
-    if (hitc && !body.force && Date.now() - hitc.at < 10 * 60 * 1000) return json(res, hitc.data)
-    const local = localImgInfo(m, role)
-    const best = await bestCandOf(m, role)
-    const data = Object.assign({ ok: true, code, role, local, posterManual: !!(m.images && m.images.posterManual) },
-      best || { best: null, all: [], better: false })
-    /* 线上候选不比本地大（一样大或更小）→ 记 UpTried，这个番号之后不再出现在「待升级」列表里；
-       真有更高的图想要时仍可批量升级或按网站对比扫描手动升级 */
-    if (data.best && data.local && !data.better) {
-      try {
-        const im = m.images = m.images || {}
-        const mk = role + 'UpTried'
-        if (!im[mk]) {
-          im[mk] = new Date().toISOString()
-          fs.mkdirSync(path.dirname(movieCacheFile(code)), { recursive: true })
-          fs.writeFileSync(movieCacheFile(code), JSON.stringify(m, null, 2))
-          data.marked = true
-        }
-      } catch (_) {}
-    }
-    CANDCACHE.set(key, { at: Date.now(), data })
-    if (CANDCACHE.size > 200) CANDCACHE.delete(CANDCACHE.keys().next().value)
-    return json(res, data)
-  }
   /* ---- 离线数据导入（添加影片页）：把按番号命名的缓存文件夹（meta.json + images/ + movie.nfo）拷回 cache/movies ---- */
   if (p === '/api/offline/scan') {
     try { return json(res, { ok: true, dir: String(body.dir || '').trim(), items: offlineScan(body.dir) }) }
@@ -5756,23 +4977,6 @@ function localSourceForCode(code) {
       }
     })
   }
-  /* 候选图信息：下拉里每个站点后面要显示「尺寸 · 大小」并与本地对比（尺寸靠下载量，结果缓存在 meta.imgCands） */
-  if (p === '/api/scrape/cand-info') {
-    const code = String(new URL(req.url, 'http://x').searchParams.get('code') || '').trim()
-    if (!code) return json(res, { ok: false, error: '缺少番号' })
-    return json(res, Object.assign({ ok: true, code }, candInfoOut(code), {
-      running: CANDINFO.running && CANDINFO.code === code, done: CANDINFO.done, total: CANDINFO.total
-    }))
-  }
-  /* 触发放候探测（异步）：面板打开 / 点「量一量候选」时调，前端轮询 cand-info 收结果 */
-  if (p === '/api/scrape/cand-probe') {
-    const code = String(body.code || '').trim()
-    if (!code) return json(res, { ok: false, error: '缺少番号' })
-    if (CANDINFO.running) return json(res, { ok: false, error: '正在量「' + CANDINFO.code + '」的候选图（' + CANDINFO.done + '/' + CANDINFO.total + '）' })
-    if (!readMovieCache(code)) return json(res, { ok: false, error: '离线数据里没有这部影片的元数据' })
-    candProbeAsync(code, !!body.force).catch(() => {})
-    return json(res, { ok: true, code })
-  }
   /* 粘贴站点影片详情页 → 只解析不落盘，结果并成「指定网址」源，供面板里逐字段选择性覆盖 */
   if (p === '/api/scrape/url-fetch') {
     const code = String(body.code || '').trim()
@@ -5860,28 +5064,6 @@ function localSourceForCode(code) {
       ok: true, src, has, title: r.title || '',
       sourcesAll: scrapeSourcesOverview(code, m)
     })
-  }
-  /* mdc-ng 规则自测：/api/scrape/mdc-test?src=avbase&code=ABC-123
-   * 直接跑该数据源的 mdc-ng 规则，回显解析到的每个字段（排查规则/站点改版用） */
-  if (p === '/api/scrape/mdc-test') {
-    const q = new URL(req.url, 'http://x').searchParams
-    const code = String(q.get('code') || '').trim()
-    const src = String(q.get('src') || '').trim()
-    if (!code || !src) return json(res, { ok: false, error: '需要 src 与 code 参数' })
-    const rule = MDCNG.ruleFor(src)
-    if (!rule) return json(res, { ok: false, error: src + '：没有对应的 mdc-ng 规则（规则文件见 rules/mdc-ng/）', rules: Object.keys(MDCNG.listRules()) })
-    const cand = scCandidates(code, src).find(x => x.id === src) || { id: src, cookies: (rule.settings || {}).cookies || '' }
-    const oldLog = SCRAPE.log
-    SCRAPE.log = []
-    try {
-      const r = await scMdcCandidate(code, cand, rule)
-      return json(res, {
-        ok: !!(r.parsed && r.parsed.title), src, code, category: mdcCategoryOf(code),
-        ruleFile: rule.__file, baseUrl: rule.base_url,
-        number: MDCNG.baseContext(rule, code),
-        fields: r.parsed || null, reason: r.reason || '', logs: SCRAPE.log
-      })
-    } finally { SCRAPE.log = oldLog }
   }
   /* 单独换某字段的来源：文本字段直接取该源的值；主图字段从该源候选重新下载 */
   if (p === '/api/scrape/field') {
@@ -6062,63 +5244,15 @@ function localSourceForCode(code) {
     try { fs.rmSync(dir, { recursive: true, force: true }) } catch (e) { return json(res, { ok: false, error: e.message }) }
     return json(res, { ok: true })
   }
-  /* ---------- 彻底删除影片（详情页「删除」按钮）----------
-   * 语义（与回收站不同，这个是真删）：
-   *   1. 库里有视频文件 → 每个版本的视频文件一并删除；
-   *   2. 元数据/图片这类离线数据 → 整个番号文件夹（cache/movies/<番号>/）删除；
-   *      inline 元数据模式外发到视频目录里的 meta.json/NFO/图片也顺手清掉（视频目录只剩空壳时连目录一起删）；
-   *   3. 视频在网盘挂载路径上、因权限（只读/凭证过期）删不掉 → 不吞错，
-   *      把 errno 翻译成人话 + 具体路径返回，前端明确提示去给权限。 */
+  /* ---------- 移除影片（详情页「删除」按钮，v0.3.0 只读媒体库语义）----------
+   * 视频文件一律不动。动作只有两个：
+   *   1. 该番号的离线数据（cache/movies/<番号>/：meta.json + 图片 + 磁力缓存）整个删除；
+   *   2. 条目从影片库隐藏（hidden），挂载目录里的视频不再展示；
+   *      想彻底恢复：删掉视频文件后取消隐藏，或在设置里清掉隐藏列表。 */
   if (p === '/api/movie/delete') {
     const code = String(body.code || '').trim()
     if (!code) return json(res, { ok: false, error: '缺少番号' })
     const items = (DATA && Array.isArray(DATA.items) ? DATA.items : []).filter(x => bare(x.code) === bare(code))
-    /* 收集该番号全部视频文件（多版本合并的 files[] 也算） */
-    const vids = []
-    for (const it of items) {
-      for (const r of [it.relVideo].concat((it.files || []).map(f => f.relVideo))) {
-        if (r && !vids.includes(r)) vids.push(r)
-      }
-    }
-    const permMsg = e => {
-      const c = e && (e.code || e.errno)
-      if (c === 'EACCES' || c === 'EPERM') return '权限不足（' + c + '）—— 网盘挂载可能是只读，或当前凭证没有删除权限，请在挂载端给写权限/重新登录'
-      if (c === 'EROFS') return '文件系统只读（EROFS）—— 挂载以只读方式接入，需要在挂载配置里开读写'
-      if (c === 'EIO') return 'I/O 错误（EIO）—— 网盘连接中断或挂载已失效，重新挂载后再试'
-      if (c === 'EBUSY') return '文件被占用（EBUSY）—— 有播放器/下载工具正开着这个文件'
-      if (c === 'ENOENT') return '文件不存在（可能已删除过）'
-      return (e && e.message) || String(c || '未知错误')
-    }
-    const videos = [], videosFailed = []
-    for (const rel of vids) {
-      const fp = safeMediaPath(rel)
-      if (!fp) { videosFailed.push({ path: rel, error: '路径越界，拒绝删除' }); continue }
-      try { fs.rmSync(fp, { force: true }); videos.push(rel) }
-      catch (e) { videosFailed.push({ path: rel, error: permMsg(e) }) }
-    }
-    /* inline 元数据：视频删掉后，同目录里外发的 meta.json / NFO / 图片也清掉 */
-    const inlineDirs = new Set()
-    if (CFG.metaMode === 'inline') {
-      for (const rel of vids) {
-        const fp = safeMediaPath(rel); if (!fp) continue
-        const d = path.dirname(fp)
-        if (!d.startsWith(MEDIA_ROOT + path.sep) || /(^|\/)_trash(\/|$)/.test(path.relative(MEDIA_ROOT, d))) continue
-        /* 同目录还有别的番号的视频 → 不动外发文件，避免误删别人的元数据 */
-        const other = ((DATA && DATA.items) || []).some(x => bare(x.code) !== bare(code) &&
-          ((x.relVideo && path.dirname(safeMediaPath(x.relVideo) || '') === d) ||
-           (x.files || []).some(f => f.relVideo && path.dirname(safeMediaPath(f.relVideo) || '') === d)))
-        if (other) continue
-        inlineDirs.add(d)
-        for (const n of ['meta.json', 'movie.nfo']) { try { fs.rmSync(path.join(d, n), { force: true }) } catch (_) {} }
-        try {
-          for (const n of fs.readdirSync(d)) if (/^(poster|fanart|sample\d+)\.(jpe?g|png|webp)$/i.test(n)) { try { fs.rmSync(path.join(d, n), { force: true }) } catch (_) {} }
-        } catch (_) {}
-      }
-    }
-    /* 目录空了就连目录一起删（外发元数据不留空壳文件夹） */
-    for (const d of inlineDirs) {
-      try { if (!fs.readdirSync(d).length) fs.rmdirSync(d) } catch (_) {}
-    }
     /* 离线数据：整个番号文件夹（meta.json + images + 磁力缓存） */
     const root = path.join(cacheDir(), 'movies')
     const offDir = offlineCodeDir(code, items[0])
@@ -6127,26 +5261,25 @@ function localSourceForCode(code) {
       try { fs.rmSync(offDir, { recursive: true, force: true }); offline = true }
       catch (e) { offlineErr = '离线数据文件夹删除失败：' + e.message }
     }
-    /* 库条目与观看记录出清（视频没删成的条目保留，方便重试） */
-    if (!videosFailed.length && DATA && Array.isArray(DATA.items)) {
+    /* 条目隐藏 + 观看记录出清 */
+    try { setHidden(code, true) } catch (e) { if (!offlineErr) offlineErr = e.message }
+    if (DATA && Array.isArray(DATA.items)) {
+      const vids = []
+      for (const it of items) {
+        for (const r of [it.relVideo].concat((it.files || []).map(f => f.relVideo))) {
+          if (r && !vids.includes(r)) vids.push(r)
+        }
+      }
       const prefixes = vids.map(r => (r.split('/').slice(0, -1).join('/')))
-      DATA.items = DATA.items.filter(x => bare(x.code) !== bare(code))
       Object.keys(WATCH).forEach(k => {
         const rel = k.replace(/^\//, '')
-        if (vids.some(v => rel === v || rel.startsWith(v + '/')) || prefixes.some(p => p && rel.startsWith(p + '/'))) delete WATCH[k]
+        if (vids.some(v => rel === v || rel.startsWith(v + '/')) || prefixes.some(pp => pp && rel.startsWith(pp + '/'))) delete WATCH[k]
       })
       watchSaveSoon()
     }
-    try { rescan() } catch (_) {}
-    if (videosFailed.length) {
-      return json(res, {
-        ok: false,
-        error: '部分文件删除失败（权限问题）：\n' + videosFailed.map(f => '· ' + f.path + '\n  ' + f.error).join('\n'),
-        videos, videosFailed, offline, offlineErr
-      })
-    }
-    return json(res, { ok: true, code, videos, offline, offlineErr })
+    return json(res, { ok: true, code, offline, offlineErr, hidden: true })
   }
+
   return json(res, { ok: false, error: 'unknown api' })
 }
 
@@ -6168,68 +5301,15 @@ function libraryBrowse(q) {
   return { ok: true, root: MEDIA_ROOT, hostPath: readMediaPathFile() || '', path: dir, parent: dir === MEDIA_ROOT ? null : path.dirname(dir), dirs }
 }
 
-/* ================= 项目内置动作 ①：刮削后自动原地整理 =================
- * 开关：设置 → 刮削（CFG.autoOrganize）。开启后每部影片刮削成功即把该番号的视频
- * 原地整理成 <番号>/<番号>-标签.ext —— 与「添加 → 导入视频整理」同一套命名规则，
- * 等于自动替你点了那次「整理」。rename 只动元数据，网盘挂载下也是秒完成。
- * 标签只按相对路径判定（与手动整理扫 /media 时的口径一致），不掺入挂载根目录名。 */
-const orgValidCode = c => !!c && ((/[A-Z]/.test(c) && /\d/.test(c)) || /^\d{6}[-_]\d{2,4}$/.test(c))
-function orgTagPart(rel) {
-  const tags = videoTagsOf(String(rel || ''), 0, 0)
-    .filter(t => !['4K', '2K', '1080P', '720P', '480P'].includes(t))
-  return tags.length ? '-' + tags.join('-') : ''
-}
-function autoOrganizeCode(code) {
-  const key = bare(code)
-  const items = ((DATA && DATA.items) || []).filter(it => it.relVideo && bare(it.code) === key)
-  if (!items.length) return { moved: [], failed: [] }
-  /* 目标名用「规范番号」（norm 保留连字符：SSIS-001），不能拿 bare() 的结果当名字 ——
-   * bare 会去掉连字符变成 SSIS001，和「添加 → 导入视频整理」的命名对不上。 */
-  const canon = norm(items[0].code || code)
-  if (!orgValidCode(canon)) return { moved: [], failed: [], skipped: '番号不合法' }
-  const dirName = String(canon).replace(/[^\w.-]/g, '_')
-  const moved = [], failed = []
-  for (const it of items) {
-    try {
-      const rel = String(it.relVideo).split(path.sep).join('/')
-      const src = safeMediaPath(rel)
-      if (!src) { failed.push({ file: rel, msg: '路径越界' }); continue }
-      let st; try { st = fs.statSync(src) } catch (_) { continue }
-      if (!st.isFile()) continue
-      const parentRel = path.dirname(rel)
-      const parentBase = parentRel === '.' ? '' : path.basename(parentRel)
-      const parentIsCode = !!parentBase && bare(parentBase) === key
-      /* 父目录已经是番号 → 原地；父目录是番号的别名写法（SSIS001）→ 一并改成规范写法 */
-      const dirRel = parentIsCode
-        ? (parentBase === dirName ? parentRel : path.join(path.dirname(parentRel), dirName))
-        : (parentRel === '.' ? dirName : path.join(parentRel, dirName))
-      const cdInName = /-cd(\d+)$/i.exec(baseOf(rel))
-      const targetRel = path.join(dirRel, dirName + orgTagPart(rel) + (cdInName ? '-cd' + cdInName[1] : '') + path.extname(rel)).split(path.sep).join('/')
-      const dst = path.resolve(MEDIA_ROOT, targetRel)
-      if (dst === src) continue                                   // 已符合规范
-      if (!dst.startsWith(MEDIA_ROOT + path.sep)) { failed.push({ file: rel, msg: '目标越界' }); continue }
-      if (fs.existsSync(dst)) { failed.push({ file: rel, msg: '目标已存在：' + path.basename(dst) }); continue }
-      fs.mkdirSync(path.dirname(dst), { recursive: true })
-      fs.renameSync(src, dst)
-      moved.push({ from: rel, to: targetRel })
-      // 旧番号文件夹（别名写法）空了就顺手删掉，别留一堆空目录
-      if (parentIsCode && parentBase !== dirName) { try { fs.rmdirSync(path.dirname(src)) } catch (_) {} }
-    } catch (e) { failed.push({ file: it.relVideo, msg: e.message }) }
-  }
-  return { moved, failed }
-}
-
 /* ================= 项目内置动作 ③：115 推送自动认领（v0.2.29） =================
  * 线上详情页推送磁力到 115 离线下载后，服务自动盯梢媒体库：
  *   文件落盘（连续两轮看到且大小不变才算稳定）→ 绑定番号（manual-codes.json，文件名解析不出番号也能挂对）
  *   → 清理同目录垃圾文件（网页 / 种子 / 快捷方式 / 系统文件，不动视频图片 nfo 字幕）
- *   → 重扫入库 → 原地整理成 <番号>/<番号>-标签.ext（复用 autoOrganizeCode）→ 路径变了再扫一遍。
+ *   → 重扫入库（v0.3.0 起不再原地整理）。
  * 库里已有该番号离线数据（详情页）→ 重扫时 enrichFromCache 自动挂上；
  * 没有 → 扫描尾部的 autoScrapeNew 自动排队刮削（元数据 / 封面 / 剧照进离线数据）。
  * 开关：设置 → 刮削「115 推送自动认领」（CFG.auto115Watch，默认开）。任务 24h 未等到文件自动作废。 */
 const W115 = { jobs: [], timer: null }
-const W115_JUNK = /\.(html?|url|torrent|lnk|mht|aspx?|php\d?)$/i
-const W115_JUNK_NAME = /^(thumbs\.db|desktop\.ini|\.ds_store)$/i
 function w115File() { return path.join(cacheDir(), '115-watch.json') }
 function w115Load() {
   try { const v = JSON.parse(fs.readFileSync(w115File(), 'utf8')); if (Array.isArray(v.jobs)) W115.jobs = v.jobs } catch (_) {}
@@ -6278,37 +5358,21 @@ function waitScanDone(maxMs) {
 }
 async function w115Claim(job, files) {
   const code = job.code
-  const dirs = new Set()
   let bound = 0
   for (const v of files) {
     const rel = path.relative(MEDIA_ROOT, v).split(path.sep).join('/')
     let pc = ''
     try { pc = norm(parseName(v).code || '') } catch (_) {}
     if (bare(pc) !== bare(code)) { saveManualCode(rel, code); bound++ }
-    dirs.add(path.dirname(v))
-  }
-  /* 清垃圾：只动认领文件同目录下的网页/种子/快捷方式/隐藏系统文件，视频图片 nfo 字幕一律保留 */
-  const cleaned = []
-  for (const dir of dirs) {
-    let entries = []
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch (_) { continue }
-    for (const e of entries) {
-      if (e.isDirectory()) continue
-      if (W115_JUNK.test(e.name) || W115_JUNK_NAME.test(e.name) || e.name.startsWith('.')) {
-        try { fs.unlinkSync(path.join(dir, e.name)); cleaned.push(e.name) } catch (_) {}
-      }
-    }
   }
   job.status = 'rescanning'; job.note = ''; w115Save()
   rescan()                                   // 入库：manualCode 生效 + enrichFromCache / autoScrapeNew
   await waitScanDone()
-  const og = autoOrganizeCode(code)          // 原地整理 <番号>/<番号>-标签.ext
-  if (og.moved && og.moved.length) rescan()  // 路径变了再刷一遍 DATA
   job.status = 'done'
   job.finishedAt = Date.now()
-  job.found = files.length; job.bound = bound; job.cleaned = cleaned.length; job.organized = (og.moved || []).length
-  job.note = '已入库 ' + files.length + ' 个文件' + (bound ? '、绑定番号' : '') + (og.moved && og.moved.length ? '、已原地整理' : '') + (cleaned.length ? '、清理垃圾 ' + cleaned.length + ' 个' : '')
-  console.log('[115-watch] ✓ ' + code + '：' + job.note + (cleaned.length ? '（清理：' + cleaned.slice(0, 5).join('、') + '）' : ''))
+  job.found = files.length; job.bound = bound
+  job.note = '已入库 ' + files.length + ' 个文件' + (bound ? '、绑定番号' : '')
+  console.log('[115-watch] ✓ ' + code + '：' + job.note)
 }
 async function w115Pump() {
   W115.timer = null
@@ -6793,15 +5857,20 @@ const server = http.createServer((req, res) => {
     /* ---------- MissAV 在线播放：解析（GET）+ HLS 中转（GET） ---------- */
     if (p === '/api/missav/play') return handleMissavPlay(req, res, u)
     if (p.startsWith('/api/missav/hls/')) return missavHlsReq(res, p, u)
+    /* 数据源列表（只读）：番号外链排序 + 添加页数据源下拉用（v0.3.0 起界面不再编辑数据源） */
+    if (p === '/api/sources') {
+      if (req.method !== 'GET') { res.writeHead(405); return res.end() }
+      const sd = getSourcesData()
+      return json(res, { ok: true, sources: sd.sources.map(x => ({ id: x.id, name: x.name, enabled: !!x.enabled })), priorities: sd.priorities })
+    }
     if (p === '/api/config' || p === '/api/config/test' || p === '/api/prefs' || p === '/api/rank/update' || p === '/api/rank/status' ||
         p === '/api/actor/scrape' || p === '/api/actor/save' || p === '/api/actor/sync' ||
         p === '/api/actor/probe' || p === '/api/actor/pick-avatar' ||
         p === '/api/library' || p === '/api/library/add' || p === '/api/library/remove' || p === '/api/library/rescan' ||
         p === '/api/library/matchCode' || p === '/api/library/bindCode' || p === '/api/lib/hide' ||
-        p === '/api/sources' || p === '/api/source/test' ||
         p === '/api/watch' || p === '/api/watch/del' || p === '/api/watch/done' ||
-        p === '/api/userdata' || p === '/api/bulk/move' ||
-        p === '/api/trash' || p === '/api/nfo/write' || p === '/api/movie/delete' ||
+        p === '/api/userdata' ||
+        p === '/api/movie/delete' ||
         p === '/api/backup' || p === '/api/login' ||
         p === '/api/favorites' || p === '/api/subscriptions' || p === '/api/subscriptions/feed' ||
         p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/image' || p === '/api/online/config' ||
@@ -6821,8 +5890,7 @@ const server = http.createServer((req, res) => {
         !(p === '/api/115/config' && req.method === 'GET') &&
         !(p === '/api/115/dirs' && req.method === 'GET') &&
         !(p === '/api/subs/get' && req.method === 'GET') &&
-        !(p === '/api/trash' && req.method === 'GET') &&
-        !(p === '/api/library' && req.method === 'GET') && !(p === '/api/sources' && req.method === 'GET')) { res.writeHead(405); return res.end() }
+        !(p === '/api/library' && req.method === 'GET')) { res.writeHead(405); return res.end() }
       handleActorApi(req, res, p).catch(e => json(res, { ok: false, error: e.message }))
       return
     }
@@ -6832,9 +5900,7 @@ const server = http.createServer((req, res) => {
       return
     }
     if (p.startsWith('/api/scrape/') || p.startsWith('/api/images/')) {
-      const isGet = p === '/api/scrape/status' || p === '/api/scrape/list' || p === '/api/scrape/meta' || p === '/api/scrape/mdc-test' ||
-        p === '/api/scrape/cand-info' ||
-        p === '/api/images/upgrade-list' || p === '/api/images/upgrade-status' || p === '/api/images/src-scan-status'
+      const isGet = p === '/api/scrape/status' || p === '/api/scrape/list' || p === '/api/scrape/meta'
       if (isGet ? req.method !== 'GET' : req.method !== 'POST') { res.writeHead(405); return res.end() }
       handleActorApi(req, res, p).catch(e => json(res, { ok: false, error: e.message }))
       return
