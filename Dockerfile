@@ -18,8 +18,9 @@ COPY manifest.webmanifest sw.js icon-192.png icon-512.png apple-touch-icon.png f
 RUN npm ci --omit=dev --no-audit --no-fund \
  && npm cache clean --force
 
-# 内置女优资料（netflav 抓取 + minnano 同步）：资料库 + 头像 + 名字归一化/别名表 + 排行榜/标签翻译
-COPY actresses.json name-map.json name-alias.json rankings.json tags-zh.json actresses-extra.json ./
+# 女优名册 actresses.json（约 16MB）已移出 git 与镜像：运行时缺失则由 server.js 写入空 []，
+# 可通过 ROSTER_URL 环境变量在首次启动时拉取（见 README）。其余女优相关元数据仍随镜像分发。
+COPY name-map.json name-alias.json rankings.json tags-zh.json actresses-extra.json ./
 
 # 头像库（actresses/，957MB）已改为在线按需抓取，不再 COPY 进镜像。
 # 示例影片包（sample-cache/movies/<番号>/：meta.json + 竖版海报，~8MB，118 部）：
