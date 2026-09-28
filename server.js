@@ -1047,6 +1047,7 @@ async function scanAsync() {
     // root 显示用户配置的真实路径：容器里 MEDIA_ROOT 是挂载点（如 /media），
     // 对用户没意义，优先读 media-path.txt 里写的宿主机完整路径
     DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items }
+    saveScanResult()   // 落盘：容器重建/更新后重启不必重扫云盘也能立刻显示影片库
     vprobeFlush()   // 分辨率探测结果落盘，重扫不重复解析
   } catch (e) {
     SCAN.error = e.message
@@ -1062,6 +1063,29 @@ async function scanAsync() {
 
 /* ---------- HTTP ---------- */
 let DATA = null
+
+/* ---------- 扫描结果落盘 / 恢复 ----------
+ * 扫描结果过去只在内存里：容器重建（每次发版）或重启后影片库会「空掉」，
+ * 只剩离线数据里的虚拟条目，必须手动重扫才有本地影片。现在把结果写进
+ * cache/scan-result.json，启动时直接恢复 —— 云盘目录树不用重走一遍。
+ * 只存条目（含 relVideo/files 播放信息），不存图片二进制；文件被删/改名由重扫纠正。 */
+function scanResultPath() { return path.join(cacheDir(), 'scan-result.json') }
+function saveScanResult() {
+  try {
+    if (!DATA || !Array.isArray(DATA.items) || !DATA.items.length) return
+    fs.mkdirSync(path.dirname(scanResultPath()), { recursive: true })
+    fs.writeFileSync(scanResultPath(), JSON.stringify({
+      root: DATA.root, generated: DATA.generated, savedAt: Date.now(),
+      libraries: Array.isArray(CFG.libraries) ? CFG.libraries : [], items: DATA.items
+    }))
+  } catch (e) { console.log('[scan] 结果落盘失败：' + e.message) }
+}
+function loadScanResult() {
+  try {
+    const d = JSON.parse(fs.readFileSync(scanResultPath(), 'utf8'))
+    return (d && Array.isArray(d.items)) ? d : null
+  } catch (_) { return null }
+}
 
 /* ---------- 进度条缩略图预览：ffmpeg 按需抽帧，缓存 cache/previews/<md5>/ ----------
  * 悬停进度条时前端按百分比取第 i 帧；首次悬停触发生成（全局单任务队列，不打架）。
@@ -1219,9 +1243,39 @@ function bootOfflineCache() {
   return items
 }
 {
-  const items = bootOfflineCache()
-  DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items }
-  console.log('[scan] 启动不自动扫描：已载入离线缓存 ' + items.length + ' 部做展示；媒体库扫描请在设置页添加/重扫触发')
+  const offline = bootOfflineCache()
+  /* 恢复上次扫描结果：本地条目（含 relVideo/files 播放信息）+ 离线数据条目合并去重。
+   * 条目重跑一遍 enrichFromCache → 取到最新刮削元数据（扫描后新刮的也能立即生效）。
+   * 整体兜底 try：恢复失败退回「只有离线条目」，绝不让启动挂掉。 */
+  let saved = null
+  try { saved = loadScanResult() } catch (_) {}
+  let restored = false
+  try {
+    if (saved && saved.items.length) {
+      const libs = (Array.isArray(CFG.libraries) ? CFG.libraries : [])
+        .map(p => String(p).replace(MEDIA_ROOT, '').replace(/^\/+/, '').replace(/\/+$/, ''))
+      const keep = saved.items.filter(it => it && it.relVideo &&
+        (!libs.length || libs.some(l => !l || it.relVideo === l || it.relVideo.startsWith(l + '/'))))
+      const K = it => String((it && it.code) || (it && it.relVideo) || '').toUpperCase()
+      const map = new Map()
+      for (const it of offline) map.set(K(it), it)
+      for (const it of keep) {
+        try { enrichFromCache(it) } catch (_) {}
+        const k = K(it), v = map.get(k)
+        if (v) { delete it.cachedOnly; if (!it.mtime && v.mtime) it.mtime = v.mtime }
+        map.set(k, it)
+      }
+      const merged = [...map.values()].sort((a, b) => (b.mtime || 0) - (a.mtime || 0))
+      DATA = { root: saved.root || readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: merged }
+      console.log('[scan] 启动恢复上次扫描结果：本地 ' + keep.length + ' 部 + 离线缓存 ' + offline.length + ' 部 → 共 ' + merged.length + ' 条' +
+        (saved.savedAt ? '（结果存于 ' + new Date(saved.savedAt).toLocaleString('zh-CN') + '；要刷新请点重扫）' : ''))
+      restored = true
+    }
+  } catch (e) { console.log('[scan] 恢复扫描结果失败（退回离线条目）：' + e.message) }
+  if (!restored) {
+    DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: offline }
+    console.log('[scan] 启动不自动扫描：已载入离线缓存 ' + offline.length + ' 部做展示；媒体库扫描请在添加页添加/重扫触发')
+  }
 }
 
 function safeMediaPath(rel) {
