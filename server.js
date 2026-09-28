@@ -5604,6 +5604,24 @@ setInterval(autoRescanTick, 10 * 60 * 1000)
 setTimeout(autoRescanTick, 3 * 60 * 1000)   // 启动 3 分钟后先检查一次（补上停机期间错过的时点）
 /* 内置补充名册：项目自带文件（首次运行自动建），随项目一起备份 */
 try { if (!fs.existsSync(EXTRA_ROSTER)) fs.writeFileSync(EXTRA_ROSTER, '[]') } catch (_) {}
+/* 女优名册已移出 git 跟踪（约 16MB）。本地缺失时写入空 []，保证各读取点不崩溃；
+ * 部署目录自带名册则跳过。设置 ROSTER_URL 可在首次启动时空名册自动拉取（见 README）。 */
+try { if (!fs.existsSync(ROSTER)) fs.writeFileSync(ROSTER, '[]', 'utf8') } catch (_) {}
+let _rosterEmpty = false
+try { _rosterEmpty = JSON.stringify(JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) === '[]' } catch (_) {}
+if (process.env.ROSTER_URL && _rosterEmpty) {
+  (async () => {
+    try {
+      const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 20000)
+      const r = await fetch(process.env.ROSTER_URL, { signal: ctrl.signal })
+      clearTimeout(to)
+      if (!r.ok) throw new Error('HTTP ' + r.status)
+      const buf = Buffer.from(await r.arrayBuffer())
+      const tmp = ROSTER + '.dl'; fs.writeFileSync(tmp, buf); fs.renameSync(tmp, ROSTER)
+      console.log('[roster] 已从 ROSTER_URL 载入女优名册 (' + (buf.length / 1048576).toFixed(1) + 'MB)')
+    } catch (e) { console.log('[roster] ROSTER_URL 拉取失败（继续使用空名册）：' + e.message) }
+  })()
+}
 
 /* ================================================================
  * MissAV 在线播放（借鉴 happy-capy 的线路发现 + 镜像中转架构）

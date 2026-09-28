@@ -28,3 +28,9 @@ shot-*.png
 .DS_Store
 *.log
 *.bak-cloud
+
+# ---- 仓库卫生：大体积样例/种子数据（不入库，本地仍保留）----
+# sample-cache/ 是示例媒体元数据（117MB），仅用于首跑演示，按需单独获取
+sample-cache/
+# 女优名册 16MB；不入库，运行时缺失时由 server.js 优雅降级（见 ROSTER 缺失守卫）
+actresses.json
