@@ -4743,7 +4743,6 @@ async function handleActorApi(req, res, p) {
   /* ---------- 在线刮削（添加本地库没有的影片） ---------- */
   if (p === '/api/scrape/start') {
     if (SCRAPE.running) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
-    if (IMGUP.running) return json(res, { ok: false, error: '正在批量升级图片（' + IMGUP.current + '），请等它完成' })
     let code = String(body.code || '').trim().toUpperCase()
     const fromUrl = scCodeFromUrl(body.code) || scCodeFromUrl(body.url)   // 直接粘详情页网址也认
     if (fromUrl) code = fromUrl
