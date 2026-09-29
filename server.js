@@ -3061,12 +3061,17 @@ function scCodeFromUrl(raw) {
 }
 
 /* 尝试单个候选：有 mdc-ng 规则的站点走规则引擎，其余走通用解析（搜索页找不到就跳详情页） */
+/* 搜索结果页误判守卫：missav 等站对任何番号都返回搜索页，页面标题形如「ZZZ-999的搜尋結果」，
+ * 正文里又恰好含番号文本 → 曾被解析成「影片」入库，主页轮播出垃圾。命中这类标题一律视为未搜到。 */
+const SC_SEARCHY = /的搜尋結果|的搜索结果|search[\s_-]?results?\b|搜尋結果|搜索結果/i
+
 async function scTryCandidate(code, c) {
   const rule = MDCNG.ruleFor(c.id)
   if (rule) {
     try {
       const r = await scMdcCandidate(code, c, rule)
-      if (r.parsed && r.parsed.title) { scLog('✓ ' + c.id + ' 命中（mdc-ng 规则 ' + rule.__file + '）'); return r.parsed }
+      if (r.parsed && r.parsed.title && !SC_SEARCHY.test(r.parsed.title)) { scLog('✓ ' + c.id + ' 命中（mdc-ng 规则 ' + rule.__file + '）'); return r.parsed }
+      if (r.parsed && r.parsed.title && SC_SEARCHY.test(r.parsed.title)) scLog(c.id + '：抓到的是搜索结果页（' + String(r.parsed.title).slice(0, 40) + '），不算命中')
       scLog(c.id + '：mdc-ng 规则未命中（' + (r.reason || '无内容') + '）' + (c.ruleOnly ? '，该源只由规则驱动，跳过通用解析' : '，改用通用解析兜底'))
     } catch (e) {
       scLog(c.id + '：mdc-ng 规则执行出错（' + e.message + '）' + (c.ruleOnly ? '，跳过通用解析' : '，改用通用解析兜底'))
@@ -3099,6 +3104,7 @@ async function scTryCandidate(code, c) {
     }
   }
   if (!parsed || !parsed.title || (!parsed.cover && !parsed.samples.length)) return null
+  if (SC_SEARCHY.test(parsed.title)) return null   // 搜索结果页标题（如「XX-123的搜尋結果」）不算命中
   parsed.usedUrl = usedUrl
   return parsed
 }
