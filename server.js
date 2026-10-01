@@ -158,6 +158,7 @@ async function onlineGet(rel, { timeout = 20000, raw = false, tries = 3 } = {}) 
   const order = (JDB_LINE_OK && c.lines.includes(JDB_LINE_OK))
     ? [JDB_LINE_OK].concat(c.lines.filter(x => x !== JDB_LINE_OK)) : c.lines.slice()
   let lastErr = null
+  const errs = []                                    // 每条线路的失败原因都留下，报错不再只显示最后一条
   for (const base of order.slice(0, Math.max(1, Math.min(tries, order.length)))) {
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), timeout)
@@ -178,9 +179,9 @@ async function onlineGet(rel, { timeout = 20000, raw = false, tries = 3 } = {}) 
       if (j && j.success === 0) throw new Error(j.message || '线上源返回失败')
       JDB_LINE_OK = base
       return j
-    } catch (e) { lastErr = e } finally { clearTimeout(timer) }
+    } catch (e) { lastErr = e; errs.push(e && e.message ? e.message : String(e)) } finally { clearTimeout(timer) }
   }
-  throw lastErr || new Error('线上线路均不可用')
+  throw (errs.length ? new Error(errs.join('；')) : (lastErr || new Error('线上线路均不可用')))
 }
 /* 线上图片直取：接口返回的 cover_url 本身就是 tp.spfcas.com 的完整地址，不需要中间服务 */
 const IMG_HOST_OK = /(^|\.)(spfcas\.com|jdbstatic\.com|javdb\d*\.com|dmm\.co\.jp|dmm\.com)$/i
@@ -309,13 +310,16 @@ const boardTypeCode = t => {
   const n = parseInt(s, 10)
   return (n >= 0 && n <= 3) ? n : 0
 }
-async function boardLatest(sortBy, page, type) {
+async function boardLatest(sortBy, page, type, filter) {
   const sb = BOARD_SORTS[sortBy] ? sortBy : 'update'
   const tp = boardTypeCode(type)
+  /* JavDB app「影片」页的筛选 chips：/latest 实测只认 can_play（可播放）/ subtitle（含字幕），
+   * magnets / single 传了会被静默忽略（返回与 all 相同），前端只出真正生效的选项 */
+  const fl = ['can_play', 'subtitle'].includes(String(filter || '')) ? String(filter) : ''
   const pg = Math.max(1, page || 1)
-  const j = await onlineGet('v1/movies/latest?limit=24&page=' + pg + '&sort_by=' + sb + '&type=' + tp)
+  const j = await onlineGet('v1/movies/latest?limit=24&page=' + pg + '&sort_by=' + sb + '&type=' + tp + (fl ? '&filter_by=' + fl : ''))
   const ms = (((j || {}).data || {}).movies) || []
-  return { sort: sb, type: tp, page: pg, movies: ms.map(onlineMovie) }
+  return { sort: sb, type: tp, filter: fl, page: pg, movies: ms.map(onlineMovie) }
 }
 async function boardRanking(type, period) {
   const tp = boardTypeCode(type)
@@ -1570,6 +1574,7 @@ const proxyAgents = new Map()
  * 分情况走代理——即使用户配了代理，这些源也坚决直连（代理不稳定时它们照常工作）。 */
 const DIRECT_HOSTS = [
   'apidd.spthgb.com', 'apidd.czssdgz.com', 'jdforrepam.com', 'tp.spfcas.com',          // 订阅（JavDB 国内线路+图床）
+  'javdb.com', 'javdb580.com', 'javdb008.com', 'jdbstatic.com',                          // JavDB 网页版（女优作品列表 + 网页图床）
   'x99dh.cc', 'x99dh.vip', 'x99dh.my', 'x99dh.pro',                                    // MissAV 线路发现
   'missav.ws', 'missav123.com', 'njavtv.my', 'thisav.my', 'missav888.cc', 'njav01.net', 'missav.watch',
   'raw.githubusercontent.com', 'api.github.com', 'github.com', 'codeload.github.com',  // 云端中转
@@ -1589,22 +1594,23 @@ function agentMaybe(u, pUrl) {
 function tunnelAgent(pUrl) {
   if (proxyAgents.has(pUrl)) return proxyAgents.get(pUrl)
   const u = new URL(pUrl)
-  const agent = new https.Agent({
-    keepAlive: true,
-    createConnection(opts, cb) {
-      const host = opts.host, port = opts.port || 443
-      const rq = http.request({
-        host: u.hostname, port: u.port || 80, method: 'CONNECT',
-        path: host + ':' + port, headers: { Host: host + ':' + port }
-      })
-      rq.once('connect', (res, socket) => {
-        if (res.statusCode !== 200) { socket.destroy(); cb(new Error('代理 CONNECT 失败 ' + res.statusCode)); return }
-        cb(null, tls.connect({ socket, servername: host }))
-      })
-      rq.once('error', cb)
-      rq.end()
-    }
-  })
+  /* javpaco 代理修复(2026-09-28)：Node 的 https.Agent 不认构造参数里的 createConnection
+   * （只认原型方法），原写法隧道从未建立、请求实际直连目标站被墙超时——
+   * 这就是「代理正常但刮削全部网络请求失败」的根因。改为实例方法覆盖，CONNECT 隧道真正生效。 */
+  const agent = new https.Agent({ keepAlive: true })
+  agent.createConnection = function (opts, cb) {
+    const host = opts.host, port = opts.port || 443
+    const rq = http.request({
+      host: u.hostname, port: u.port || 80, method: 'CONNECT',
+      path: host + ':' + port, headers: { Host: host + ':' + port }
+    })
+    rq.once('connect', (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); cb(new Error('代理 CONNECT 失败 ' + res.statusCode)); return }
+      cb(null, tls.connect({ socket, servername: host }))
+    })
+    rq.once('error', cb)
+    rq.end()
+  }
   proxyAgents.set(pUrl, agent)
   return agent
 }
@@ -2602,8 +2608,16 @@ function scOnce(url, opts = {}) {
         'accept-language': 'ja,zh-CN;q=0.9,en;q=0.6'
       }, body ? { 'content-type': 'application/x-www-form-urlencoded', 'content-length': String(body.length) } : {}, opts.hdrs || {})
     }
-    const pUrl = proxyUrl()
-    if (pUrl) { const ag = agentMaybe(u, pUrl); if (ag) o.agent = ag }
+    /* javpaco 双通道补丁(2026-09-28)：支持通道覆写——
+     * _pOverride:'' 强制直连；_forceProxy:'http://..' 强制走代理（绕过直连白名单） */
+    const pUrl = opts._forceProxy ? String(opts._forceProxy).trim()
+      : opts._pOverride !== undefined ? String(opts._pOverride || '').trim()
+      : proxyUrl()
+    if (pUrl) {
+      let ag = null
+      try { ag = opts._forceProxy ? tunnelAgent(pUrl) : agentMaybe(u, pUrl) } catch (_) {}
+      if (ag) o.agent = ag
+    }
     const rq = https.request(o, rs => {
       const chunks = []
       rs.on('data', c => chunks.push(c))
@@ -2623,8 +2637,21 @@ async function scFetch(url, opts = {}) {
   const post = opts.method === 'POST' && opts.body
   for (let hop = 0; hop < 5; hop++) {
     let rs = null
+    const tryOnce = (extra) => scOnce(cur, Object.assign({}, opts, extra || {}, hop === 0 ? {} : { method: 'GET', body: '' }))
     for (let i = 0; i < 2; i++) {
-      try { rs = await scOnce(cur, hop === 0 ? opts : Object.assign({}, opts, { method: 'GET', body: '' })); break } catch (e) { mnFetch.lastErr = e.message; await new Promise(s => setTimeout(s, 900 * (i + 1))) }
+      try { rs = await tryOnce({}); break } catch (e) { mnFetch.lastErr = e.message; await new Promise(s => setTimeout(s, 900 * (i + 1))) }
+    }
+    /* javpaco 双通道补丁(2026-09-28)：默认路径（代理 或 白名单直连）整体失败时，
+     * 自动换另一条路再试一次：默认走代理的源 → 换直连；默认直连（白名单内，如 missav）
+     * 的源 → 强制走代理（绕过白名单）。与 mnGetFollow 的「代理优先+直连兜底」同思路。 */
+    if (!rs) {
+      let alt = null
+      try {
+        const pv = proxyUrl()
+        const wentProxy = pv && !isDirectHost(new URL(cur).hostname)
+        alt = wentProxy ? { _pOverride: '' } : (pv ? { _forceProxy: pv } : null)
+      } catch (_) {}
+      if (alt) { try { rs = await tryOnce(alt) } catch (e) { mnFetch.lastErr = e.message } }
     }
     if (!rs) throw new Error('网络请求失败' + (mnFetch.lastErr ? '：' + mnFetch.lastErr : ''))
     if ([301, 302, 303, 307, 308].includes(rs.status) && rs.headers.location) {
@@ -2672,6 +2699,72 @@ function scRows(html) {
   const re2 = /<span[^>]*class="[^"]*header[^"]*"[^>]*>([\s\S]*?)<\/span>([\s\S]*?)(?=<\/p|$)/gi
   while ((m = re2.exec(html))) rows.push([scText(m[1]).replace(/[：:]\s*$/, ''), scText(m[2])])
   return rows
+}
+/* ---------- JavDB 网页版「演员页」解析（女优作品全量列表的唯一来源） ----------
+ * 页面形状：<span class="actor-section-name">坂道美琉, 坂道みる</span> + <span class="section-meta">miru</span>
+ *          + <span class="section-meta">255 部影片</span>；列表每条 = <a href="/v/{vid}" class="box">
+ *          内含 .cover>img（竖版封面）/ .video-title（<strong>番号</strong> 标题）/ .score / .meta（日期）。
+ * 页脚 .pagination 给出总页数（每页 40 部）。 */
+/* JavDB 网页版封面（cN.jdbstatic.com）在容器里取不到（实测 NAS 请求该域名返回 404，
+ * 而同网络下 tp.spfcas.com 正常），但同一张图在订阅图床上有镜像：两边路径都是
+ * /covers/{id 前两位小写}/{id}.jpg，所以换掉 host 即可。spfcas 的路径段（如 rhe951l4q）
+ * 由接口下发、不能写死，按需抓一次最新影片列表把段提取出来并缓存 12 小时。 */
+let JDB_IMG_BASE = ''
+let JDB_IMG_BASE_AT = 0
+async function jdbImgBase() {
+  if (JDB_IMG_BASE && Date.now() - JDB_IMG_BASE_AT < 12 * 3600 * 1000) return JDB_IMG_BASE
+  try {
+    const j = await onlineGet('v1/movies/latest?page=1&limit=1')
+    const m = ((((j || {}).data || {}).movies) || [])[0] || {}
+    const u = String(m.cover_url || m.thumb_url || '')
+    const mt = u.match(/^(https?:\/\/[^/]+\/[A-Za-z0-9_-]+)\//)
+    if (mt) { JDB_IMG_BASE = mt[1]; JDB_IMG_BASE_AT = Date.now() }
+  } catch (_) {}
+  return JDB_IMG_BASE
+}
+function jdbImgMirror(u, base) {
+  const s = String(u || '')
+  if (!base || !/^https?:\/\/[^/]*jdbstatic\.com\//i.test(s)) return s
+  return s.replace(/^https?:\/\/[^/]+\//i, base + '/')
+}
+function jdbParseActorMovies(html) {
+  const out = { name: '', aliases: [], total: 0, totalPages: 1, movies: [] }
+  const sec = html.match(/class="actor-section-name">([\s\S]*?)<\/span>/)
+  if (sec) {
+    out.aliases = scText(sec[1]).split(/[,，]/).map(s => s.trim()).filter(Boolean)
+    out.name = out.aliases[0] || ''
+  }
+  const cm = html.match(/([0-9][0-9,]*)\s*部影片/)
+  if (cm) out.total = parseInt(cm[1].replace(/,/g, ''), 10) || 0
+  /* 总页数：页脚分页链接里的最大 page=（筛选后页数会变，所以不能拿 total/40 硬算） */
+  let maxPg = 0
+  for (const mm of html.matchAll(/[?&]page=([0-9]+)/g)) { const n = parseInt(mm[1], 10); if (n > maxPg) maxPg = n }
+  out.totalPages = Math.max(1, maxPg)
+  const re = /<a[^>]*href="\/v\/([A-Za-z0-9]+)"[^>]*\sclass="box[^"]*"[^>]*>([\s\S]*?)<\/a>/g
+  const seen = new Set()
+  let m
+  while ((m = re.exec(html))) {
+    const vid = m[1], blk = m[2]
+    const img = blk.match(/<img[^>]+src="([^"]+)"/)
+    const ttl = blk.match(/<div class="video-title">([\s\S]*?)<\/div>/)
+    let code = '', title = ''
+    if (ttl) {
+      const cm2 = ttl[1].match(/<strong>([\s\S]*?)<\/strong>/)
+      code = cm2 ? scText(cm2[1]) : ''
+      title = scText(ttl[1].replace(/<strong>[\s\S]*?<\/strong>/, ''))
+    }
+    const date = (blk.match(/class="meta">\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/) || [])[1] || ''
+    const sc = (blk.match(/([0-9]+(?:\.[0-9]+)?)\s*分/) || [])[1] || ''
+    if (!code && !title) continue
+    if (seen.has(code || vid)) continue
+    seen.add(code || vid)
+    const cover = img ? String(img[1]).replace(/^\/\//, 'https://') : ''
+    out.movies.push({
+      id: vid, code, title, thumb: cover, cover, date, duration: 0,
+      score: sc, magnets: 0, hasSub: false, canPlay: false, maker: ''
+    })
+  }
+  return out
 }
 function scPick(rows, labels) {
   for (const [th, td] of rows) {
@@ -3638,7 +3731,8 @@ async function handleActorApi(req, res, p) {
       autoAvatar: CFG.autoAvatar !== false,
       auto115Watch: CFG.auto115Watch !== false,
       autoAvatarRunning: AVA_BACKFILL_RUNNING, autoAvatarStats: AVA_BACKFILL_STATS,
-      autoRescan: CFG.autoRescan === true, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
+      /* 默认开：设置里「媒体库每日自动重扫」开关默认开启，只有显式 false 才算关 */
+      autoRescan: CFG.autoRescan !== false, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
       accessOn: !!ACCESS_CODE(),
       mounts: containerMounts(), mediaRoot: MEDIA_ROOT
     })
@@ -3688,7 +3782,7 @@ async function handleActorApi(req, res, p) {
       ok: true, proxy: CFG.proxy || '', proxyEnabled: CFG.proxyEnabled !== false,
       cacheDir: CFG.cacheDir || '', metaMode: CFG.metaMode === 'inline' ? 'inline' : '',
       autoScrapeNew: CFG.autoScrapeNew !== false,
-      autoRescan: CFG.autoRescan === true, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
+      autoRescan: CFG.autoRescan !== false, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
       rankAuto: CFG.rankAuto !== false, rankHour: rankHour(),
       rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running
     })
@@ -3904,7 +3998,9 @@ async function handleActorApi(req, res, p) {
     }
     return join(rel, extra)
   }
-  if (p === '/api/online/proxy') {
+  /* 名字叫 direct 更名副其实：这只是「前端 → 本机 server → JavDB 国内直连线路」的本地只读中转，
+   * server 出网固定直连（onlineGet 纯 fetch，不走代理隧道），/api/online/proxy 旧名保留兼容 */
+  if (p === '/api/online/proxy' || p === '/api/online/direct') {
     const q = new URL(req.url, 'http://x')
     const rel = onlineAllowedPath(q.searchParams.get('path') || 'latest')
     if (!rel) return json(res, { ok: false, error: '不允许的线上路径' })
@@ -3948,7 +4044,7 @@ async function handleActorApi(req, res, p) {
         if (!r.movies.length) return json(res, { ok: false, error: '官方榜单拉取失败：线上线路不可用或返回为空' })
         return json(res, Object.assign({ ok: true, kind: 'ranking', total: r.movies.length, meta: BOARD_META }, r))
       }
-      const r = await boardLatest(q.searchParams.get('sort'), parseInt(q.searchParams.get('page') || '1', 10) || 1, q.searchParams.get('type'))
+      const r = await boardLatest(q.searchParams.get('sort'), parseInt(q.searchParams.get('page') || '1', 10) || 1, q.searchParams.get('type'), q.searchParams.get('filter'))
       return json(res, Object.assign({ ok: true, kind: 'latest', sorts: BOARD_SORTS, meta: BOARD_META }, r))
     } catch (e) { return json(res, { ok: false, error: e.message }) }
   }
@@ -3973,23 +4069,207 @@ async function handleActorApi(req, res, p) {
     CFG.online = o; writeCfg(); SUB_FEED = { at: 0, data: null }
     return json(res, view(onlineCfg()))
   }
-  /* ---------- JavDB 线上搜索（独立搜索模块用）：v2/search 逐页代理 ---------- */
+  /* ---------- JavDB 线上搜索（独立搜索模块用）：v2/search 逐页代理 ----------
+   * 完整对齐 JavDB app 搜索参数：movie_type（all/0有码/1无码/2欧美/3FC2/4动漫）、
+   * movie_sort_by（relevance/release/update/score）、movie_filter_by（all/can_play/magnets/subtitle/single）、limit。 */
   if (p === '/api/online/search') {
     const uq = new URL(req.url, 'http://x')
     const qs = String((body && body.q) || uq.searchParams.get('q') || '').trim()
     const pg = Math.max(1, parseInt((body && body.page) || uq.searchParams.get('page') || '1', 10) || 1)
-    if (!qs) return json(res, { ok: false, error: '请输入搜索关键词（番号 / 片名 / 女优）' })
+    const mt = ['all', '0', '1', '2', '3', '4'].includes(String((body && body.movie_type) || uq.searchParams.get('movie_type') || 'all')) ? String((body && body.movie_type) || uq.searchParams.get('movie_type') || 'all') : 'all'
+    const msb = ['relevance', 'release', 'update', 'score'].includes(String((body && body.movie_sort_by) || uq.searchParams.get('movie_sort_by') || 'relevance')) ? String((body && body.movie_sort_by) || uq.searchParams.get('movie_sort_by') || 'relevance') : 'relevance'
+    const mfb = ['all', 'can_play', 'magnets', 'subtitle', 'single'].includes(String((body && body.movie_filter_by) || uq.searchParams.get('movie_filter_by') || 'all')) ? String((body && body.movie_filter_by) || uq.searchParams.get('movie_filter_by') || 'all') : 'all'
+    const lim = [10, 20, 24, 48].includes(parseInt((body && body.limit) || uq.searchParams.get('limit') || '24', 10)) ? parseInt((body && body.limit) || uq.searchParams.get('limit') || '24', 10) : 24
+    /* app 搜索页的类型页签：影片 / 演员 / 系列 / 片商（非影片类型同一 v2/search，只换 type） */
+    const ty = ['movie', 'actor', 'series', 'maker'].includes(String((body && body.type) || uq.searchParams.get('type') || 'movie')) ? String((body && body.type) || uq.searchParams.get('type') || 'movie') : 'movie'
+    if (!qs) return json(res, { ok: false, error: '请输入搜索关键词（番号 / 片名 / 女优 / 系列 / 片商）' })
     try {
-      const j = await onlineGet('v2/search?q=' + encodeURIComponent(qs) + '&type=movie&page=' + pg)
-      const d = (j || {}).data || {}
-      const movies = (d.movies || []).map(m => ({
-        id: m.id || '', code: m.number || m.code || '', title: m.title || m.origin_title || '',
-        thumb: m.thumb_url || '', cover: m.cover_url || '',
-        date: m.release_date || '', duration: Number(m.duration) || 0,
-        score: m.score || '', magnets: Number(m.magnets_count || m.magnet_count) || 0,
-        hasSub: !!(m.has_cnsub || m.has_subtitle), maker: m.maker_name || ''
-      })).filter(x => x.code || x.title)
-      return json(res, { ok: true, q: qs, page: pg, movies, total: (d.pagination && (d.pagination.total != null ? d.pagination.total : d.pagination.count)) || movies.length })
+      if (ty !== 'movie') {
+        const j2 = await onlineGet('v2/search?q=' + encodeURIComponent(qs) + '&type=' + ty + '&page=' + pg)
+        const d2 = (j2 || {}).data || {}
+        const actors = (d2.actors || []).map(a => ({ id: a.id || '', name: a.name || a.name_zht || '', nameZht: a.name_zht || '', otherName: a.other_name || '', avatar: a.avatar_url || '', videos: (a.videos_count != null ? a.videos_count : ''), uncensored: !!a.uncensored })).filter(a => a.id)
+        const series = (d2.series || []).map(s => ({ id: s.id || '', name: s.name || '', videos: (s.videos_count != null ? s.videos_count : '') })).filter(s => s.id)
+        const makers = (d2.makers || []).map(m => ({ id: m.id || '', name: m.name || '', videos: (m.videos_count != null ? m.videos_count : '') })).filter(m => m.id)
+        return json(res, { ok: true, q: qs, type: ty, page: pg, movies: [], actors, series, makers,
+          total: actors.length + series.length + makers.length })
+      }
+      /* 聚合翻页：上游每页硬上限 24 且不给总数（v2/search 响应只有 current_page+movies）。
+       * 这里把上游 2 页合并成本地 1 页（48 个），再用第 3 个上游页探测「还有没有下一页」——
+       * 翻页条的最后一页判定从此是真实的，不再靠「本页不满」猜。 */
+      const UP = 24
+      const upUrl = p => 'v2/search?q=' + encodeURIComponent(qs) + '&from_recent=false&type=movie&movie_type=' + mt +
+        '&movie_sort_by=' + msb + '&movie_filter_by=' + mfb + '&page=' + p + '&limit=' + UP
+      const up1 = onlineGet(upUrl(pg * 2 - 1))
+      const up2 = onlineGet(upUrl(pg * 2))
+      const up3 = onlineGet(upUrl(pg * 2 + 1)).catch(() => null)   // 探测页：失败按没有下一页处理
+      const j1 = await up1, j2 = await up2, j3 = await up3
+      const seenM = new Set(), movies = []
+      for (const src of [j1, j2]) for (const m of (((src || {}).data || {}).movies || [])) {
+        const it = {
+          id: m.id || '', code: m.number || m.code || '', title: m.title || m.origin_title || '',
+          thumb: m.thumb_url || '', cover: m.cover_url || '',
+          date: m.release_date || '', duration: Number(m.duration) || 0,
+          score: m.score || '', magnets: Number(m.magnets_count || m.magnet_count) || 0,
+          hasSub: !!(m.has_cnsub || m.has_subtitle), canPlay: !!m.can_play, maker: m.maker_name || ''
+        }
+        if (!it.code && !it.title) continue
+        if (it.id && seenM.has(it.id)) continue
+        if (it.id) seenM.add(it.id)
+        movies.push(it)
+      }
+      /* 搜索同时会带出女优/系列/片商联想——女优结果可直接点进 JavDB 女优页 */
+      const seenA = new Set(), actors = []
+      for (const src of [j1, j2]) for (const a of (((src || {}).data || {}).actors || [])) {
+        if (!a.id || seenA.has(a.id)) continue
+        seenA.add(a.id)
+        actors.push({
+          id: a.id || '', name: a.name || a.name_zht || '', nameZht: a.name_zht || '', otherName: a.other_name || '',
+          avatar: a.avatar_url || '', videos: (a.videos_count != null ? a.videos_count : '')
+        })
+      }
+      return json(res, { ok: true, q: qs, type: 'movie', page: pg, perPage: UP * 2, movies, actors,
+        total: 0, hasMore: ((((j3 || {}).data || {}).movies || []).length > 0) })
+    } catch (e) { return json(res, { ok: false, error: e.message }) }
+  }
+  /* ---------- JavDB 女优详情页（复刻 app 女优页）：v1/actors/{id} ----------
+   * 支持直接传 id（搜索结果里点进来）或按名字解析（本地女优页「全部作品」按钮进来）。
+   * 返回 profile（头像/别名/生日/身高/三围/社交账号/作品数）+ names（按命中率排序的搜索候选名，
+   * 作品列表走 v2/search 名字搜索——站方 app 同款做法，没有独立的女优作品端点）。 */
+  if (p === '/api/online/actor') {
+    const uq = new URL(req.url, 'http://x')
+    const aid = String((body && body.id) || uq.searchParams.get('id') || '').trim()
+    const aname = String((body && body.name) || uq.searchParams.get('name') || '').trim()
+    if (!aid && !aname) return json(res, { ok: false, error: '缺少女优 id 或名字' })
+    try {
+      let id = aid
+      if (!id) {
+        const hit = await onlineActorFind(aname)
+        if (!hit || !hit.id) return json(res, { ok: false, error: '线上没有找到这位女优（试试她的日文原名）' })
+        id = hit.id
+      }
+      const j = await onlineGet('v1/actors/' + encodeURIComponent(id))
+      const d = ((j || {}).data || {})
+      const a = d.actor || {}
+      /* share_info 形如「深田えいみ\nhttps://javdb580.com/actors/E26vd」——网页版链接可当资料页兜底入口 */
+      const webUrl = (String(d.share_info || '').match(/https?:\/\/\S+\/actors\/\S+/) || [''])[0]
+      const names = []
+      for (const n of [a.name, a.name_zht, a.other_name].concat(String(a.other_name || '').split(/[,，、]/))) {
+        const s = String(n || '').trim()
+        if (s && !names.includes(s)) names.push(s)
+      }
+      return json(res, {
+        ok: true,
+        actor: {
+          id: a.id || id, name: a.name || aname || '', nameZht: a.name_zht || '', otherName: a.other_name || '',
+          avatar: a.avatar_url || '', birthday: a.birthday || '', age: a.age || '', bloodType: a.blood_type || '',
+          height: a.height || '', bust: a.bust || '', cup: a.cup || '', waist: a.waist || '', hips: a.hips || '',
+          birthplace: a.birthplace || '', twitter: a.twitter_id || '', instagram: a.instagram_id || '',
+          videosCount: a.videos_count != null ? a.videos_count : ''
+        },
+        names,
+        tags: (d.tags || []).map(t => ({ name: t.name || '', count: Number(t.videos_count) || 0 })).filter(t => t.name),
+        webUrl
+      })
+    } catch (e) { return json(res, { ok: false, error: e.message }) }
+  }
+  /* ---------- 女优作品列表（网页版演员页）：唯一能给「全部作品」的来源 ----------
+   * 背景：app API 根本没有「女优作品」端点 —— v1/movies/latest 的 actor_id / actor_ids /
+   * filter_by=actor 等参数全被静默忽略（实测带与不带返回逐字节相同），v2/search 只按标题
+   * 关键词匹配。于是「坂道美琉 = 255 部」在旧实现里只剩标题里恰好写了 miru 的那 3 部。
+   * 网页版演员页 /actors/{id} 才有完整分页（每页 40 部 + 页脚总页数）。
+   * 参数：page（≥1）、sort_type（0 发行日期倒序 / 1 评分 / 2 热度 / 3 想看 / 4 看过）、
+   *       t（筛选：p 可播放 / s 单体作品 / d 含磁链 / c 含字幕；留空 = 全部）。 */
+  if (p === '/api/online/actor_movies') {
+    const uq = new URL(req.url, 'http://x')
+    const id = String((body && body.id) || uq.searchParams.get('id') || '').trim()
+    const pg = Math.max(1, parseInt((body && body.page) || uq.searchParams.get('page') || '1', 10) || 1)
+    const _st = String((body && body.sort_type) || uq.searchParams.get('sort_type') || '0')
+    const st = ['0', '1', '2', '3', '4'].includes(_st) ? _st : '0'
+    const _tf = String((body && body.t) || uq.searchParams.get('t') || '').trim()
+    const tf = ['', 'p', 's', 'd', 'c'].includes(_tf) ? _tf : ''
+    if (!/^[A-Za-z0-9]{3,16}$/.test(id)) return json(res, { ok: false, error: '女优 id 不合法' })
+    const qs = []
+    if (tf) qs.push('t=' + tf)
+    if (st !== '0') qs.push('sort_type=' + st)
+    if (pg > 1) qs.push('page=' + pg)
+    const rel = '/actors/' + id + (qs.length ? '?' + qs.join('&') : '')
+    let lastErr = null
+    for (const base of ['https://javdb.com', 'https://javdb580.com']) {
+      try {
+        const html = await scFetch(base + rel, { hdrs: { referer: base + '/', cookie: 'over18=1; locale=zh' } })
+        if (!/class="item"|actor-section-name/.test(html)) throw new Error('演员页没有内容（女优 id 可能不对）')
+        const parsed = jdbParseActorMovies(html)
+        parsed.hasMore = pg < parsed.totalPages
+        parsed.perPage = 40
+        /* 封面从 cN.jdbstatic.com 换到国内可达的 spfcas 镜像（详见 jdbImgBase 注释） */
+        const imgBase = await jdbImgBase()
+        parsed.movies = parsed.movies.map(m => Object.assign({}, m, {
+          thumb: jdbImgMirror(m.thumb, imgBase), cover: jdbImgMirror(m.cover, imgBase)
+        }))
+        return json(res, Object.assign({ ok: true, id, page: pg, sortType: st, t: tf, webUrl: base + '/actors/' + id }, parsed))
+      } catch (e) { lastErr = e }
+    }
+    return json(res, { ok: false, error: '演员页抓取失败：' + ((lastErr && lastErr.message) || '未知错误') })
+  }
+  /* ---------- JavDB 目录页（复刻 app「演员」「片商」「系列」tab）：v1/actors|makers|series ----------
+   * 目录 = 大全式翻页（type: 0有码 1无码 all）；带 q 时走 v2/search 对应类型。
+   * 片商/系列没有专属作品端点（实测 maker_id 会被 v1/movies/latest 静默忽略），作品列表用名字搜索兜底。 */
+  if (p === '/api/online/dirs') {
+    const uq = new URL(req.url, 'http://x')
+    const kindRaw = String(uq.searchParams.get('kind') || 'actors').toLowerCase()
+    const kind = ['actors', 'makers', 'series'].includes(kindRaw) ? kindRaw : 'actors'
+    const ty = ['0', '1', 'all'].includes(String(uq.searchParams.get('type') || 'all')) ? String(uq.searchParams.get('type') || 'all') : 'all'
+    const pg = Math.max(1, parseInt(uq.searchParams.get('page') || '1', 10) || 1)
+    const qs = String(uq.searchParams.get('q') || '').trim()
+    try {
+      /* 聚合翻页：上游目录每页很小（actors 实测只有 10 条/页）且不给总数（v1/* 响应无 pagination.total）。
+       * 同 search：上游 2 页合并成本地 1 页，第 3 页探测 hasMore，翻页条末页判定真实。 */
+      const singular = kind === 'actors' ? 'actor' : (kind === 'series' ? 'series' : 'maker')
+      /* 上游坑：v1/makers 不认 type=all（500），片商的「全部」回落成有码 */
+      const tySend = (kind === 'makers' && ty === 'all') ? '0' : ty
+      const UP = 24
+      const upDir = p => qs
+        ? onlineGet('v2/search?q=' + encodeURIComponent(qs) + '&type=' + singular + '&page=' + p)
+        : onlineGet('v1/' + kind + '?type=' + tySend + '&page=' + p)
+      const j1 = await upDir(pg * 2 - 1), j2 = await upDir(pg * 2), j3 = await upDir(pg * 2 + 1).catch(() => null)
+      let list = [], hasMore = false
+      for (const [idx, j] of [j1, j2].entries()) {
+        const d = (j || {}).data || {}
+        const raw = d[kind] || []
+        list = list.concat(raw)
+        if (idx === 1) {
+          const d3 = (j3 || {}).data || {}
+          hasMore = (d3[kind] || []).length > 0
+        }
+      }
+      const seen = new Set(); const items = []
+      for (const x of list) {
+        if (!x.id || seen.has(x.id)) continue
+        seen.add(x.id)
+        items.push(kind === 'actors'
+          ? { id: x.id || '', name: x.name || x.name_zht || '', nameZht: x.name_zht || '', otherName: x.other_name || '', avatar: x.avatar_url || '', videos: (x.videos_count != null ? x.videos_count : ''), uncensored: !!x.uncensored }
+          : { id: x.id || '', name: x.name || '', videos: (x.videos_count != null ? x.videos_count : '') })
+      }
+      const total = ((((j1 || {}).data || {}).pagination || {}).total) || 0
+      return json(res, { ok: true, kind, type: ty, page: pg, q: qs, items, total, hasMore })
+    } catch (e) { return json(res, { ok: false, error: e.message }) }
+  }
+  /* ---------- 片商 / 系列详情：v1/makers/{id} | v1/series/{id}（share_info 里带网页版链接） ---------- */
+  if (p === '/api/online/entity') {
+    const uq = new URL(req.url, 'http://x')
+    const kindRaw = String(uq.searchParams.get('kind') || '').toLowerCase()
+    const kind = ['maker', 'series'].includes(kindRaw) ? kindRaw : ''
+    const eid = String(uq.searchParams.get('id') || '').trim()
+    if (!kind || !eid) return json(res, { ok: false, error: '缺少 kind 或 id' })
+    try {
+      /* 复数化特判：v1 端点里 maker→makers，但 series 本身就是复数——
+       * 直接 kind+'s' 会拼出 v1/seriess/{id}（404），三条线路全挂，报错文案还只报最后一条线路，极具迷惑性 */
+      const path = kind === 'series' ? 'series' : kind + 's'
+      const j = await onlineGet('v1/' + path + '/' + encodeURIComponent(eid))
+      const d = ((j || {}).data || {})
+      const x = d[kind] || {}
+      const webUrl = (String(d.share_info || '').match(new RegExp('https?://\\S+/' + path + '/\\S+')) || [''])[0]
+      return json(res, { ok: true, kind, id: x.id || eid, name: x.name || '', videos: (x.videos_count != null ? x.videos_count : ''), webUrl })
     } catch (e) { return json(res, { ok: false, error: e.message }) }
   }
   /* ---------- 115 离线推送 ----------
@@ -4234,6 +4514,21 @@ async function handleActorApi(req, res, p) {
     return json(res, { ok: true, started: true })
   }
   if (p === '/api/rank/status') return json(res, { ok: true, running: RANKUP.running, phase: RANKUP.phase, error: RANKUP.error, added: RANKUP.added, count: RANKUP.count, finishedAt: RANKUP.finishedAt, updatedAt: rankUpdatedAt(), rankAuto: CFG.rankAuto !== false, rankHour: rankHour() })
+  /* ---------- 女优名册自动同步：GET 查状态 / POST 立即拉一次（每日自动由内置定时器负责） ---------- */
+  if (p === '/api/roster/sync') {
+    if (req.method === 'GET') {
+      const st = rosterSyncState()
+      return json(res, {
+        ok: true, running: ROSTER_SYNC.running, phase: ROSTER_SYNC.phase, error: ROSTER_SYNC.error,
+        count: rosterCount(), last: st.last || 0, before: st.before || 0, remote: st.remote || 0,
+        added: st.added || 0, skipped: !!st.skipped, note: st.note || '', remoteSize: st.remoteSize || 0,
+        auto: CFG.rosterSync !== false, hour: rosterSyncHour()
+      })
+    }
+    if (ROSTER_SYNC.running) return json(res, { ok: false, error: '名册同步中（' + (ROSTER_SYNC.phase || '') + '）' })
+    rosterSyncOnce('manual').catch(() => {})
+    return json(res, { ok: true, started: true })
+  }
   if (p === '/api/config/test') {
     /* 线路延迟测试（v0.2.29）：只测「这条代理线路本身」的延迟，不绑任何具体网站。
      * 目标用中立的连通性检测端点（微软 NCSI connecttest.txt，国内外直连/经代理都可达）。
@@ -4267,7 +4562,30 @@ async function handleActorApi(req, res, p) {
     const avg = okN.length ? Math.round(okN.reduce((s, x) => s + x.ms, 0) / okN.length) : 0
     const bad = samples.find(x => !x.ok) || {}
     const errText = bad.error ? bad.error : (bad.status ? '代理请求失败：HTTP ' + bad.status : '无响应')
-    return json(res, { ok: okN.length > 0, via: pv || 'direct', avg, samples, error: okN.length ? '' : errText })
+    /* 出口 IP 归属地（2026-10-01）：测通后顺路查一次出口 IP 的国家/地区（ip-api.com 免费端点，
+     * 中文国名、http-only，与上面的线路探测同一条路 —— 开代理就查代理出口，直连就查本机出口）。
+     * 查不到不报错：geo 为 null 时前端只省略这半句，不影响测速结果本身。 */
+    const geoProbe = () => new Promise(resolve => {
+      const GHOST = 'ip-api.com'
+      const GPATH = '/json/?fields=status,country,countryCode,query&lang=zh-CN'
+      const fin = txt => { try { const g = JSON.parse(txt); resolve(g && g.status === 'success' ? { ip: g.query, country: g.country, cc: g.countryCode } : null) } catch (_) { resolve(null) } }
+      try {
+        let rq
+        if (pv) {
+          const pu = new URL(pv)
+          rq = http.request({ host: pu.hostname, port: Number(pu.port) || 80, path: 'http://' + GHOST + GPATH, method: 'GET', headers: { host: GHOST, 'user-agent': MN_UA, accept: '*/*' } },
+            rs => { let b = ''; rs.on('data', c => { b += c }); rs.on('end', () => fin(b)); rs.resume() })
+        } else {
+          rq = http.request({ host: GHOST, path: GPATH, method: 'GET', headers: { host: GHOST, 'user-agent': MN_UA, accept: '*/*' } },
+            rs => { let b = ''; rs.on('data', c => { b += c }); rs.on('end', () => fin(b)); rs.resume() })
+        }
+        rq.setTimeout(5000, () => { try { rq.destroy(new Error('超时')) } catch (_) {} resolve(null) })
+        rq.on('error', () => resolve(null))
+        rq.end()
+      } catch (_) { resolve(null) }
+    })
+    const geo = okN.length ? await geoProbe() : null
+    return json(res, { ok: okN.length > 0, via: pv || 'direct', avg, samples, error: okN.length ? '' : errText, geo })
   }
   if (p === '/api/actor/scrape') {
     const mnid = String(body.mnid || '').replace(/\D/g, '')
@@ -5590,7 +5908,7 @@ function autoRescanLast() { try { return JSON.parse(fs.readFileSync(AUTOSCAN_FIL
 function autoRescanMark() { try { fs.writeFileSync(AUTOSCAN_FILE, JSON.stringify({ last: Date.now() })) } catch (_) {} }
 let autoRescanTrying = 0
 function autoRescanTick() {
-  if (CFG.autoRescan !== true) return             // 设置里没开
+  if (CFG.autoRescan === false) return            // 默认开：只有设置里明确关掉才停
   if (SCAN.running) return                        // 正在扫：本轮跳过，10 分钟后再看
   const now = new Date()
   if (now.getHours() < autoRescanHour()) return   // 还没到今天的扫描时刻
@@ -5609,24 +5927,117 @@ setInterval(autoRescanTick, 10 * 60 * 1000)
 setTimeout(autoRescanTick, 3 * 60 * 1000)   // 启动 3 分钟后先检查一次（补上停机期间错过的时点）
 /* 内置补充名册：项目自带文件（首次运行自动建），随项目一起备份 */
 try { if (!fs.existsSync(EXTRA_ROSTER)) fs.writeFileSync(EXTRA_ROSTER, '[]') } catch (_) {}
-/* 女优名册已移出 git 跟踪（约 16MB）。本地缺失时写入空 []，保证各读取点不崩溃；
- * 部署目录自带名册则跳过。设置 ROSTER_URL 可在首次启动时空名册自动拉取（见 README）。 */
-try { if (!fs.existsSync(ROSTER)) fs.writeFileSync(ROSTER, '[]', 'utf8') } catch (_) {}
-let _rosterEmpty = false
-try { _rosterEmpty = JSON.stringify(JSON.parse(fs.readFileSync(ROSTER, 'utf8'))) === '[]' } catch (_) {}
-if (process.env.ROSTER_URL && _rosterEmpty) {
-  (async () => {
-    try {
-      const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 20000)
-      const r = await fetch(process.env.ROSTER_URL, { signal: ctrl.signal })
-      clearTimeout(to)
-      if (!r.ok) throw new Error('HTTP ' + r.status)
-      const buf = Buffer.from(await r.arrayBuffer())
-      const tmp = ROSTER + '.dl'; fs.writeFileSync(tmp, buf); fs.renameSync(tmp, ROSTER)
-      console.log('[roster] 已从 ROSTER_URL 载入女优名册 (' + (buf.length / 1048576).toFixed(1) + 'MB)')
-    } catch (e) { console.log('[roster] ROSTER_URL 拉取失败（继续使用空名册）：' + e.message) }
-  })()
+
+/* ---------- 女优名册每日自动同步（relay/roster.json → actresses.json） ----------
+ * 名册约 16MB，不便随镜像分发，改放公共仓库 ShHEdisonXu/javpaco-relay
+ * （GitHub Actions 每日从 minnano 全量同步后提交）。本服务每天拉一次，
+ * 以后本机/CI 侧更新名册，容器次日自动跟上，不必再手动部署。
+ *
+ * 通道：relayBuf() 依次试 raw.githubusercontent.com → cdn.jsdelivr.net → GitHub Contents API。
+ *   NAS 实测 raw 被墙（fetch failed），jsDelivr 可用（16MB 约 100s），任一成功即可。
+ *
+ * ⚠️ 安全阀（重要）：只有远端条数 > 本地条数才写回。relay 通常落后于本机同步结果
+ * （2026-10-01 实测远端 25407 < 本地 25421），无条件覆盖会把本地补全的资料整体回退。
+ * 写回走 tmp+rename 原子替换；/actresses.json 的合并缓存以 mtime+size 作 key，会自动失效。
+ *
+ * 省钱优化：先用 Contents API 取远端字节数（几 KB），与上次同步记录一致就跳过下载，
+ *   避免每天白拉 16MB。探测失败则照常走全量。
+ * 默认每天 04:00 同步（CFG.rosterSyncHour 可改），CFG.rosterSync === false 可关闭。 */
+const RELAY_ROSTER_API = RELAY_API + 'roster.json'
+const ROSTER_SYNC_STATE = path.join(UI_ROOT, 'roster-sync-state.json')
+const ROSTER_SYNC = { running: false, phase: '', last: 0, ok: false, remote: 0, before: 0, added: 0, error: '', skipped: false, note: '', remoteSize: 0 }
+function rosterSyncState() { try { return JSON.parse(fs.readFileSync(ROSTER_SYNC_STATE, 'utf8')) || {} } catch (_) { return {} } }
+function rosterSyncHour() { const h = parseInt(CFG.rosterSyncHour, 10); return isNaN(h) ? 4 : Math.max(0, Math.min(23, h)) }
+function rosterSyncLast() { return +rosterSyncState().last || 0 }
+function rosterCount() { try { const v = JSON.parse(fs.readFileSync(ROSTER, 'utf8')); return Array.isArray(v) ? v.length : 0 } catch (_) { return 0 } }
+function rosterSyncSave() {
+  try {
+    fs.writeFileSync(ROSTER_SYNC_STATE, JSON.stringify({
+      last: ROSTER_SYNC.last, remote: ROSTER_SYNC.remote, before: ROSTER_SYNC.before,
+      added: ROSTER_SYNC.added, ok: ROSTER_SYNC.ok, skipped: ROSTER_SYNC.skipped,
+      note: ROSTER_SYNC.note, error: ROSTER_SYNC.error, remoteSize: ROSTER_SYNC.remoteSize
+    }))
+  } catch (_) {}
 }
+/* 远端字节数（Contents API 返回的 JSON 很小）——只用来判断值不值得下 16MB 全量 */
+async function relayRosterSize() {
+  try {
+    const r = await fetch(RELAY_ROSTER_API, { headers: { accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) })
+    if (!r.ok) return 0
+    const j = await r.json()
+    return +((j && j.size) || 0) || 0
+  } catch (_) { return 0 }
+}
+async function rosterSyncOnce(tag) {
+  if (ROSTER_SYNC.running) return { ok: false, error: '同步中' }
+  ROSTER_SYNC.running = true
+  ROSTER_SYNC.phase = '探测远端'; ROSTER_SYNC.error = ''; ROSTER_SYNC.skipped = false; ROSTER_SYNC.note = ''
+  try {
+    /* ① 先问一下远端的字节数：和上次同步时一致就说明没更新，直接跳过（省 16MB 下载） */
+    const rz = await relayRosterSize()
+    const prev = rosterSyncState()
+    if (rz && prev.remoteSize && rz === prev.remoteSize && prev.ok) {
+      ROSTER_SYNC.ok = true; ROSTER_SYNC.skipped = true; ROSTER_SYNC.phase = '跳过'
+      ROSTER_SYNC.note = '远端未变化（' + rz + ' 字节）'; ROSTER_SYNC.remoteSize = rz
+      ROSTER_SYNC.last = Date.now(); rosterSyncSave()
+      console.log('[roster-sync] ' + tag + '：远端未变化（' + rz + ' 字节），跳过')
+      return { ok: true, skipped: true, note: ROSTER_SYNC.note }
+    }
+    /* ② 拉全量（绕过 10 分钟缓存，确保拿到远端最新）
+     * 超时给足 5 分钟：jsDelivr 拉 16MB 实测 100~180s 波动，余量不够会白等一场。 */
+    ROSTER_SYNC.phase = '拉取 roster.json'
+    relayCache.delete('roster.json')
+    const buf = await relayBuf('roster.json', 300000)
+    if (!buf) throw new Error('relay 不可达（raw / jsDelivr / Contents API 均失败）')
+    ROSTER_SYNC.phase = '解析'
+    let remote
+    try { remote = JSON.parse(buf.toString('utf8')) } catch (_) { throw new Error('远端 roster.json 不是合法 JSON') }
+    if (!Array.isArray(remote) || !remote.length) throw new Error('远端名册为空或格式异常')
+    const before = rosterCount()
+    ROSTER_SYNC.remote = remote.length; ROSTER_SYNC.before = before
+    /* ③ 安全阀：远端不比本地全就绝不覆盖 */
+    if (remote.length <= before) {
+      ROSTER_SYNC.ok = true; ROSTER_SYNC.skipped = true; ROSTER_SYNC.phase = '跳过'
+      ROSTER_SYNC.note = '远端 ' + remote.length + ' ≤ 本地 ' + before + '，不覆盖'
+      ROSTER_SYNC.remoteSize = rz || buf.length
+      ROSTER_SYNC.last = Date.now(); rosterSyncSave()
+      console.log('[roster-sync] ' + tag + '：' + ROSTER_SYNC.note)
+      return { ok: true, skipped: true, remote: remote.length, before, note: ROSTER_SYNC.note }
+    }
+    ROSTER_SYNC.phase = '写回'
+    const tmp = ROSTER + '.sync'
+    fs.writeFileSync(tmp, buf); fs.renameSync(tmp, ROSTER)
+    AVA_ONLINE_INDEX = null                    // 名册换了 → 头像在线索引作废
+    ROSTER_SYNC.added = remote.length - before; ROSTER_SYNC.ok = true; ROSTER_SYNC.phase = '完成'
+    ROSTER_SYNC.remoteSize = rz || buf.length
+    ROSTER_SYNC.last = Date.now(); rosterSyncSave()
+    console.log('[roster-sync] ' + tag + '：名册已更新 ' + before + ' → ' + remote.length + '（+' + ROSTER_SYNC.added + '）')
+    return { ok: true, before, remote: remote.length, added: ROSTER_SYNC.added }
+  } catch (e) {
+    /* 失败**不**更新 last（last 只记「上次成功」）→ 定时器隔 1 小时会再试，
+     * 否则一次网络抖动就把当天机会用光、要等明天。 */
+    ROSTER_SYNC.ok = false; ROSTER_SYNC.phase = '失败'; ROSTER_SYNC.error = String((e && e.message) || e)
+    rosterSyncSave()
+    console.log('[roster-sync] ' + tag + ' 失败：' + ROSTER_SYNC.error)
+    return { ok: false, error: ROSTER_SYNC.error }
+  } finally {
+    ROSTER_SYNC.running = false
+  }
+}
+let rosterSyncTrying = 0
+function rosterSyncTick() {
+  if (CFG.rosterSync === false) return                    // 设置里关掉了
+  if (ROSTER_SYNC.running) return
+  const now = new Date()
+  if (now.getHours() < rosterSyncHour()) return           // 还没到今天的同步时刻
+  const todayAt = new Date(now.getFullYear(), now.getMonth(), now.getDate(), rosterSyncHour()).getTime()
+  if (rosterSyncLast() >= todayAt) return                 // 今天已经同步过
+  if (Date.now() - rosterSyncTrying < 55 * 60 * 1000) return   // 失败后至少隔 1 小时再试
+  rosterSyncTrying = Date.now()
+  rosterSyncOnce('auto').catch(() => {})
+}
+setInterval(rosterSyncTick, 30 * 60 * 1000)
+setTimeout(rosterSyncTick, 8 * 60 * 1000)                 // 启动 8 分钟后先查一次（补上停机期间错过的时点）
 
 /* ================================================================
  * MissAV 在线播放（借鉴 happy-capy 的线路发现 + 镜像中转架构）
@@ -5957,7 +6368,7 @@ const server = http.createServer((req, res) => {
       const sd = getSourcesData()
       return json(res, { ok: true, sources: sd.sources.map(x => ({ id: x.id, name: x.name, enabled: !!x.enabled })), priorities: sd.priorities })
     }
-    if (p === '/api/config' || p === '/api/config/test' || p === '/api/prefs' || p === '/api/rank/update' || p === '/api/rank/status' ||
+    if (p === '/api/config' || p === '/api/config/test' || p === '/api/prefs' || p === '/api/rank/update' || p === '/api/rank/status' || p === '/api/roster/sync' ||
         p === '/api/actor/scrape' || p === '/api/actor/save' || p === '/api/actor/sync' ||
         p === '/api/actor/probe' || p === '/api/actor/pick-avatar' ||
         p === '/api/library' || p === '/api/library/add' || p === '/api/library/remove' || p === '/api/library/rescan' ||
@@ -5967,13 +6378,16 @@ const server = http.createServer((req, res) => {
         p === '/api/movie/delete' ||
         p === '/api/backup' || p === '/api/login' ||
         p === '/api/favorites' || p === '/api/subscriptions' || p === '/api/subscriptions/feed' ||
-        p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/image' || p === '/api/online/config' ||
-        p === '/api/online/detail' || p === '/api/online/reviews' || p === '/api/online/board' || p === '/api/online/search' ||
+        p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/direct' || p === '/api/online/image' || p === '/api/online/config' ||
+        p === '/api/online/detail' || p === '/api/online/reviews' || p === '/api/online/board' || p === '/api/online/search' || p === '/api/online/actor' ||
+        p === '/api/online/actor_movies' ||
+        p === '/api/online/dirs' || p === '/api/online/entity' ||
         p === '/api/115/config' || p === '/api/115/test' || p === '/api/115/push' || p === '/api/115/tasks' || p === '/api/115/dirs' || p === '/api/115/watch' ||
         p === '/api/subs' || p === '/api/subs/get') {
       if (req.method !== 'POST' &&
         !(p === '/api/config' && req.method === 'GET') && !(p === '/api/prefs' && req.method === 'GET') &&
         !(p === '/api/rank/status' && req.method === 'GET') &&
+        !(p === '/api/roster/sync' && req.method === 'GET') &&
         !(p === '/api/watch' && req.method === 'GET') &&
         !(p === '/api/userdata' && req.method === 'GET') &&
         !(p === '/api/backup' && req.method === 'GET') &&
