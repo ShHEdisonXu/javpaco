@@ -29,43 +29,11 @@ shot-*.png
 *.log
 *.bak-cloud
 
-# ---- 仓库卫生：大体积样例/种子数据 ----
-# sample-cache/ 完整版 118 部 / 117MB，仅本地保留；仓库只入库一个精简子集（30 部），
-# 既避免仓库增重，又保证 Dockerfile 的 `COPY sample-cache` 有内容可拷
-# —— 源路径不存在时 docker 会直接构建失败（2026-10-01 云端 CI 就卡在这）。
-sample-cache/*
-!sample-cache/SEED_VER
-!sample-cache/movies
-sample-cache/movies/*
-!sample-cache/movies/MIDE-309
-!sample-cache/movies/MIGD-425
-!sample-cache/movies/MIDE-314
-!sample-cache/movies/MIDE-319
-!sample-cache/movies/MIDE-298
-!sample-cache/movies/MIDE-321
-!sample-cache/movies/MIDE-305
-!sample-cache/movies/MIDE-310
-!sample-cache/movies/MIDE-312
-!sample-cache/movies/MIDE-320
-!sample-cache/movies/MIDE-297
-!sample-cache/movies/MIDE-318
-!sample-cache/movies/MIDE-325
-!sample-cache/movies/MIDE-326
-!sample-cache/movies/MIDE-296
-!sample-cache/movies/MIDE-307
-!sample-cache/movies/MIDE-295
-!sample-cache/movies/MIDE-316
-!sample-cache/movies/GDRD-006
-!sample-cache/movies/MIGD-437
-!sample-cache/movies/MIDE-308
-!sample-cache/movies/MIDE-303
-!sample-cache/movies/MSFH-018
-!sample-cache/movies/MIDE-300
-!sample-cache/movies/ABF-386
-!sample-cache/movies/ZMAR-132
-!sample-cache/movies/107SDJS-382
-!sample-cache/movies/MIDA-621
-!sample-cache/movies/HIKR-247
-!sample-cache/movies/HIKR-230
+# ---- 仓库卫生：样例/种子数据 ----
+# sample-cache/ 完整版 118 部 / 117MB **全部入库**（2026-10-01 用户要求「118 部全放回去」）：
+# 曾用白名单只留 30 部，现恢复完整包 —— Dockerfile 有 `COPY sample-cache`，
+# 源路径不存在时 docker 会直接构建失败（2026-10-01 云端 CI 就卡在这），
+# 内容为空或裁剪都会让「没挂媒体时也能看到内容」的演示体验变差。
+# 注意：单文件最大 ~1.2MB，远低于 GitHub 100MB 硬限；全仓库约 +117MB。
 # 女优名册 16MB；不入库，运行时缺失时由 server.js 优雅降级（见 ROSTER 缺失守卫）
 actresses.json
