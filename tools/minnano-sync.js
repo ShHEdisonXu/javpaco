@@ -12,6 +12,9 @@
  *   --avatars   头像全部换成 minnano：缺的补、已有的也用 minnano 版覆盖（跟踪缓存跳过未变化的）
  *   --profiles  逐个抓资料页刷新档案字段 + 「をチェックした人が見ている女優」相关女优（rel）+
  *               资料页タグ（优先于 index 标签）；20 小时内抓过的跳过（每日刷新友好）
+ *   --debuts    从「出道作品」标题括注里推出「出道年月」（纯本地推导，零网络请求）
+ *   --works     用 index 的「AV登録数」统一本地 videoCount（排行榜与详情页的作品数同源；
+ *               站点未登记时保留本地原值）。榜单显示前必须先跑这个，否则两边永远对不上。
  *   --rankings  抓日榜/周榜/月榜前100 → rankings.json；榜上不在本地库的女优自动建档入库
  *   --cups      抓 minnano 罩杯名单（actress_list.php?cup=A..L，约 16.6k 条）→ 给本地缺罩杯的人补上，
  *               并统计与资料页解析值的冲突（同源交叉校验）
@@ -53,6 +56,8 @@ const DO = {
   importAll: ARGS.includes('--import-all') || ARGS.includes('--all'),
   avatars: ARGS.includes('--avatars') || ARGS.includes('--all'),
   profiles: ARGS.includes('--profiles') || ARGS.includes('--all'),
+  works: ARGS.includes('--works') || ARGS.includes('--all'),
+  debuts: ARGS.includes('--debuts') || ARGS.includes('--all'),
   rankings: ARGS.includes('--rankings') || ARGS.includes('--all'),
   cups: ARGS.includes('--cups') || ARGS.includes('--all'),
   wiki: ARGS.includes('--wiki') || ARGS.includes('--all')
@@ -116,10 +121,17 @@ async function getBin(url) {
   return null
 }
 
-/* ---------- 并发 runner：tasks 为 () => Promise 工厂 ---------- */
-async function runPool(n, tasks, every) {
+/* ---------- 并发 runner：tasks 为 () => Promise 工厂 ----------
+ * every 支持两种用法：
+ *   ① 数字 → 进度节流步长，配合第 4 个参数 onTick(done,total) 回调；
+ *   ② 函数 → 直接当回调（向后兼容），此时每个任务完成都会调用，由回调自行按 d 取模节流。
+ * 注意：早期版本把回调函数塞进 every，函数体却算 done % every === 0（对函数取模得 NaN），
+ * 结果进度日志与「每 N 条落盘」全部静默失效，只在全部跑完时触发一次 —— 已修正。 */
+async function runPool(n, tasks, every, onTick) {
   let cursor = 0, done = 0
   const total = tasks.length
+  const step = (typeof every === 'number' && every > 0) ? every : 1
+  const cb = typeof every === 'function' ? every : onTick
   async function worker() {
     while (true) {
       const i = cursor++
@@ -127,7 +139,7 @@ async function runPool(n, tasks, every) {
       const t0 = Date.now()
       try { await tasks[i]() } catch (e) { console.log('  task ERR: ' + String(e && e.message || e).slice(0, 80)) }
       done++
-      if (every && (done % every === 0 || done === total)) every(done, total)
+      if (cb && (done % step === 0 || done === total)) cb(done, total)
       if (DELAY) await sleep(Math.max(0, DELAY - (Date.now() - t0)))
     }
   }
@@ -267,23 +279,32 @@ async function stageSync(idx) {
   }
   console.log(`[sync] index 命中 ${matched}/${list.length}（更新 ${updated}，打标签 ${newTagged}），待搜索兜底 ${unmatched.length}`)
   // 搜索兜底（并发）
-  let fixed = 0
+  // 搜索接口有时会被站方 WAF 整段拦掉（一律 403/超时）：这时每个请求要空等 3 次超时，
+  // 几百个兜底能拖成一个多小时。连续失败到阈值就直接放弃兜底，别白跑。
+  let fixed = 0, failStreak = 0, aborted = false
   const tasks = unmatched.map(a => async () => {
+    if (aborted) return
     const r = await searchOne(a.name_ja || a.name)
-    if (r && r.id) {
-      const rec = idx.recs[r.id]
-      fixed++
-      a.mnid = r.id
-      a.msrc = BASE + 'actress' + r.id + '.html'
-      if (rec) {
-        if (rec.img) a.mimg = BASE + rec.img
-        if (rec.tags && rec.tags.length) a.tags = rec.tags
-        if (rec.furi && !a.furi) a.furi = rec.furi
+    if (!r || !r.id) {
+      if (++failStreak >= 12 && !aborted) {
+        aborted = true
+        console.log('  [sync] 搜索接口连续 12 次无结果（疑似被 WAF 拦），放弃本轮兜底')
       }
+      return
+    }
+    failStreak = 0
+    const rec = idx.recs[r.id]
+    fixed++
+    a.mnid = r.id
+    a.msrc = BASE + 'actress' + r.id + '.html'
+    if (rec) {
+      if (rec.img) a.mimg = BASE + rec.img
+      if (rec.tags && rec.tags.length) a.tags = rec.tags
+      if (rec.furi && !a.furi) a.furi = rec.furi
     }
   })
   await runPool(tasks.length, tasks, (d, t) => d % 50 === 0 && console.log(`  [sync] 搜索兜底 ${d}/${t}，成功 ${fixed}`))
-  console.log(`[sync] 搜索兜底成功 ${fixed}，最终未匹配 ${unmatched.length - fixed}`)
+  console.log(`[sync] 搜索兜底成功 ${fixed}${aborted ? '（已提前放弃）' : ''}，最终未匹配 ${unmatched.length - fixed}`)
   saveRoster(list)
   return list
 }
@@ -424,11 +445,16 @@ async function stageProfiles(list) {
   fs.mkdirSync(TMP, { recursive: true })
   const cache = REDO ? {} : loadJson(C_PROF, {})
   const targets = list.filter(a => a.mnid)
-  /* ONLY=mnid1,mnid2 → 只刷新指定的人（无视 TTL，用于新人补档，不全量爬） */
+  /* ONLY=mnid1,mnid2 → 只刷新指定的人（无视 TTL，用于新人补档，不全量爬）
+   * ONLY_MISSING=1 → 只刷「一条档案都没有」的人（生年月日/身高/罩杯全空，约占名册 21%）。
+   *   全量刷 2.4 万页里绝大多数站点有的本地早已有（同源），白跑一两个小时。 */
   const ONLY = (process.env.ONLY || '').split(',').map(s => s.trim()).filter(Boolean)
+  const ONLY_MISSING = process.env.ONLY_MISSING === '1' || ARGS.includes('--only-missing')
+  const TTL_OK = a => { const c = cache[a.mnid]; return !c || Date.now() - c.fetchedAt > PROF_TTL }
   const stale = ONLY.length ? targets.filter(a => ONLY.includes(String(a.mnid)))
-    : targets.filter(a => { const c = cache[a.mnid]; return !c || Date.now() - c.fetchedAt > PROF_TTL })
-  console.log(`[profiles] 有 mnid ${targets.length} 人，需刷新 ${stale.length}${ONLY.length ? '（ONLY 指定模式）' : ''}`)
+    : ONLY_MISSING ? targets.filter(a => !a.birthday && !a.height && !a.cup && TTL_OK(a))
+      : targets.filter(TTL_OK)
+  console.log(`[profiles] 有 mnid ${targets.length} 人，需刷新 ${stale.length}${ONLY.length ? '（ONLY 指定模式）' : ONLY_MISSING ? '（只补空白档案）' : ''}`)
   let ok = 0, fail = 0
   const tasks = stale.map(a => async () => {
     const r = await get(BASE + 'actress' + a.mnid + '.html')
@@ -437,7 +463,12 @@ async function stageProfiles(list) {
     cache[a.mnid] = { fetchedAt: Date.now(), p }
     ok++
   })
-  await runPool(tasks.length, tasks, (d, t) => d % 100 === 0 && console.log(`  [profiles] ${d}/${t} 成功 ${ok} 失败 ${fail}`))
+  /* 每 200 条落一次缓存：抓 5000 页要一小时，中途 Ctrl-C / 网络断了就白跑（旧版只在全部
+   * 结束后才写盘，一次失败等于全丢）。断点续跑靠的就是这份缓存。 */
+  await runPool(tasks.length, tasks, (d, t) => {
+    if (d % 200 === 0) { saveAtomic(C_PROF, cache); console.log(`  [profiles] ${d}/${t} 成功 ${ok} 失败 ${fail}（已落缓存）`) }
+    else if (d % 50 === 0) console.log(`  [profiles] ${d}/${t} 成功 ${ok} 失败 ${fail}`)
+  })
   saveAtomic(C_PROF, cache)
   // 写回
   let touched = 0
@@ -527,6 +558,15 @@ async function stageCups(list) {
 
 /* ================================================================
  * --wiki：ja.wikipedia 批量兜底（一次 50 个标题，含 AV女優 身份校验）
+ * ================================================================
+ * ⚠ 2026-10-01 实测结论：**这条路对「资料缺口人群」基本无效，别再指望它**。
+ *   缺口 = 有 mnid 但 birthday/height/cup 全空，共 5,234 人（占名册 21%）。
+ *   ① 按标题批量查 5,191 个缺口名 → 日文维基有条目 504（9.7%），但过了身份校验的只剩 13 个（0.3%）。
+ *   ② 反向枚举 Category:日本のAV女優（含子分类，共 4,321 条）→ 其中 3,837（88.8%）我们名册早已收录，
+ *      真正落在缺口里的只有 31 人（0.59%）。
+ *   原因：维基百科要求「独立关注度」，缺口这批多为单体/素人系（アリス/LISA/あおい/ルナ 之类），
+ *   没有媒体报道 → 不合收录标准；而维基上有条目的都是行业头部，我们资料本来就齐。
+ *   本阶段保留的意义只剩「罩杯」这一个边际场景（站点已知时才在 B86 后附 (Dカップ)）。
  * ================================================================ */
 const cleanName = s => String(s || '').replace(/[（(].*?[)）]/g, '').trim()
 const WIKI_API = 'https://ja.wikipedia.org/w/api.php'
@@ -671,13 +711,68 @@ function parseRankRows(html) {
   return rows
 }
 
+/* ================================================================
+ * --debuts：从「出道作品」标题推出「出道年月」（零网络，纯本地推导）
+ *   minnano 没有单独的出道年月字段，但出道作品标题末尾带括注：
+ *     新人NO.1STYLE 芸能人 七ツ森りりAVデビュー（2020年08月 19日） → 2020-08
+ *   实测：已有 debutDate 的 9135 人里 9025 人能这样推导、**0 例冲突**，规则可靠。
+ *   详情页「出道年月」那一栏原本 2.5 万人里有 1.6 万是「——」。
+ * ================================================================ */
+const DEBUT_M = /[（(](\d{4})年\s*(\d{1,2})月/
+function debutMonthOf(text) {
+  const m = DEBUT_M.exec(String(text || ''))
+  return m ? m[1] + '-' + String(m[2]).padStart(2, '0') : ''
+}
+async function stageDebuts(list) {
+  let n = 0, cant = 0
+  for (const a of list) {
+    if (a.debutDate) continue
+    const d = debutMonthOf(a.debut)
+    if (d) { a.debutDate = d; n++ } else cant++
+  }
+  saveRoster(list)
+  console.log(`[debuts] 补出出道年月 ${n} 人（出道作品文本里没有年月、补不了的 ${cant} 人）`)
+  return list
+}
+
+/* ================================================================
+ * --works：用 index 的「AV登録数」统一本地作品数（videoCount）
+ *   排行榜卡片上的「作品 N」来自 rankings.json 的 works（minnano 的 AV登録数），
+ *   而详情页的「作品 N」读的是本地 videoCount（早年来自 netflav）——两个数不同源，
+ *   绝大部分对不上。这里把本地口径统一到 minnano（站点未登记 0 时保留本地原值，
+ *   免得把 netflav 已有的数抹掉）。
+ * ================================================================ */
+async function stageWorks(idx, list) {
+  if (!idx || !idx.recs) { console.log('[works] 无 index 缓存，跳过（先跑 --index）'); return list }
+  let upd = 0, same = 0, keep = 0, nomn = 0
+  const samples = []
+  for (const a of list) {
+    if (!a.mnid) { nomn++; continue }
+    const rec = idx.recs[String(a.mnid)]
+    const w = rec ? (parseInt(rec.works, 10) || 0) : 0
+    if (!w) { keep++; continue }                      // 站点没登记作品 → 保留本地值
+    if ((a.videoCount || 0) === w) { same++; continue }
+    if (samples.length < 12) samples.push(`${a.name}: ${a.videoCount || 0} → ${w}`)
+    a.videoCount = w
+    upd++
+  }
+  saveRoster(list)
+  console.log(`[works] 更新 ${upd} 人 / 已是同值 ${same} / 站点未登记保留原值 ${keep} / 无 mnid ${nomn}`)
+  if (samples.length) console.log('  例：' + samples.join('；'))
+  return list
+}
+
 async function stageRankings(idx, list) {
   const modes = [['day', 'ranking_actress.php?daily'], ['week', 'ranking_actress.php'], ['month', 'ranking_actress.php?monthly']]
   const byMnid = new Map(list.filter(a => a.mnid).map(a => [a.mnid, a]))
+  /* 同一个人可能有多条记录（名册里存在重复 mnid，见 README「已知数据问题」），
+   * 补作品数时必须全都补上，否则前端 ACR_MN 取到没补的那条，两边照样对不上。 */
+  const allByMnid = new Map()
+  for (const a of list) { if (!a.mnid) continue; const k = String(a.mnid); if (!allByMnid.has(k)) allByMnid.set(k, []); allByMnid.get(k).push(a) }
   const byName = new Map()
   list.forEach(a => { const k = acNorm(a.name); if (k && !byName.has(k)) byName.set(k, a) })
   const rank = {}
-  let added = 0, renamed = 0
+  let added = 0, renamed = 0, worksFilled = 0
   for (const [key, url] of modes) {
     const r = await get(BASE + url)
     const rows = r && r.text ? parseRankRows(r.text) : []
@@ -709,6 +804,10 @@ async function stageRankings(idx, list) {
         added++
         console.log(`  [rankings] 新增女优：${x.name}（mnid=${x.id}）`)
       }
+      // 作品数：站内两个页面口径不完全一致（榜单页「AV登録数」vs 名册页「AV作品数」），
+      // 以名册页为准（--works 已写全），这里只给名册页拿不到值的人补一个，
+      // 免得出现「榜单有数、点进去空白」。
+      if (x.works > 0) for (const r of (allByMnid.get(String(x.id)) || [a])) if (!r.videoCount) { r.videoCount = x.works; worksFilled++ }
       // 头像：优先本地文件
       const fname = (a.lid || a.mnid) + '.jpg'
       const local = '/actresses/' + fname
@@ -719,9 +818,9 @@ async function stageRankings(idx, list) {
       }
     })
   }
-  if (added || renamed) saveRoster(list)
+  if (added || renamed || worksFilled) saveRoster(list)
   saveAtomic(RANK_OUT, { updatedAt: Date.now(), day: rank.day, week: rank.week, month: rank.month })
-  console.log(`[rankings] 写入 rankings.json（新入库 ${added} 人）`)
+  console.log(`[rankings] 写入 rankings.json（新入库 ${added} 人，改名 ${renamed}，补作品数 ${worksFilled}）`)
   return list
 }
 
@@ -729,7 +828,7 @@ async function stageRankings(idx, list) {
 async function main() {
   const t0 = Date.now()
   if (!Object.values(DO).some(Boolean)) {
-    console.log('无模式参数。可选：--index --sync --import-all --avatars --profiles --cups --wiki --rankings --all')
+    console.log('无模式参数。可选：--index --sync --import-all --avatars --profiles --cups --wiki --debuts --works --rankings --all')
     process.exit(0)
   }
   let idx = null
@@ -737,12 +836,14 @@ async function main() {
   if (DO.sync || DO.importAll || DO.avatars || DO.profiles || DO.rankings) idx = idx || loadJson(C_INDEX, null)
   let list = null
   if (DO.sync) list = await stageSync(idx)
-  if (DO.importAll || DO.avatars || DO.profiles || DO.cups || DO.wiki || DO.rankings) list = list || loadJson(OUT, [])
+  if (DO.importAll || DO.avatars || DO.profiles || DO.cups || DO.wiki || DO.debuts || DO.works || DO.rankings) list = list || loadJson(OUT, [])
   if (DO.importAll) list = await stageImportAll(idx, list)
   if (DO.avatars) list = await stageAvatars(list)
   if (DO.profiles) list = await stageProfiles(list)
   if (DO.cups) list = await stageCups(list)
   if (DO.wiki) list = await stageWiki(list)
+  if (DO.debuts) list = await stageDebuts(list)
+  if (DO.works) list = await stageWorks(idx, list)
   if (DO.rankings) list = await stageRankings(idx, list)
   console.log(`\n全部完成，耗时 ${Math.round((Date.now() - t0) / 1000)}s`)
 }
