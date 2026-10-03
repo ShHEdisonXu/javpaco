@@ -151,6 +151,33 @@ function onlineAllowedPath(rel) {
   if (!s || s.includes('..') || s.includes('//')) return ''
   return ONLINE_OK.includes(s.split(/[/?#]/)[0]) ? s : ''
 }
+/* ---------- 线上请求节流 + 自适应限速（2026-10-03：名册 2.5 万人全量回填） ----------
+ * 背景：给名册里 2.5 万个女优查代号，要对 JavDB 打十几万次请求。固定间隔不好使 ——
+ *   打太快 → 被限流（表现为超时/假失败，且失败会污染成 miss）；打太慢 → 要跑一整天。
+ * 所以做成**自适应**：连续成功 15 次就把间隔 ×0.85（下限 650ms）；任何失败立刻 ×2.2 并把窗口推后，
+ * 之后慢慢爬回来。再叠加 ±25% 抖动，避免固定节奏被识别成机器流量。
+ * 只在回填任务在跑时生效（RATE.on），平时看片/刮削的交互请求完全不受影响。 */
+const RATE = { min: 650, max: 60000, gap: 1100, okStreak: 0, next: 0, on: false, queue: Promise.resolve(), backoffs: 0, reqs: 0 }
+const rateWait = (ms) => new Promise(r => setTimeout(r, ms))
+function rateSlot() {
+  const S = RATE
+  if (!S.on) return Promise.resolve()
+  const run = S.queue.then(async () => {
+    const wait = S.next - Date.now()
+    if (wait > 0) await rateWait(wait + Math.floor((Math.random() - 0.5) * S.gap * 0.5))
+    S.next = Date.now() + S.gap
+  })
+  S.queue = run.catch(() => {})
+  return run
+}
+function rateOk() { const S = RATE; S.okStreak++; if (S.okStreak >= 15) { S.okStreak = 0; S.gap = Math.max(S.min, Math.round(S.gap * 0.85)) } }
+function rateBad() { const S = RATE; S.okStreak = 0; S.gap = Math.min(S.max, Math.round(S.gap * 2.2) + 400); S.next = Date.now() + S.gap; S.backoffs++ }
+/* 回填专用：排队 + 成功/失败反馈到限速器（不用ban的东西"线上未启用"不算被打） */
+async function onlineGetPaced(rel, opt) {
+  await rateSlot()
+  try { const j = await onlineGet(rel, opt); rateOk(); RATE.reqs++; return j }
+  catch (e) { if (!/线上数据源未启用/.test(String((e && e.message) || ''))) rateBad(); throw e }
+}
 let JDB_LINE_OK = ''                                // 上次成功的线路优先复用
 async function onlineGet(rel, { timeout = 20000, raw = false, tries = 3 } = {}) {
   const c = onlineCfg()
@@ -222,6 +249,11 @@ async function onlineImageGet(u, { timeout = 20000 } = {}) {
 }
 /* 女优：按名字搜索（线上没有全量名册接口），名字归一化后精确比对，不行就取第一条 */
 const onNorm = s => String(s || '').toLowerCase().replace(/[\s\u3000・·,，、/]+/g, '')
+/* 片假名→平假名（比对用）；「姓+名」拆分：新井リマ → ['新井','リマ']（名部必须全是假名）；
+ * 姓提取：开头连续非假名段（新井莉麻 → 新井 / 兒玉七海 → 兒玉 / 坂道美琉 → 坂道） */
+const onKana = s => String(s || '').replace(/[\u30a1-\u30f6]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
+const onNmSplit = s => { const m = String(s || '').match(/^([^\u3040-\u30ff]+)([\u3040-\u30ff]+)$/); return m ? [m[1], m[2]] : null }
+const onSurOf = s => { const m = String(s || '').match(/^([^\u3040-\u30ff]+)/); return m ? m[1] : '' }
 async function onlineActorFind(name) {
   const n = onNorm(name)
   if (!n) return null
@@ -1044,7 +1076,7 @@ async function scanAsync() {
       }
       if (fresh.length) {
         SCAN.autoQueued = fresh.length
-        autoIngestQueue(fresh)
+        autoIngestQueue(fresh, '扫描')
         console.log('[scan] 自动刮削：' + fresh.length + ' 个新番号已排队（设置 → 自动化 可关）')
       }
     }
@@ -1554,6 +1586,9 @@ function parseMinnanoProfile(html) {
     /* 站点是日文「期間」，旧写法「期间」永远匹配不上 → 两个键都认 */
     period: kv['AV出演期間'] || kv['AV出演期间'] || '', debut: kv['デビュー作品'] || '',
     agency: kv['所属事务所'] || kv['所属事務所'] || '', blog: kv['ブログ'] || '',
+    /* 愛称（こなみん、ぐらちゃん 这类圈内昵称）与 公式サイト（事务所官方页）——2026-10-02 补全 */
+    nick: kv['愛称'] || kv['爱称'] || '',
+    official: kv['公式サイト'] || kv['公式站点'] || '',
     avatarUrl: img ? MN_BASE + img : '',
     alias: alias.filter(Boolean), tags, rel
   }
@@ -1898,7 +1933,8 @@ function writeExtraRoster(list) {
 function applyActorFields(a, body) {
   const F = body.fields || {}
   const strs = ['name', 'furi', 'birthday', 'height', 'breast', 'waist', 'hip', 'cup',
-    'blood', 'place', 'period', 'debutDate', 'debut', 'agency', 'hobby', 'shoe', 'blog']
+    'blood', 'place', 'period', 'debutDate', 'debut', 'agency', 'hobby', 'shoe', 'blog',
+    'nick', 'official']
   for (const k of strs) if (typeof F[k] === 'string') a[k] = F[k].trim()
   if (F.works !== undefined) { const w = parseInt(F.works, 10); if (w > 0) a.videoCount = w }
   if (typeof F.alias === 'string') a.alias = F.alias.split(/[，,、]/).map(x => x.trim()).filter(Boolean)
@@ -2589,7 +2625,10 @@ function offlineScan(dir) {
  * 元数据 + 竖版封面 + 横版主图 + 剧照 → 图片下载进缓存目录
  * meta.json 落盘 cache/movies/<番号>/（磁力与已有缓存合并保留）
  * ================================================================ */
-const SCRAPE = { running: false, code: '', title: '', phase: '', pct: 0, log: [], error: '', finishedAt: 0 }
+const SCRAPE = { running: false, code: '', title: '', phase: '', pct: 0, log: [], error: '', finishedAt: 0, stop: false }
+/* 手动中止：POST /api/scrape/stop。刮削是长流程（11 个源逐个试 + 下载图片），
+ * 碰上某个源一直挂着就整条卡住，除了重启容器没有别的办法。置 stop 后各阶段自行收工。 */
+function scCheckStop() { if (SCRAPE.stop) throw new Error('已手动停止') }
 function scLog(s) {
   SCRAPE.log.push(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${s}`)
   if (SCRAPE.log.length > 200) SCRAPE.log.shift()
@@ -3125,6 +3164,30 @@ function scDmmCdnCands(code) {
   for (let i = 1; i <= 10; i++) samples.push(hosts[0]('jp-' + i + '.jpg'))
   return { poster, fanart, samples }
 }
+/* ---------- 用「站点给的 DMM 图 URL」反推真实 cid，再换成高清模板 ----------
+ * 上面的 scDmmCdnCands 是照着番号**猜** cid（前缀+5 位补零），对 SSE/素人/老片常常猜错：
+ *   SS-061 猜成 ss00061  → 真身 h_113ss00061（プラム 素人セーラー服）
+ *   START-549 猜成 start00549 → 真身 1start00549
+ * 猜错的下场不是 404，而是 302 到 DMM 的 noimage 占位图（状态码还是 200），于是「海报」成了一块白板。
+ * 站点（jav321/JavBus/DMM 规则）给出来的 URL 里的 cid 一定是准的，抠出来套 awsimgsrc 模板即可拿高清：
+ *   实测 1start00549 —— pics.dmm.co.jp 的 ps 只有 147×200，换 awsimgsrc pics_dig 后是 1536×2184。 */
+function scDmmCidOf(url) {
+  const m = String(url || '').match(
+    /\/(?:pics_dig\/digital\/video|dig\/mono\/movie|digital\/video|mono\/movie(?:\/adult)?)\/([a-z0-9_]{4,32})\/\1(?:ps|pl|jp-\d+)\.jpe?g/i)
+  return m ? m[1] : ''
+}
+function scDmmCandsFromCids(cids) {
+  const poster = [], fanart = [], samples = []
+  for (const cid of cids) {
+    /* pics_dig（在售数字版，最大）排在 dig/mono 前面：pick 找到够宽的图就收工，顺序即质量 */
+    poster.push('https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/' + cid + '/' + cid + 'ps.jpg')
+    fanart.push('https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/' + cid + '/' + cid + 'pl.jpg')
+    poster.push('https://awsimgsrc.dmm.com/dig/mono/movie/' + cid + '/' + cid + 'ps.jpg')
+    fanart.push('https://awsimgsrc.dmm.com/dig/mono/movie/' + cid + '/' + cid + 'pl.jpg')
+  }
+  for (let i = 1; i <= 10 && cids[0]; i++) samples.push('https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/' + cids[0] + '/' + cids[0] + 'jp-' + i + '.jpg')
+  return { poster, fanart, samples }
+}
 /* 从详情页网址里抠番号（「输入番号详细网址」用）：
  *   dmm:    https://www.dmm.co.jp/digital/videoa/-/detail/=/cid=vrkm00625/  → VRKM-625
  *           https://video.dmm.co.jp/av/content/?id=vrkm00625                → VRKM-625
@@ -3201,6 +3264,68 @@ async function scTryCandidate(code, c) {
   parsed.usedUrl = usedUrl
   return parsed
 }
+/* ---------- 占位图识别（DMM 的「无图」） ----------
+ * 猜错 cid 时 DMM 不返回 404，而是给一张占位图，状态码还是 200：
+ *   pics.dmm.co.jp/mono/movie/<cid>/<cid>ps.jpg → 302 → pics.dmm.com/mono/noimage/noimage_ps.jpg（147×200 / 2.6KB）
+ *   awsimgsrc 系 → 404 带本体 90×122 / 2.7KB（now_printing.jpg）
+ * 旧门槛「小于 2500 字节才算无效」正好放它们过去，于是被存成正式海报
+ * （SS-061 / DTSL-142 / HODV-21806 / WPSL-195 / WPSL-212 就这么白板了）。
+ * 真实小封面同尺寸（147×200）有 13~16KB，所以按「尺寸 + 字节」联合判，别一竿子打死小图。 */
+function scPlaceholderImg(sz, bytes) {
+  if (!sz || !sz.w) return true
+  if (sz.w <= 96 && sz.h <= 130) return true                             // now printing（90×122）
+  if (sz.w <= 170 && sz.h <= 215 && (bytes || 0) < 4200) return true     // noimage（147×200 / 2.6KB）
+  return false
+}
+/* ---------- 同名不同作品（番号撞车）防线 ----------
+ * 一个番号在不同站可能指向两部毫不相干的片：SS-061 在 jav321 是プラム「素人セーラー服生中出し（改）
+ * 061」(2010)，在 JavDB 线上却是ファインピクチャーズ「My Girl/新井リマ」(2022)。多源是「字段级择优」，
+ * 不设防就会把 A 的标题、日期 + B 的演员拼成一部不存在的片子（用户看到的「识别错了」就是它）。
+ * 判据：各源发行年份投票取锚点 → 与锚点差 ≥2 年**且**标题不像（去掉番号/【】修饰后的 2-gram 相似度
+ * < 0.5）才算撞车。两个条件都要满足，是为了放过 DMM 的【ベストヒッツ】【アウトレット】重发行版
+ * （GDRD-006 / BAB-044 那种：年份差 2 年但标题其实是同一部，不能误杀）。 */
+function scNormTitle(t) {
+  return String(t || '')
+    .replace(/[【\[（(][^】\]）)]*[】\]）)]/g, ' ')
+    .replace(/^[A-Za-z]{2,8}[-_ ]?\d{2,6}\s*/, ' ')
+    .replace(/(無料で見る|チェキ付き|の検索結果|搜尋結果|搜索结果)/g, ' ')
+    .replace(/[\s　\-–—_/・、,.。:：|+]/g, '')
+    .toLowerCase()
+}
+function scTitleSim(a, b) {
+  const A = scNormTitle(a), B = scNormTitle(b)
+  if (!A || !B) return 1                     // 没标题 → 无从判断，当作同一部
+  if (A === B) return 1
+  const gram = s => { const m = new Set(); for (let i = 0; i + 1 < s.length; i++) m.add(s.slice(i, i + 2)); return m }
+  const ga = gram(A), gb = gram(B)
+  let inter = 0
+  for (const x of ga) if (gb.has(x)) inter++
+  return inter / ((ga.size + gb.size - inter) || 1)
+}
+const scYearOf = v => { const m = String(v || '').match(/(19|20)\d{2}/); return m ? +m[0] : 0 }
+function scOffFilmSources(results, gotId) {
+  const rows = Object.entries(results || {}).map(([id, r]) => ({
+    id, title: (r && (r.title || '')) || '', rel: (r && (r.release || r.date)) || '', y: scYearOf(r && (r.release || r.date))
+  }))
+  const ys = rows.filter(r => r.y).map(r => r.y)
+  if (ys.length < 2) return { off: new Set(), items: [], anchorYear: ys[0] || 0 }
+  const cnt = {}
+  ys.forEach(y => { cnt[y] = (cnt[y] || 0) + 1 })
+  let anchor = gotId && results[gotId] && scYearOf(results[gotId].release || results[gotId].date)
+  if (!anchor || !(anchor in cnt) || cnt[anchor] < Math.max.apply(null, Object.values(cnt))) {
+    let n = -1
+    for (const y of Object.keys(cnt)) if (cnt[y] > n) { n = cnt[y]; anchor = +y }   // 年票最多者为锚点
+  }
+  const base = rows.find(r => r.y === anchor) || rows[0]
+  const off = new Set(), items = []
+  for (const r of rows) {
+    if (!r.y || r.id === base.id || Math.abs(r.y - anchor) < 2) continue
+    if (scTitleSim(r.title, base.title) >= 0.5) continue        // 标题像 = 重发行/合集版，不算撞车
+    off.add(r.id)
+    items.push({ id: r.id, title: r.title, release: r.rel, year: r.y })
+  }
+  return { off, items, anchorId: base.id, anchorYear: anchor }
+}
 /* 图片落盘（MDC-NG 规则：不看文件名，按下载后的真实宽高定角色）
    poster.jpg 竖版海报（h>w） / fanart.jpg 横版主图（w>h） / sampleNN.jpg 剧照（不与主图重复） */
 async function scSaveImages(dir, parsed) {
@@ -3218,11 +3343,24 @@ async function scSaveImages(dir, parsed) {
     fs.writeFileSync(fp, b)
     const sz = imgSize(fp)
     if (!sz) { try { fs.unlinkSync(fp) } catch (_) {} throw new Error('不是有效图片') }
-    return { fp, sz }
+    /* DMM 的「无图」占位图当没图处理（规则见 scPlaceholderImg）——存下来只会得到一块白板海报 */
+    if (scPlaceholderImg(sz, b.length)) { try { fs.unlinkSync(fp) } catch (_) {} throw new Error('是 DMM 的「无图」占位图') }
+    return { fp, sz, bytes: b.length }
   }
   const put = (fp, name) => { fs.renameSync(fp, path.join(imgDir, name)); return web(name) }
   // —— 本地基线：缓存里已有的成品图也参与择优（整部重刮时，线上候选没有它大就保留原文件，绝不降级）
-  const localSz = name => { try { const s = imgSize(path.join(imgDir, name)); return s && s.w ? s : null } catch (_) { return null } }
+  const localSz = name => {
+    try {
+      const fp = path.join(imgDir, name)
+      const s = imgSize(fp)
+      if (!s || !s.w) return null
+      let bytes = 0
+      try { bytes = fs.statSync(fp).size } catch (_) {}
+      /* 本地存着的本来就是占位图（历史遗留）→ 不能拿它当基线，否则重刮永远换不掉它（面积相同不算「更大」） */
+      if (scPlaceholderImg(s, bytes)) return null
+      return s
+    } catch (_) { return null }
+  }
   const locP = localSz('poster.jpg'), locF = localSz('fanart.jpg')
   // —— 候选择优：同一张图站点常给多个尺寸变体（含缩略图/占位图），靠前的不一定最清晰，
   //    所以试前几个候选取面积最大的那张，而不是碰到第一张符合朝向的就收工；
@@ -3254,28 +3392,27 @@ async function scSaveImages(dir, parsed) {
     return best || loose
   }
   // —— 竖版海报：候选里取面积最大的竖版；横版候选也不浪费（转投横版池）
+  //    撞车源（同名不同作品）的图单独放 fallback 池：混在一个池里「排最后」没用 —— pick 是按面积挑的，
+  //    错片那张只要尺寸不输，照样会被选中。所以信任池挑不出来才轮到它。
   const landPool = (parsed.fanartCands || []).slice()
-  const bp = await pick(parsed.posterCands || [], PORTRAIT, sz => sz.w >= 500, 5, ({ sz, u }) => {
-    if (LANDSCAPE(sz) && !landPool.includes(u)) landPool.unshift(u)
-    return false
-  }, locP)
+  const landPoolFB = (parsed.fanartFallback || []).slice()
+  const toLand = pool => ({ sz, u }) => { if (LANDSCAPE(sz) && !pool.includes(u)) pool.unshift(u); return false }
+  const bp = (await pick(parsed.posterCands || [], PORTRAIT, sz => sz.w >= 500, 8, toLand(landPool), locP))
+    || (await pick(parsed.posterFallback || [], PORTRAIT, sz => sz.w >= 500, 8, toLand(landPoolFB), locP))
   if (bp) {
     if (bp.local) { out.poster = web('poster.jpg'); scLog('竖版海报：保留本地 ' + bp.sz.w + '×' + bp.sz.h + '（线上候选没有更大的）') }
-    else { out.poster = put(bp.fp, 'poster.jpg'); used.add(bp.u); scLog('竖版海报：' + bp.sz.w + '×' + bp.sz.h + ' ← ' + bp.u.split('/').pop()) }
-    if (!bp.local && /dmm/i.test(bp.u)) out.posterFromDmm = true   // 来源标注跟着实际命中的图床走
+    else { out.poster = put(bp.fp, 'poster.jpg'); used.add(bp.u); out.posterUrl = bp.u; scLog('竖版海报：' + bp.sz.w + '×' + bp.sz.h + ' ← ' + bp.u.split('/').pop()) }
   }
   // —— 横版主图：同样取面积最大的横版；顺手留一张竖版备用
   let posterAlt = null
-  const bf = await pick(landPool.filter(u => !used.has(u)), LANDSCAPE, sz => sz.w >= 1600, 5, ({ fp, sz, u }) => {
-    if (PORTRAIT(sz) && !out.poster && !posterAlt) { posterAlt = { fp, sz, u }; return true }
-    return false
-  }, locF)
+  const onPort = ({ fp, sz, u }) => { if (PORTRAIT(sz) && !out.poster && !posterAlt) { posterAlt = { fp, sz, u }; return true } return false }
+  const bf = (await pick(landPool.filter(u => !used.has(u)), LANDSCAPE, sz => sz.w >= 1600, 8, onPort, locF))
+    || (await pick(landPoolFB.filter(u => !used.has(u)), LANDSCAPE, sz => sz.w >= 1600, 8, onPort, locF))
   if (bf) {
     if (bf.local) { out.fanart = web('fanart.jpg'); scLog('横版主图：保留本地 ' + bf.sz.w + '×' + bf.sz.h + '（线上候选没有更大的）') }
-    else { out.fanart = put(bf.fp, 'fanart.jpg'); used.add(bf.u); scLog('横版主图：' + bf.sz.w + '×' + bf.sz.h + ' ← ' + bf.u.split('/').pop()) }
-    if (!bf.local && /dmm/i.test(bf.u)) out.fanartFromDmm = true
+    else { out.fanart = put(bf.fp, 'fanart.jpg'); used.add(bf.u); out.fanartUrl = bf.u; scLog('横版主图：' + bf.sz.w + '×' + bf.sz.h + ' ← ' + bf.u.split('/').pop()) }
   }
-  if (!out.poster && posterAlt) { out.poster = put(posterAlt.fp, 'poster.jpg'); used.add(posterAlt.u) }
+  if (!out.poster && posterAlt) { out.poster = put(posterAlt.fp, 'poster.jpg'); used.add(posterAlt.u); out.posterUrl = posterAlt.u }
   // —— 剧照（跳过已用作主图的 URL；顺手记下第一张横版剧照作兜底）
   let i = 1, firstLand = null, firstPort = null
   for (const s of (parsed.samples || [])) {
@@ -3332,7 +3469,7 @@ async function scSaveOne(dir, cands, role) {
   const good = role === 'poster' ? (sz => sz.w >= 500) : (sz => sz.w >= 1600)
   // 规则给的候选里，靠前的不一定是清晰的那张（DMM 同一片有多种尺寸变体），
   // 所以试前几个、留面积最大的，而不是取第一个能用的
-  const MAX_TRY = 5
+  const MAX_TRY = 8
   let best = null, attempt = 0, loose = null   // loose：接近正方形的兜底（JavDB 的 FC2 封面常是 1:1）
   for (const u of cands) {
     if (attempt >= MAX_TRY) break
@@ -3344,6 +3481,7 @@ async function scSaveOne(dir, cands, role) {
       fs.writeFileSync(fp, b)
       const sz = imgSize(fp)
       if (!sz) { try { fs.unlinkSync(fp) } catch (_) {} throw new Error('不是有效图片') }
+      if (scPlaceholderImg(sz, b.length)) { try { fs.unlinkSync(fp) } catch (_) {} throw new Error('是 DMM 的「无图」占位图') }
       if (want(sz) && (!best || sz.w * sz.h > best.sz.w * best.sz.h)) {
         if (best) { try { fs.unlinkSync(best.fp) } catch (_) {} }
         best = { fp, sz, u }
@@ -3370,7 +3508,7 @@ async function scSaveOne(dir, cands, role) {
 async function scrapeAsync(job) {
   const t0 = Date.now()
   SCRAPE.running = true; SCRAPE.code = job.code; SCRAPE.phase = '准备'; SCRAPE.pct = 2
-  SCRAPE.error = ''; SCRAPE.log = []; SCRAPE.finishedAt = 0; SCRAPE.title = ''
+  SCRAPE.error = ''; SCRAPE.log = []; SCRAPE.finishedAt = 0; SCRAPE.title = ''; SCRAPE.stop = false
   const dir = path.join(cacheDir(), 'movies', job.code.replace(/[^\w.-]/g, '_'))
   const scTried = []      // 本次实际抓过的源：[{id, ok, reason}]，写进 meta 供详情页显示「数据源一览」
   let scSkipped = []      // 提前收工没来得及试的源 id
@@ -3418,6 +3556,7 @@ async function scrapeAsync(job) {
       const triedSet = new Set()
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i]
+        scCheckStop()                       // 逐源检查：中止时把没试的源记进「已跳过」
         triedSet.add(c.id)
         SCRAPE.phase = '抓取 ' + c.id; SCRAPE.pct = 6 + Math.round(54 * i / candidates.length)
         try {
@@ -3454,12 +3593,23 @@ async function scrapeAsync(job) {
     if (!got) throw new Error('所有站点都未能获取到「' + job.code + '」的元数据（可能被站点反爬或番号不存在）。可尝试直接粘贴该番号的详情页网址。')
     SCRAPE.phase = '合并字段'; SCRAPE.pct = 60
     const pri = getSourcesData().priorities
+    /* 先判「同名不同作品」（番号撞车）：这些源的文字字段一律不进择优，否则会拼出一部不存在的片子 */
+    const xf = scOffFilmSources(results, got && got.sourceId)
+    const resultsTxt = xf.off.size
+      ? Object.keys(results).reduce((o, id) => { if (!xf.off.has(id)) o[id] = results[id]; return o }, {})
+      : results
+    if (xf.off.size) {
+      scLog('⚠ 同名不同作品：' + xf.items.map(x => x.id + '《' + String(x.title || '').slice(0, 24) + '》' + x.year).join('、') +
+        ' 与主片（' + xf.anchorYear + ' 年）对不上 → 已排除其标题/演员/剧情等文字字段，图片只作最后兜底')
+    }
     const pk = {}
-    for (const f of SC_TEXT_FIELDS.concat(['actors', 'genres', 'poster', 'fanart', 'samples'])) pk[f] = scPickField(results, f, pri)
+    /* 文字字段只认「没撞车」的源；图片/剧照仍看全部源（撞车源的图已在候选里排到最后兜底） */
+    for (const f of SC_TEXT_FIELDS.concat(['actors', 'genres'])) pk[f] = scPickField(resultsTxt, f, pri)
+    for (const f of ['poster', 'fanart', 'samples']) pk[f] = scPickField(results, f, pri)
     /* 兜底：聚合择优没取到、但首个命中源里其实有 → 直接用它的（防止再出现「scraped:true 却全空」的空壳条目） */
     const fv = f => {
       if (pk[f]) return pk[f].v
-      if (got) {
+      if (got && !xf.off.has(got.sourceId)) {
         const v = f === 'release' ? (got.date || got.release) : got[f]
         if (f === 'actors' || f === 'genres') return Array.isArray(v) && v.length ? v : []
         if (f === 'runtime') return v > 0 ? v : 0
@@ -3470,22 +3620,70 @@ async function scrapeAsync(job) {
     const fsr = f => pk[f] ? pk[f].src : ''
     SCRAPE.title = fv('title')   // 供「添加影片」批量进度逐条回显标题
     SCRAPE.phase = '下载图片'; SCRAPE.pct = 62
-    /* 剧照：把所有源按优先级串起来（某源的图全挂了就顺延到下一个源），去重后交给下载循环 */
+    scCheckStop()                       // 图片是最容易卡住的阶段（几十张图逐个试站点）
+    /* 图片候选：把所有源的候选按优先级串起来，而不是只取「第一个有图的源」那一份清单 ——
+     * 只认一份清单时，万一那源只给了小图/横图就再无挑选余地（START-549 竖版海报卡在 147×200 就是这样）。
+     * 撞车源的图排在最后，只在前面全挂时才轮到它兜底。 */
+    const urlSrc = Object.create(null)
+    const pushC = (arr, list, id) => {
+      for (const u of (list || [])) {
+        if (!u || typeof u !== 'string') continue
+        if (!urlSrc[u]) urlSrc[u] = id
+        if (arr.indexOf(u) < 0) arr.push(u)
+      }
+    }
+    /* 剧照：把所有源按优先级串起来（某源的图全挂了就顺延到下一个源），去重后交给下载循环。
+     * 撞车源的剧照是另一部片的画面，垫到最后。 */
     const samplesAll = []
     for (const id of scFieldOrder('samples', pri)) {
+      if (xf.off.has(id)) continue
       const r = results[id] || {}
       for (const s of (r.samples || [])) if (samplesAll.indexOf(s) < 0) samplesAll.push(s)
     }
-    /* DMM 图床直链候选排在所有源之后：前面的源都拿不到图（或图全挂了）才轮到它，
-     * 下载循环按序试，404/无效图自动跳过 —— 不给已有图的片子多下载无用的候选 */
+    for (const id of scFieldOrder('samples', pri)) {
+      if (!xf.off.has(id)) continue
+      const r = results[id] || {}
+      for (const s of (r.samples || [])) if (samplesAll.indexOf(s) < 0) samplesAll.push(s)
+    }
+    const posterAll = [], fanartAll = [], posterFB = [], fanartFB = []
+    const imgOrder = [], seenSrc = new Set()
+    for (const id of scFieldOrder('poster', pri).concat(scFieldOrder('fanart', pri)).concat(Object.keys(results))) {
+      if (!seenSrc.has(id)) { seenSrc.add(id); imgOrder.push(id) }
+    }
+    for (const id of imgOrder) {
+      if (xf.off.has(id)) continue
+      pushC(posterAll, (results[id] || {}).posterCands, id)
+      pushC(fanartAll, (results[id] || {}).fanartCands, id)
+    }
+    for (const id of imgOrder) {                 // 撞车源：图单独成池，只在信任池一张都挑不出时才用
+      if (!xf.off.has(id)) continue
+      pushC(posterFB, (results[id] || {}).posterCands, id)
+      pushC(fanartFB, (results[id] || {}).fanartCands, id)
+    }
+    /* DMM 直链候选分两档：①按站点给的真实 cid 反推（准）②按番号猜（SSE/素人老片常猜错，垫底） */
+    const knownCids = []
+    for (const u of posterAll.concat(fanartAll)) {
+      const cid = scDmmCidOf(u)
+      if (cid && knownCids.indexOf(cid) < 0) knownCids.push(cid)
+    }
+    const dmmK = scDmmCandsFromCids(knownCids.slice(0, 3))
     const dmmC = scDmmCdnCands(job.code)
+    const builtUrls = new Set([].concat(dmmK.poster, dmmK.fanart, dmmK.samples, dmmC.poster, dmmC.fanart, dmmC.samples))
     const imgs = await scSaveImages(dir, {
-      posterCands: (pk.poster ? pk.poster.cands : []).concat(dmmC.poster),
-      fanartCands: ((pk.fanart ? pk.fanart.cands : [])).concat(dmmC.fanart),
-      samples: samplesAll.length ? samplesAll : (pk.samples ? pk.samples.cands : []).concat(dmmC.samples)
+      posterCands: posterAll.concat(dmmK.poster, dmmC.poster),
+      fanartCands: fanartAll.concat(dmmK.fanart, dmmC.fanart),
+      posterFallback: posterFB, fanartFallback: fanartFB,
+      samples: samplesAll.length ? samplesAll : (pk.samples ? pk.samples.cands : []).concat(dmmK.samples, dmmC.samples)
     })
-    imgs.posterSrc = imgs.posterFromDmm ? 'dmm 图床' : fsr('poster'); imgs.fanartSrc = imgs.fanartFromDmm ? 'dmm 图床' : fsr('fanart'); imgs.samplesSrc = fsr('samples')
-    delete imgs.posterFromDmm; delete imgs.fanartFromDmm
+    /* 来源标注：只有命中「本地构造的 DMM 直链」才写 dmm 图床；其它按真正给出这条 URL 的站点。
+     * 旧写法只要 URL 里含 dmm 就写「dmm 图床」——jav321 给的正是 DMM 官方图，于是正常刮到的也白背
+     * 「没刮到、走图床兜底」的黑锅（这正是用户看到的「很多主图显示 dmm 图床」）。 */
+    const srcOf = (u, f) => (!u ? (pk[f] ? pk[f].src : '')
+      : (urlSrc[u] || (builtUrls.has(u) ? 'dmm 图床' : (pk[f] ? pk[f].src : ''))))
+    imgs.posterSrc = srcOf(imgs.posterUrl, 'poster')
+    imgs.fanartSrc = srcOf(imgs.fanartUrl, 'fanart')
+    imgs.samplesSrc = pk.samples ? pk.samples.src : ''
+    delete imgs.posterUrl; delete imgs.fanartUrl
     SCRAPE.phase = '抓取磁力'; SCRAPE.pct = 86
     let magnets = []
     const old = readMovieCache(job.code)
@@ -3502,6 +3700,8 @@ async function scrapeAsync(job) {
       source: got.sourceId + (got.usedUrl ? ' · ' + got.usedUrl : ''),
       /* 本次数据源尝试记录：详情页「刮削内容」列出全部源及其状态，未试过的可按需补抓 */
       scrapeTried: { tried: scTried, skipped: scSkipped },
+      /* 同名不同作品（番号撞车）记录：被排除文字字段的源 + 它指向的片名，面板里要给用户看得见 */
+      offFilm: xf.items.length ? xf.items : undefined,
       title: fv('title'), plot: fv('plot'), year: (fv('release') || '').slice(0, 4),
       studio: fv('studio'), publisher: fv('publisher'), series: fv('series'), director: fv('director'),
       release: fv('release'), runtime: fv('runtime'), actors: fv('actors'), genres: fv('genres'),
@@ -3539,11 +3739,17 @@ async function scrapeAsync(job) {
     patchDataItem(job.code)   // 并回内存条目：本地影片详情/系列页立刻见新数据
     SCRAPE.pct = 100; SCRAPE.phase = '完成'
     scLog(`完成：《${got.title}》 竖版封面${imgs.poster ? '✓' : '✕'} 横版主图${imgs.fanart ? '✓' : '✕'} 剧照 ${imgs.samples.length} 张 磁力 ${magnets.length} 条`)
+    scrapeHistAdd({ code: job.code, ok: true, err: '', src: got.sourceId || '', via: job.via || '手动', at: t0, dur: Date.now() - t0 })
   } catch (e) {
     SCRAPE.error = e.message
     scLog('失败：' + e.message)
+    scrapeHistAdd({ code: job.code, ok: false, err: String(e.message || '').slice(0, 120), src: '', via: job.via || '手动', at: t0, dur: Date.now() - t0 })
   } finally {
-    SCRAPE.running = false; SCRAPE.finishedAt = Date.now()
+    SCRAPE.running = false; SCRAPE.finishedAt = Date.now(); SCRAPE.stop = false
+    /* 手动单跑任务正常收尾 → 清掉落盘里的"进行中"，别下次启动又补一遍 */
+    if (AUTO_INGEST.current === job.code && !AUTO_INGEST.queue.includes(job.code)) {
+      AUTO_INGEST.current = ''; AUTO_INGEST.currentVia = ''; autoQSave()
+    }
     console.log('[scrape]', job.code, SCRAPE.error ? '失败: ' + SCRAPE.error : 'OK', Date.now() - t0 + 'ms')
   }
 }
@@ -3620,30 +3826,431 @@ let SUB_FEED = { at: 0, data: null }
 const SUB_FEED_TTL = 300000
 /* ---------- 订阅「自动入库」：开了开关的订阅，检查到线上新作后自动刮进离线数据 ----------
  * 默认关闭 —— 订阅只负责「发现」，要不要入媒体库由用户逐条决定；开关在订阅列表里改。 */
-const AUTO_INGEST = { running: false, queue: [], done: 0, total: 0, current: '', ok: 0, fail: 0 }
+const AUTO_INGEST = { running: false, queue: [], done: 0, total: 0, current: '', currentVia: '', ok: 0, fail: 0, paused: false }
 async function autoIngestRun() {
   if (AUTO_INGEST.running) return
   AUTO_INGEST.running = true
   try {
     while (AUTO_INGEST.queue.length) {
+      if (AUTO_INGEST.paused) { await new Promise(s => setTimeout(s, 2000)); continue }   // 暂停：保留队列，只是不取新任务
+      const via = (AUTO_INGEST.queue.via || {})[AUTO_INGEST.queue[0]] || '订阅'
       const code = AUTO_INGEST.queue.shift()
       AUTO_INGEST.current = code
+      AUTO_INGEST.currentVia = via
+      autoQSave()                            // 刚落队就落盘：这会儿容器被杀，恢复时它还在队首
       if (SCRAPE.running) { await new Promise(s => setTimeout(s, 3000)); AUTO_INGEST.queue.unshift(code); continue }   // 用户手动刮削优先
       let already = false
       try { const m = readMovieCache(code); already = !!(m && m.scraped) } catch (_) {}
-      if (already) { AUTO_INGEST.done++; AUTO_INGEST.ok++; continue }   // 已有离线数据就不重复刮
-      try { await scrapeAsync({ code }) } catch (_) {}
+      if (already) { AUTO_INGEST.done++; AUTO_INGEST.ok++; AUTO_INGEST.current = ''; autoQSave(); continue }   // 已有离线数据就不重复刮
+      try { await scrapeAsync({ code, via }) } catch (_) {}
       if (SCRAPE.error) AUTO_INGEST.fail++; else AUTO_INGEST.ok++
       AUTO_INGEST.done++
+      AUTO_INGEST.current = ''            // 这一部完成了（落盘时别再把它当"进行中"）
+      autoQSave()
     }
-  } finally { AUTO_INGEST.running = false; AUTO_INGEST.current = '' }
+  } finally { AUTO_INGEST.running = false; AUTO_INGEST.current = ''; AUTO_INGEST.currentVia = ''; AUTO_INGEST.queue.via = AUTO_INGEST.queue.via || {} }
 }
-function autoIngestQueue(codes) {
+/* front = true → 插到队首（手动指定的番号优先于订阅批量）。
+ * 返回该番号在队列里的位次（1 起），给前端显示「前面还有几部」。 */
+function autoIngestQueue(codes, via = '订阅', front = false) {
   const q = AUTO_INGEST.queue
-  for (const c of codes) if (c && !q.includes(c)) q.push(c)
-  if (!q.length) return
+  q.via = q.via || {}
+  for (const c of codes) {
+    if (!c || q.includes(c)) continue
+    if (front) q.unshift(c); else q.push(c)
+    q.via[c] = via
+  }
+  if (!q.length) return 0
   AUTO_INGEST.total = q.length + AUTO_INGEST.done
+  autoQSave()
   autoIngestRun().catch(() => {})
+  return q.indexOf(codes[0]) + 1
+}
+/* 队列落盘：几百部的批量入库要跑好几个小时，容器中途重启（部署/断电）不能把没跑的番号全丢了。
+ * ⚠️ 「正在刮的那一部」在 autoIngestRun 里已经 shift 出队了，**只存 queue 会把它弄丢** ——
+ *   容器在刮到一半时重启/被 stop，那一部就永远消失了（实测踩过）。所以 current 一起落盘，
+ *   启动时 autoQLoad 把它 unshift 回队首，接着刮。手动 POST /api/scrape/start 起的单跑任务同理。 */
+const AUTO_Q_FILE = () => { try { return path.join(cacheDir(), 'ingest-queue.json') } catch (_) { return '' } }
+function autoQSave() {
+  try {
+    fs.writeFileSync(AUTO_Q_FILE(), JSON.stringify({
+      queue: AUTO_INGEST.queue, via: AUTO_INGEST.queue.via || {},
+      current: AUTO_INGEST.current, currentVia: AUTO_INGEST.currentVia || '',
+      done: AUTO_INGEST.done, ok: AUTO_INGEST.ok, fail: AUTO_INGEST.fail, total: AUTO_INGEST.total
+    }))
+  } catch (_) {}
+}
+function autoQLoad() {
+  try {
+    const d = JSON.parse(fs.readFileSync(AUTO_Q_FILE(), 'utf8'))
+    /* 手动单跑的任务也要能续：SCRAPE.code 有值且不在队列里 → 补进队首（重启后接着刮） */
+    let extra = []
+    if (SCRAPE.code && Array.isArray(d.queue) && d.queue.indexOf(SCRAPE.code) < 0 && !d.current) extra = [SCRAPE.code]
+    if (d.current && Array.isArray(d.queue) && d.queue.indexOf(d.current) < 0) extra = [d.current].concat(extra)
+    if (Array.isArray(d.queue) && d.queue.length) {
+      AUTO_INGEST.queue = d.queue; AUTO_INGEST.queue.via = d.via || {}
+      AUTO_INGEST.done = Number(d.done) || 0; AUTO_INGEST.ok = Number(d.ok) || 0; AUTO_INGEST.fail = Number(d.fail) || 0
+      for (const c of extra) { AUTO_INGEST.queue.unshift(c); AUTO_INGEST.queue.via[c] = '断点续跑' }
+      AUTO_INGEST.total = AUTO_INGEST.queue.length + AUTO_INGEST.done
+      autoQSave()
+      autoIngestRun().catch(() => {})
+      console.log('[auto-ingest] 恢复上次没跑完的队列：' + AUTO_INGEST.queue.length + ' 个番号' + (extra.length ? '（含中断的 ' + extra.join(',') + '）' : ''))
+    }
+  } catch (_) {}
+}
+
+/* ---------- 刮削历史（服务端常驻）：手动 / 订阅 / 扫描的每一次刮削成败都记一条，落盘重启不丢 ---------- */
+const SCRAPE_HIST = { loaded: false, list: [] }
+const SCRAPE_HIST_FILE = () => { try { return path.join(cacheDir(), 'scrape-history.json') } catch (_) { return '' } }
+function scrapeHistLoad() {
+  if (SCRAPE_HIST.loaded) return
+  SCRAPE_HIST.loaded = true
+  try { const a = JSON.parse(fs.readFileSync(SCRAPE_HIST_FILE(), 'utf8')); if (Array.isArray(a)) SCRAPE_HIST.list = a } catch (_) {}
+}
+function scrapeHistAdd(rec) {
+  scrapeHistLoad()
+  SCRAPE_HIST.list.push(rec)
+  if (SCRAPE_HIST.list.length > 600) SCRAPE_HIST.list = SCRAPE_HIST.list.slice(-600)
+  try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+}
+
+/* ---------- 订阅女优「全量作品自动入库」 ----------
+ * 和上面的 autoIngest 是两件事，别混：
+ *   autoIngest —— 每次检查订阅时，把「线上有、本机没有」的**新作**排进队列；actor 只翻前 2 页（≈20 部）。
+ *   这里       —— 订阅一个女优的**那一刻**，把她的**全部作品**翻页拉到底（可能几百部）再排队刮削。
+ * 开关：设置 → 偏好 → 「订阅女优后自动获取全部作品」（uiPrefs.subsfull，默认关）。
+ * 默认关的理由：热门女优几百部，一开就会连续刮很久、也吃线上配额，不该由代码替用户决定。 */
+const SUB_FULL = { running: false, name: '', subId: '', found: 0, page: 0, total: 0, err: '', at: 0, dry: false, expect: 0, terms: '', dropped: '', exact: false, note: '' }
+const subsFullOn = () => String((((CFG || {}).uiPrefs) || {}).subsfull || '') === '1'
+
+/* ---------- JavDB 女优代号（2026-10-03） ----------
+ * 网页 https://javdb.com/actors/A5yq 里的 A5yq 与 app API 的 actor id 是同一套：
+ * 实测 v1/actors/A5yq 直接 200，返回 葵司 / 别名「葵つかさ」/ videos_count 476。
+ * 有代号 = 100% 锁人，全量抓取不再需要「拿名字去搜然后猜是不是同一个人」。
+ * 注意：app API 没有「按 id 取作品」的端点（v1|v2/actors/{id}/videos 全 404），
+ * 作品列表仍要按名字翻页搜 —— 代号的作用是把「人」钉死，再用官方主名 + 全量别名去搜。 */
+function jdbActorCodeOf(input) {
+  const s = String(input || '').trim()
+  if (!s) return ''
+  const m = s.match(/javdb\.com\/actors\/([A-Za-z0-9]+)/i)
+  if (m) return m[1]
+  /* 裸代号只「可能」是代号（MIDE 也是合法的系列前缀）——add/update 里会用 v1/actors/{code}
+   * 实测验证，404 就退回普通名字订阅，不会误伤。 */
+  return /^[A-Za-z0-9]{3,6}$/.test(s) ? s : ''
+}
+async function onlineActorById(id) {
+  const j = await onlineGet('v1/actors/' + encodeURIComponent(String(id || '').trim()))
+  return ((((j || {}).data) || {}).actor) || null
+}
+/* 订阅对象填的是 JavDB 代号 / 女优页链接吗？命中 → 返回 { code, actor }（官方主名 + 全量别名 + 线上作品数） */
+async function onlineActorResolve(input) {
+  const code = jdbActorCodeOf(input)
+  if (!code) return null
+  try {
+    const d = await onlineActorById(code)
+    if (d && d.name) return { code, actor: d }
+  } catch (_) {}
+  return null
+}
+
+/* ---------- 库内女优 JavDB 代号回填（2026-10-03） ----------
+ * 给影片库（data.json items 的 actors）里每位演员查 JavDB 代号，存 cache/jdb-codes.json：
+ *   name -> { id, name, videos_count, at }（命中）或 { miss: 1, at }（线上查无此人，7 天后才重试）。
+ * 用途：① 订阅按名字添加时自动升级成 id 锁定（onlineActorSmartResolve）；
+ *      ② 女优详情页显示代号 + 直达 JavDB 女优页（免搜索）。
+ * 限速 350ms/人（每人一次 v2/search），匹配复用 onlineActorExact（精确同名 + 姓相同+名部=别名两步），
+ * 每查 10 个落一次盘，可断点续跑；启动时自动续跑没查完的。 */
+const JDB_CODE_FILE = () => path.join(cacheDir(), 'jdb-codes.json')
+let JDB_CODES = null
+function jdbCodeMap() {
+  if (JDB_CODES) return JDB_CODES
+  try { JDB_CODES = JSON.parse(fs.readFileSync(JDB_CODE_FILE(), 'utf8')) || {} } catch (_) { JDB_CODES = {} }
+  return JDB_CODES
+}
+function jdbCodeSave() {
+  try { fs.writeFileSync(JDB_CODE_FILE(), JSON.stringify(JDB_CODES || {})) } catch (_) {}
+}
+/* 目标名单：① 影片库里出现过的演员（原来的范围，几百人）
+ *          ② **整个女优名册 actresses.json（2.5 万人）** —— 命中后订阅/刮削/详情页全都受益，
+ *             所以回填目标是名册而非库；两者合并去重，谁还没查过就查谁。 */
+function jdbCodeTargets() {
+  const set = new Set()
+  for (const it of ((DATA && DATA.items) || [])) {
+    const a = it.actors
+    if (Array.isArray(a)) for (const x of a) { const n = String(x || '').trim(); if (n) set.add(n) }
+    else { const n = String(a || '').trim(); if (n) set.add(n) }
+  }
+  return [...set]
+}
+/* 不像人名的杂质直接跳过 —— 25,422 人的名册里混着乱码/片商前缀/标注串，
+ * 给它们发请求纯属浪费配额（还会平白把 miss 率拉高）。 */
+function jdbNamePlausible(n) {
+  if (!n || n.length < 2 || n.length > 20) return false
+  if (/^[\x20-\x7F]+$/.test(n)) return false                    // 纯 ASCII：片商前缀（ABP/IPZZ）/ 拉丁艺名
+  if (/[（(）)?？:：/\\|,，、]/.test(n)) return false           // 括号与标点：标注串/刮削残渣
+  if (/[0-9０-９]/.test(n)) return false                        // 含数字：场次编号类
+  return true
+}
+function jdbCodeRosterTargets() {
+  try {
+    const arr = JSON.parse(fs.readFileSync(path.join(UI_ROOT, 'actresses.json'), 'utf8'))
+    if (!Array.isArray(arr)) return []
+    const out = new Set()
+    for (const a of arr) {
+      const n = String((a && a.name) || '').trim()
+      if (jdbNamePlausible(n)) out.add(n)
+    }
+    return [...out]
+  } catch (_) { return [] }
+}
+/* 上次跑的模式（名册 / 库）落盘 —— 容器重启后要接着同一个模式跑，别掉回小范围 */
+const JDB_RUN_FILE = () => path.join(cacheDir(), 'jdb-codes-run.json')
+let JDB_RUN = { mode: 'lib' }
+function jdbRunLoad() { try { JDB_RUN = JSON.parse(fs.readFileSync(JDB_RUN_FILE(), 'utf8')) || JDB_RUN } catch (_) {} }
+function jdbRunSave() { try { fs.writeFileSync(JDB_RUN_FILE(), JSON.stringify(JDB_RUN)) } catch (_) {} }
+jdbRunLoad()
+let JDBCODE = { running: false, total: 0, done: 0, hits: 0, cur: '', stop: false, mode: '', phase: 0, etaMs: 0, reqs: 0, gap: 0, backoffs: 0, startedAt: 0 }
+async function jdbCodeBackfill({ mode = 'lib', phase = 2 } = {}) {
+  if (JDBCODE.running) return
+  const M = jdbCodeMap()
+  const names = mode === 'roster' ? jdbCodeRosterTargets() : jdbCodeTargets()
+  /* 没查过的全查；miss 的 7 天后才重试（线上收录会变） */
+  const targets = names.filter(n => {
+    const e = M[n]
+    return !e || (!e.id && Date.now() - (e.at || 0) > 7 * 864e5)
+  })
+  if (!targets.length) return
+  JDBCODE.running = true; JDBCODE.stop = false
+  JDBCODE.mode = mode; JDBCODE.phase = phase
+  JDBCODE.total = targets.length; JDBCODE.done = 0; JDBCODE.hits = 0
+  JDBCODE.startedAt = Date.now(); JDBCODE.etaMs = 0
+  /* 开启节流（自适应：起始 1100ms，成功逐步加速，失败立刻退避） */
+  RATE.on = true; RATE.gap = 1100; RATE.next = 0; RATE.backoffs = 0; RATE.reqs = 0
+  const deep = phase !== 1                      // phase 1 = 快扫：不做候选详情比对，省 80% 请求
+  try {
+    for (const name of targets) {
+      if (JDBCODE.stop) break
+      JDBCODE.cur = name; JDBCODE.done++
+      try {
+        const a = await onlineActorExact(name, { deep })
+        if (a && a.id) { M[name] = { id: a.id, name: a.name, videos_count: Number(a.videos_count) || 0, at: Date.now() }; JDBCODE.hits++ }
+        else M[name] = { miss: 1, at: Date.now() }
+      } catch (_) { M[name] = { miss: 1, at: Date.now() } }
+      if (JDBCODE.done % 10 === 0) jdbCodeSave()
+      /* ETA：先跑 20 个人校准出一个真实速率，之后每 200 人刷新一次 */
+      const el = Date.now() - JDBCODE.startedAt
+      if (JDBCODE.done === 20 || JDBCODE.done % 200 === 0) JDBCODE.etaMs = Math.round((el / JDBCODE.done) * (JDBCODE.total - JDBCODE.done))
+      JDBCODE.reqs = RATE.reqs; JDBCODE.gap = RATE.gap; JDBCODE.backoffs = RATE.backoffs
+    }
+  } finally {
+    jdbCodeSave()
+    RATE.on = false
+    JDBCODE.running = false; JDBCODE.cur = ''
+  }
+}
+/* 全量回填 = 两阶段：① 快扫（每人 1~2 次搜索，最快拿到大部分代号）
+ *                    ② 精查（只对没中的人做全变体 + 候选详情比对，也就是贵的第三次机会） */
+async function jdbCodeRunAll() {
+  JDB_RUN = { mode: 'roster' }; jdbRunSave()
+  await jdbCodeBackfill({ mode: 'roster', phase: 1 })
+  if (JDBCODE.stop) { JDB_RUN = { mode: 'lib' }; jdbRunSave(); return }
+  await jdbCodeBackfill({ mode: 'roster', phase: 2 })
+  await jdbCodeBackfill({ mode: 'lib', phase: 2 })
+  JDB_RUN = { mode: 'roster' }; jdbRunSave()
+}
+/* 订阅锁人三级跳：代号/链接 → 库内代号缓存（按名字命中，缓存过期会按 id 再验证）→ 名字精确匹配 */
+async function onlineActorSmartResolve(input) {
+  const direct = await onlineActorResolve(input).catch(() => null)
+  if (direct) return direct
+  const name = String(input || '').trim()
+  if (!name || jdbActorCodeOf(name)) return null
+  const e = jdbCodeMap()[name]
+  if (e && e.id) {
+    try {
+      const d = await onlineActorById(e.id)
+      if (d && d.name) return { code: e.id, actor: d }
+    } catch (_) {}
+  }
+  return null
+}
+
+/* 异体字归一（第三次机会比对用）：旧字体/假名汉字混淆形 —— 三上悠「亞」vs 三上悠「亜」、
+ * 水卜さくら 的「卜」线上常写作片假名「ト」等。只用于别名比对，不动原有 onNorm 精确逻辑。 */
+const JDB_VARMAP = { '卜': 'ト', '亞': '亜', '澁': '渋', '惠': '恵', '澤': '沢', '濱': '浜', '邊': '辺', '櫻': '桜', '圓': '円', '龜': '亀', '廣': '広', '德': '徳', '豐': '豊', '黑': '黒', '戶': '戸', '结': '結', '绪': '緒', '响': '響', '叶': '葉', '冈': '岡', '泽': '沢', '满': '満', '关': '関', '绘': '絵', '荣': '栄', '边': '辺', '滨': '浜' }
+const onNormVar = s => onNorm(onKana(String(s || ''))).replace(/./g, c => JDB_VARMAP[c] || c)
+
+/* 只认「精确同名」的女优（onlineActorFind 会兜底取首条，那对全量抓取太危险 ——
+ * 实测「恋れん」在线上搜不到同名，兜底返回的是「朝日奈花戀」，
+ * 拿她的别名去搜会把别人几百部片子整批刮进来）。 */
+/* 查询词变体（2026-10-03）：线上搜索对异体字不模糊（「波多野结衣」搜不到「結衣」）、
+ * 也不认「本名（备注）」整串 —— 依次试：原名 → 去括号 → 括号内真名 → 异体字归一 → 组合。
+ * 实测「ひなたなつ（日向なつ）」的真名在括号里、「百田光稀（百田光希）」两边都要能查。 */
+function onlineActorQueryVariants(name) {
+  const base = String(name || '').trim()
+  const inner = (base.match(/[（(]([^（）()]*)[）)]/) || [])[1] || ''
+  const nopp = base.replace(/[（(][^）)]*[）)]/g, '').trim()
+  const trans = s => String(s || '').replace(/./g, c => JDB_VARMAP[c] || c)
+  const out = [base, nopp, inner, trans(base), trans(nopp), trans(inner)].filter((x, i, a) => x && a.indexOf(x) === i)
+  return out
+}
+async function onlineActorExact(name, { deep = true } = {}) {
+  const n = onNorm(name)
+  if (!n) return null
+  let list = []
+  for (const q of onlineActorQueryVariants(name)) {
+    const j = await onlineGetPaced('v2/search?q=' + encodeURIComponent(q) + '&type=actor&page=1')
+    list = ((j || {}).data || {}).actors || []
+    if (list.length) break
+  }
+  for (const a of list) {
+    const names = [a.name, a.name_zht, a.other_name].filter(Boolean).join(',')
+    for (const x of String(names).split(',')) if (x && onNorm(x) === n) return a
+  }
+  /* 第二次机会（2026-10-03）：线上主名用字可能不同 —— 实测订阅「新井リマ」，线上主名是「新井莉麻」，
+   * 全名比对必不相等，但搜索结果里她的别名 other_name=りま,リマ 恰好就是订阅名的名部。
+   * 规则：**姓相同 + 名部等于某个别名（平/片假名不敏感）** → 也认作同一人。
+   * 对「恋れん」那种真·不同人仍然安全：她搜不到姓相同且别名正好是「れん」的人。 */
+  const qSur = onSurOf(name)
+  const qGiven = qSur && qSur.length < name.length ? name.slice(qSur.length) : ''
+  if (qSur && qGiven) for (const a of list) {
+    for (const nm of [a.name, a.name_zht]) {
+      if (!nm || !onNorm(nm).startsWith(onNorm(qSur))) continue   // 演员名以订阅名的「姓」开头（新井莉麻 ∋ 新井）
+      const aliases = String(a.other_name || '').split(',').map(x => onNorm(onKana(x)))
+      if (aliases.some(x => x && x === onNorm(onKana(qGiven)))) return a
+    }
+  }
+  /* 第三次机会（2026-10-03）：主名与查询名完全不同形 —— 实测「つぼみ」线上主名是「蕾」、
+   * 「あやみ旬果」是「彩美旬果」、「水卜さくら」是「水卜櫻」（别名还写作水「ト」さくら）。
+   * 拿搜索前 5 个候选的 v1 详情（全量别名）逐一比对，异体字归一（卜/ト、亞/亜…）后等值即认。
+   * deep=false（快扫阶段）跳过这一步 —— 2.5 万人每人再打 5 次详情太贵，留给第二轮只对 miss 的人做。 */
+  if (deep && list.length) {
+    const cands = list.slice(0, 5).slice().sort((x, y) => (Number(y.videos_count) || 0) - (Number(x.videos_count) || 0))
+    for (const a of cands) {
+      if (!a.id) continue
+      try {
+        const j = await onlineGetPaced('v1/actors/' + encodeURIComponent(a.id))
+        const d = ((((j || {}).data) || {}).actor) || {}
+        const names = [d.name, d.name_zht, d.other_name].filter(Boolean).join(',').split(',').map(x => onNormVar(x))
+        if (names.some(x => x && x === onNormVar(name))) {
+          return { id: a.id, name: d.name || a.name, name_zht: d.name_zht || a.name_zht, other_name: d.other_name || a.other_name, videos_count: Number(d.videos_count) || Number(a.videos_count) || 0 }
+        }
+      } catch (_) {}
+    }
+  }
+  return null
+}
+
+/* 全量抓取要搜哪些词：订阅名 + 精确同名时的别名。
+ * 为什么必须加别名：线上同一个人的主名常常是日文/罗马字 —— 实测「坂道美琉」直接搜只有 3 部，
+ * 她的别名 other_name=miru，线上记录（videos_count）是 255 部。不扩别名等于没抓。 */
+async function onlineActorSearchTerms(name, actorId) {
+  const base = String(name || '').trim()
+  const terms = []
+  const aliasDropped = []
+  const addTerm = (x) => { const t = String(x || '').trim(); if (t && t.length >= 2 && !terms.includes(t)) terms.push(t) }
+  addTerm(base)
+  let a = null
+  /* 有 JavDB 女优代号（订阅时填了代号/链接，或旧订阅已回填 actorId）→ 按 id 直取官方资料，
+   * 跳过整个「搜索结果里猜是哪位」环节，从根上消灭同名/用字不同误判。 */
+  if (actorId) { try { a = await onlineActorById(actorId) } catch (_) {} }
+  if (!a) { try { a = await onlineActorExact(base) } catch (_) {} }
+  /* ⚠️ 别名必须从 v1 详情取，不能只信 v2/search 的列表 —— 列表里的 other_name 是**残缺的**：
+   * 实测「坂道美琉」列表只给 `miru`（罗马字，搜出 103 部），
+   * 而 v1/actors/vd5z 详情里是 `坂道みる, miru`（日文名，搜出 276 部）。
+   * 只信列表 → 106 部；补上日文名 → 281 部（线上 videos_count 255）。差的就是这里。 */
+  if (a && a.id) {
+    try {
+      const j = await onlineGet('v1/actors/' + encodeURIComponent(a.id))
+      const d = ((((j || {}).data) || {}).actor) || {}
+      for (const f of [d.name, d.name_zht, d.other_name]) for (const x of String(f || '').split(',')) addTerm(x)
+      if (Number(d.videos_count)) a.videos_count = d.videos_count   // 详情更准（列表给 247，详情给 255）
+    } catch (_) {}
+  }
+  if (a) for (const f of [a.name, a.name_zht, a.other_name]) for (const x of String(f || '').split(',')) addTerm(x)
+  /* 泛化别名过滤（2026-10-03）：不含「姓」的纯名部（りま/リマ/miru）会把别人的片整批搜回来
+   * —— 实测搜「リマ」400 部起步，cap（线上记录 ×1.5）根本拦不住（新井リマ cap=983）。
+   * 保留：带姓的别名（坂道みる）/ 纯汉字全名（兒玉七海）/ 带空格的罗马字全名（Kodama Nanami）。 */
+  if (terms.length > 1) {
+    const surs = []
+    for (const cand of [base, a && a.name, a && a.name_zht].filter(Boolean)) {
+      const sp = onNmSplit(cand); if (sp) surs.push(onNorm(sp[0]))
+    }
+    const keepT = t => {
+      if (t === base) return true
+      const nt = onNorm(t)
+      if (surs.some(x => x && nt.includes(x))) return true
+      if (!/[\u3040-\u30ffa-z]/i.test(t)) return true   // 纯汉字全名
+      if (/ /.test(t)) return true                       // 罗马字全名
+      return false
+    }
+    for (let i = terms.length - 1; i >= 0; i--) if (!keepT(terms[i])) { aliasDropped.unshift(terms.splice(i, 1)[0]) }
+  }
+  return { terms: terms.slice(0, 6), actor: a, exact: !!a, expect: a ? (Number(a.videos_count) || 0) : 0, aliasDropped }
+}
+
+/* 某女优的**全部作品**：逐词翻页搜到底，合并去重。
+ * 泛化词过滤：别名（尤其罗马字如 miru）会搜出一堆别人的片。线上给了这位女优的作品数
+ * （videos_count），某词的结果超过它的 1.5 倍 + 10 就判定该词不可信、整词丢弃（宁可少不准多错）。 */
+async function onlineActorAllWorks(name, { maxPages = 0, meta: preMeta = null } = {}) {
+  const meta = preMeta || await onlineActorSearchTerms(name)
+  const cap = meta.expect > 0 ? Math.floor(meta.expect * 1.5) + 10 : 400
+  /* limit=50 是关键：v2/search 默认每页 10 条，且翻页有深度限制 —— 实测「三上悠亜」（线上记录 323）
+   * 用默认 limit 翻到第 20 页只有 186 部，换成 limit=50 只要 7 页就拿到 319 部。 */
+  const LIM = 50
+  const pgMax = maxPages || Math.min(30, Math.ceil((meta.expect || 200) / LIM) + 3)
+  const codes = []; const seen = new Set(); const dropped = []
+  let rounds = 0
+  for (const term of meta.terms) {
+    const got = new Set(); let pgs = 0
+    for (let pg = 1; pg <= pgMax; pg++) {
+      const j = await onlineGet('v2/search?q=' + encodeURIComponent(term) + '&type=movie&page=' + pg + '&limit=' + LIM)
+      const list = ((j || {}).data || {}).movies || []
+      pgs = pg
+      if (!list.length) break
+      for (const m of list) { const c = bare(m.number || m.code); if (c) got.add(c) }
+      if (got.size > cap) break             // 已能判定是泛化词（如「みる」921 部）→ 立刻停，别白翻十几页
+      if (list.length < LIM) break          // 不满一页 = 这个词已经到底
+    }
+    rounds += pgs
+    if (got.size > cap) { dropped.push(term + '（' + got.size + ' 部，超线上记录 ' + meta.expect + '，疑为同名泛化词）'); continue }
+    for (const c of got) if (!seen.has(c)) { seen.add(c); codes.push(c) }
+  }
+  return { codes, rounds, terms: meta.terms, expect: meta.expect, exact: meta.exact, dropped, matched: meta.actor ? meta.actor.name : '' }
+}
+
+/* dry = 只抓取、不入库：用于「先看看这位女优线上有多少部」的诊断，也方便无损验证抓取链路 */
+async function subsFullRun(sub, { dry = false } = {}) {
+  if (SUB_FULL.running) { SUB_FULL.err = '已有全量任务在跑（' + (SUB_FULL.name || '') + '）'; return }
+  SUB_FULL.running = true
+  SUB_FULL.name = sub.name; SUB_FULL.subId = sub.id || ''; SUB_FULL.dry = !!dry
+  SUB_FULL.found = 0; SUB_FULL.page = 0; SUB_FULL.total = 0; SUB_FULL.err = ''; SUB_FULL.at = Date.now()
+  SUB_FULL.expect = 0; SUB_FULL.terms = ''; SUB_FULL.dropped = ''; SUB_FULL.exact = false; SUB_FULL.note = ''
+  try {
+    const meta = await onlineActorSearchTerms(sub.name, sub.actorId)
+    SUB_FULL.exact = !!meta.exact; SUB_FULL.expect = meta.expect; SUB_FULL.terms = meta.terms.join(' / ')
+    /* 线上没有同名女优 → 直接跳过。
+     * 实测「恋れん」就是这样：线上搜不到这个名字的女优，硬搜却能返回 344 部，
+     * 里面绝大部分是名字含「れん」的**其他**女优 —— 照单全收等于把别人几百部片子刮进自己库。
+     * 这种情况只在 UI 提示「改用线上正式名字订阅」，不做任何入库。 */
+    if (!meta.exact) {
+      SUB_FULL.note = '线上没有同名女优（搜到的都是名字相近的别人），已跳过全量抓取'
+      SUB_FULL.found = 0; SUB_FULL.total = 0
+      return
+    }
+    const r = await onlineActorAllWorks(sub.name, { meta })
+    SUB_FULL.found = r.codes.length; SUB_FULL.page = r.rounds
+    SUB_FULL.expect = r.expect; SUB_FULL.terms = r.terms.join(' / '); SUB_FULL.dropped = r.dropped.join('；')
+    SUB_FULL.exact = !!r.exact
+    if ((meta.aliasDropped || []).length) SUB_FULL.dropped = (SUB_FULL.dropped ? SUB_FULL.dropped + '；' : '') + '泛化别名不搜：' + meta.aliasDropped.join(' / ')
+    if (r.codes.length >= 400) SUB_FULL.note = '线上搜索最多返回 400 部（翻页深度限制），她的线上记录是 ' + r.expect + ' —— 能搜到的已全部排队'
+    const local = new Set()
+    for (const it of ((DATA && DATA.items) || [])) if (it.code) local.add(bare(it.code))
+    for (const it of scrapedVirtualItems()) if (it.code) local.add(bare(it.code))
+    const fresh = r.codes.filter(c => !local.has(c))
+    SUB_FULL.total = fresh.length
+    if (fresh.length && !dry) autoIngestQueue(fresh, '订阅·全量')   // 复用同一条串行队列：不与手动刮削抢资源
+  } catch (e) { SUB_FULL.err = (e && e.message) || String(e) }
+  finally { SUB_FULL.running = false }
 }
 
 async function subsFeed(force) {
@@ -3663,6 +4270,7 @@ async function subsFeed(force) {
         /* 线上没有「按女优取作品」的接口，用搜索（搜索会匹配女优名）拉前两页 */
         const a = await onlineActorFind(s.name).catch(() => null)
         if (a) rec.onlineId = a.id
+        if (s.actorId) rec.onlineId = s.actorId   // 订阅时已按 JavDB 代号锁人的，直接用
         const acc = []
         for (const pg of [1, 2]) {
           const j = await onlineGet('v2/search?q=' + encodeURIComponent(s.name) + '&type=movie&page=' + pg)
@@ -3712,7 +4320,8 @@ async function subsFeed(force) {
     ok: true, at: Date.now(), items, subs: subOut, error: firstErr,
     online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK },
     stats: { subs: subs.length, active: subs.filter(x => x.active !== false).length, fresh: items.length, local: local.size },
-    autoIngest: { running: AUTO_INGEST.running, pending: AUTO_INGEST.queue.length, done: AUTO_INGEST.done, total: AUTO_INGEST.total, current: AUTO_INGEST.current, ok: AUTO_INGEST.ok, fail: AUTO_INGEST.fail }
+    autoIngest: { running: AUTO_INGEST.running, pending: AUTO_INGEST.queue.length, done: AUTO_INGEST.done, total: AUTO_INGEST.total, current: AUTO_INGEST.current, ok: AUTO_INGEST.ok, fail: AUTO_INGEST.fail },
+    subFull: Object.assign({ on: subsFullOn() }, SUB_FULL)
   }
   SUB_FEED = { at: Date.now(), data }
   try { writeCfg() } catch (_) {}
@@ -3899,18 +4508,54 @@ async function handleActorApi(req, res, p) {
   /* ---------- 订阅单（本地增删改；线上数据只读，不动 NAS） ---------- */
   if (p === '/api/subscriptions') {
     const subs = () => Array.isArray(CFG.subscriptions) ? CFG.subscriptions : []
-    if (req.method === 'GET') { const oc = onlineCfg(); return json(res, { ok: true, subs: subs(), online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK } }) }
+    if (req.method === 'GET') {
+      const oc = onlineCfg()
+      /* 本地写法反查：同一 JavDB 代号在库里的写法可能和线上官方名不同
+       * （「新井リマ」vs 官方「新井莉麻」、「坂道みる」vs「坂道美琉」），
+       * 把库内所有指向同一代号的名字一并带回去 —— 女优页 / 女优列表才能认出「已订阅」。 */
+      /* ⚠ 变量名不能叫 subs —— 外层 const subs 是「取订阅数组」的函数，
+       *    同名 let 会在同一作用域里触发 TDZ（Cannot access 'subs' before initialization）。 */
+      let subsOut = subs()
+      try {
+        const M = jdbCodeMap(), byCode = {}
+        for (const k of Object.keys(M)) {
+          const id = (M[k] || {}).id
+          if (!id) continue
+          ;(byCode[id] = byCode[id] || []).push(k)
+        }
+        subsOut = subsOut.map(s => {
+          const locals = (s.kind === 'actor' && s.actorId && byCode[s.actorId]) ? byCode[s.actorId].slice(0, 20) : []
+          return locals.length ? Object.assign({}, s, { locals }) : s
+        })
+      } catch (_) {}
+      return json(res, {
+        ok: true, subs: subsOut, online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK },
+        full: Object.assign({ on: subsFullOn() }, SUB_FULL)      // 全量入库开关 + 当前进度（前端订阅页展示）
+      })
+    }
     const action = String(body.action || '')
     const list = subs().slice()
     if (action === 'add') {
-      const kind = ['actor', 'series', 'code'].includes(body.kind) ? body.kind : 'actor'
-      const name = String(body.name || '').trim()
+      /* maker = 片商：没有专属作品端点，和 series 一样走 v2/search 关键词匹配 */
+      const kind = ['actor', 'series', 'maker', 'code'].includes(body.kind) ? body.kind : 'actor'
+      let name = String(body.name || '').trim()
       const query = String(body.query || name).trim()
       if (!name) return json(res, { ok: false, error: '请填写订阅对象' })
-      if (list.some(x => x.kind === kind && String(x.name) === name)) return json(res, { ok: true, subs: list, dup: true })
+      /* 女优订阅锁人三级跳（onlineActorSmartResolve）：
+       * ① JavDB 代号/链接（如 A5yq）→ ② 库内代号缓存按名字命中 → ③ 退回普通名字订阅。
+       * 命中 → 订阅名统一成线上官方主名 + 记下 actorId，全量抓取按 id 锁人。 */
+      let actorId = ''
+      let viaCode = false
+      let hit = null
+      if (kind === 'actor') {
+        hit = await onlineActorSmartResolve(String(body.actorId || '').trim() || name).catch(() => null)
+        if (hit) { actorId = hit.code; name = hit.actor.name; viaCode = true }
+      }
+      if (list.some(x => (actorId && x.actorId === actorId) || (x.kind === kind && String(x.name) === name))) return json(res, { ok: true, subs: list, dup: true })
       const rec = {
         id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        kind, name, query,
+        kind, name, query: viaCode ? name : query, actorId,
+        videosCount: viaCode ? (Number(((hit || {}).actor || {}).videos_count) || 0) : 0,
         quality: String(body.quality || ''), requireSub: !!body.requireSub, requireUncensored: !!body.requireUncensored,
         minSizeMb: Number(body.minSizeMb) || 0, maxSizeMb: Number(body.maxSizeMb) || 0,
         autoIngest: !!body.autoIngest,      // 自动入库：默认关。开了才会把该订阅的线上新作自动刮进离线数据
@@ -3918,7 +4563,10 @@ async function handleActorApi(req, res, p) {
         active: true, createdAt: new Date().toISOString(), lastCheckedAt: ''
       }
       list.push(rec); CFG.subscriptions = list; writeCfg(); SUB_FEED = { at: 0, data: null }
-      return json(res, { ok: true, subs: list, added: rec })
+      /* 订阅女优 + 开关开着 → 立刻去线上把她的全部作品翻页拉全，排队刮进离线数据（不等订阅页刷新） */
+      const fullGrab = kind === 'actor' && subsFullOn()
+      if (fullGrab) subsFullRun(rec).catch(() => {})
+      return json(res, { ok: true, subs: list, added: rec, fullGrab })
     }
     if (action === 'remove') {
       const id = String(body.id || '')
@@ -3935,16 +4583,67 @@ async function handleActorApi(req, res, p) {
     if (action === 'update') {
       const id = String(body.id || '')
       const patch = {}
-      if (body.kind !== undefined && ['actor', 'series', 'code'].includes(body.kind)) patch.kind = body.kind
+      if (body.kind !== undefined && ['actor', 'series', 'maker', 'code'].includes(body.kind)) patch.kind = body.kind
       ;['name', 'query', 'quality', 'note'].forEach(k => { if (body[k] !== undefined) patch[k] = String(body[k]) })
+      /* 编辑女优订阅时把名字换成 JavDB 代号/链接（或库内已回填过代号的名字）→ 按 id 锁人。
+       * ⚠ 名字改成非代号时必须**清空** actorId —— 残留旧代号会让全量抓取按旧人锁定，
+       * 而搜索词又来自新名字，两拨人的作品会混在一起（实测踩过：A5yq 改成三上悠亜后代号没清）。 */
+      if ((patch.kind || (list.find(x => x.id === id) || {}).kind) === 'actor' && patch.name !== undefined) {
+        const hit2 = await onlineActorSmartResolve(patch.name).catch(() => null)
+        if (hit2) {
+          patch.name = hit2.actor.name
+          patch.actorId = hit2.code
+          if (body.query === undefined) patch.query = patch.name
+          patch.videosCount = Number(hit2.actor.videos_count) || 0
+        } else {
+          patch.actorId = ''
+          patch.videosCount = 0
+        }
+      }
       ;['requireSub', 'requireUncensored', 'autoIngest'].forEach(k => { if (body[k] !== undefined) patch[k] = !!body[k] })
       ;['minSizeMb', 'maxSizeMb'].forEach(k => { if (body[k] !== undefined) patch[k] = Number(body[k]) || 0 })
       CFG.subscriptions = list.map(x => x.id === id ? Object.assign({}, x, patch) : x)
       writeCfg(); SUB_FEED = { at: 0, data: null }
       return json(res, { ok: true, subs: CFG.subscriptions })
     }
+    /* 手动对一个「已订阅」的女优补全全部作品（开关是自动触发，这条是补课入口） */
+    if (action === 'full') {
+      const id = String(body.id || '')
+      const s = list.find(x => x.id === id)
+      if (!s) return json(res, { ok: false, error: '订阅不存在' })
+      if (s.kind !== 'actor') return json(res, { ok: false, error: '只有「女优」订阅支持全量拉取' })
+      if (SUB_FULL.running) return json(res, { ok: false, error: '已有全量任务在跑：' + (SUB_FULL.name || '') })
+      subsFullRun(s, { dry: !!body.dry }).catch(() => {})
+      return json(res, { ok: true, started: true, name: s.name, dry: !!body.dry })
+    }
     if (action === 'feed-reset') { SUB_FEED = { at: 0, data: null }; return json(res, { ok: true }) }
     return json(res, { ok: false, error: '未知操作：' + action })
+  }
+  /* 库内女优 JavDB 代号：GET 查 map+进度；POST start/stop/clear/one（one = 单个即时补查） */
+  if (p === '/api/jdbcodes') {
+    if (req.method === 'GET') return json(res, { ok: true, map: jdbCodeMap(), status: JDBCODE })
+    const act = String(body.action || '')
+    if (act === 'start') { jdbCodeBackfill({ mode: body.mode === 'roster' ? 'roster' : 'lib', phase: 2 }).catch(() => {}); return json(res, { ok: true, started: true, status: JDBCODE }) }
+    /* 全名册回填（2.5 万人）：先快扫再精查，内部自适应限速 + 断点续跑 */
+    if (act === 'start-all') { jdbCodeRunAll().catch(() => {}); return json(res, { ok: true, started: true, status: JDBCODE }) }
+    if (act === 'stop') { JDBCODE.stop = true; RATE.on = false; return json(res, { ok: true }) }
+    if (act === 'clear') { JDB_CODES = {}; jdbCodeSave(); return json(res, { ok: true }) }
+    if (act === 'retry-miss') {   // 清掉 miss 记录后精查一轮（匹配规则升级 / 想复查时用）
+      const M = jdbCodeMap()
+      for (const k of Object.keys(M)) if (!M[k].id) delete M[k]
+      jdbCodeSave()
+      jdbCodeBackfill({ mode: (JDB_RUN.mode === 'roster' || body.mode === 'roster') ? 'roster' : 'lib', phase: 2 }).catch(() => {})
+      return json(res, { ok: true, started: true, status: JDBCODE })
+    }
+    if (act === 'one') {
+      const name = String(body.name || '').trim()
+      if (!name) return json(res, { ok: false, error: '缺少 name' })
+      const a = await onlineActorExact(name).catch(() => null)
+      const M = jdbCodeMap()
+      if (a && a.id) { M[name] = { id: a.id, name: a.name, videos_count: Number(a.videos_count) || 0, at: Date.now() }; jdbCodeSave() }
+      return json(res, { ok: true, hit: !!(a && a.id), code: a ? a.id : '', name: a ? a.name : '', videos_count: (a && a.videos_count) || 0 })
+    }
+    return json(res, { ok: false, error: '未知操作：' + act })
   }
   /* 订阅 → 线上新作（线上有、本机没有的） */
   if (p === '/api/subscriptions/feed') {
@@ -4521,7 +5220,7 @@ async function handleActorApi(req, res, p) {
       return json(res, {
         ok: true, running: ROSTER_SYNC.running, phase: ROSTER_SYNC.phase, error: ROSTER_SYNC.error,
         count: rosterCount(), last: st.last || 0, before: st.before || 0, remote: st.remote || 0,
-        added: st.added || 0, skipped: !!st.skipped, note: st.note || '', remoteSize: st.remoteSize || 0,
+        added: st.added || 0, filled: st.filled || 0, skipped: !!st.skipped, note: st.note || '', remoteSize: st.remoteSize || 0,
         auto: CFG.rosterSync !== false, hour: rosterSyncHour()
       })
     }
@@ -4671,6 +5370,7 @@ async function handleActorApi(req, res, p) {
           waist: nocm(rr.waist), hip: nocm(rr.hip), shoe: nocm(rr.shoe),
           blood: rr.blood || '', place: rr.place || '', hobby: rr.hobby || '',
           period: rr.period || '', debut: rr.debut || '', agency: rr.agency || '', blog: rr.blog || '',
+          nick: rr.nick || '', official: rr.official || '',
           avatarUrl: '',   // 头像由 avatarOnline 的 relay 链路兜底，不走 minnano 直连
           alias: Array.isArray(rr.alias) ? rr.alias : [], tags: Array.isArray(rr.tags) ? rr.tags : [],
           rel: Array.isArray(rr.rel) ? rr.rel : []
@@ -4707,6 +5407,8 @@ async function handleActorApi(req, res, p) {
       put('debut', prof.debut, '出道作品')
       put('agency', prof.agency, '事务所')
       put('blog', prof.blog, '博客')
+      put('nick', prof.nick, '爱称')
+      put('official', prof.official, '官网')
       if (Array.isArray(prof.tags) && prof.tags.length && JSON.stringify(prof.tags) !== JSON.stringify(rec.tags || [])) { patch.tags = prof.tags; changes.push('标签') }
       if (Array.isArray(prof.rel) && prof.rel.length && JSON.stringify(prof.rel) !== JSON.stringify(rec.rel || [])) { patch.rel = prof.rel; changes.push('相关女优') }
       if (!rec.msrc) patch.msrc = MN_BASE + 'actress' + mnid + '.html'
@@ -5066,7 +5768,7 @@ async function handleActorApi(req, res, p) {
   }
   /* ---------- 在线刮削（添加本地库没有的影片） ---------- */
   if (p === '/api/scrape/start') {
-    if (SCRAPE.running) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
+    const wantQueue = body.queue === true || body.queue === 'front'
     let code = String(body.code || '').trim().toUpperCase()
     const fromUrl = scCodeFromUrl(body.code) || scCodeFromUrl(body.url)   // 直接粘详情页网址也认
     if (fromUrl) code = fromUrl
@@ -5082,11 +5784,91 @@ async function handleActorApi(req, res, p) {
     code = code ? parseName(code + '.mp4').code : ''
     /* 日期式无码番号（082926-001 / 100323_01）是纯数字，不能按「必须含字母」拒掉 */
     if (!code || !(/^\d{6}-\d{2,4}$/.test(code) || (/[A-Z]/.test(code) && /\d/.test(code)))) return json(res, { ok: false, error: '无法识别番号：请填形如 STARS-238 或 092126-001 的番号、含 <num> 的 NFO，或详情页网址' })
-    const job = { code, url: String(body.url || '').trim(), sourceId: String(body.sourceId || '').trim(), nfo, full: !!body.full }
+    /* 服务端一次只跑一部。默认仍直接拒（老调用方靠这个错误判断"没启动"）；
+       带 queue 的手动添加改成排进服务端持久队列 —— 订阅全量动辄几百部，
+       否则批量没跑完时点「加入离线数据」只会拿到一句"正在刮削 X，请等它完成"。 */
+    if (SCRAPE.running) {
+      if (!wantQueue) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
+      const pos = autoIngestQueue([code], '手动', body.queue === 'front')
+      return json(res, { ok: true, code, queued: true, pos, pending: AUTO_INGEST.queue.length })
+    }
+    const job = { code, url: String(body.url || '').trim(), sourceId: String(body.sourceId || '').trim(), nfo, full: !!body.full, via: '手动' }
+    /* 单跑任务也记进落盘：中途重启/崩溃时 autoQLoad 会把它补回队首接着刮（不记就丢了） */
+    AUTO_INGEST.current = code; AUTO_INGEST.currentVia = '手动'; autoQSave()
     scrapeAsync(job).catch(() => {})
     return json(res, { ok: true, code })
   }
-  if (p === '/api/scrape/status') return json(res, Object.assign({ ok: true }, SCRAPE))
+  if (p === '/api/scrape/status') return json(res, Object.assign({ ok: true }, SCRAPE, {
+    /* 入库队列进度：前端的「排队中」要显示真实位次/剩余量，否则整批计时器会被误读成单条耗时 */
+    queue: {
+      pending: AUTO_INGEST.queue.length, current: AUTO_INGEST.current,
+      done: AUTO_INGEST.done, ok: AUTO_INGEST.ok, fail: AUTO_INGEST.fail,
+      total: AUTO_INGEST.total, running: AUTO_INGEST.running, paused: !!AUTO_INGEST.paused
+    }
+  }))
+  /* ---------- 卡住时的自救工具箱（2026-10-03） ----------
+   * 以前「刮削卡住 / 队列太长」除了重启容器没有别的办法，现在：
+   *   stop    中止当前这部（逐阶段检查 SCRAPE.stop，不会写出半成品 meta）
+   *   pause   暂停队列（保留不跑，随时恢复）
+   *   resume  恢复队列
+   *   clear   清空待跑队列（已入库的不受影响）
+   *   remove  把某一部从队列里去掉
+   *   front   把某一部提到队首（手动优先于订阅批量） */
+  if (p === '/api/scrape/stop') {
+    if (!SCRAPE.running) return json(res, { ok: true, already: true })
+    SCRAPE.stop = true; SCRAPE.phase = '正在停止'
+    scLog('收到手动停止指令，正在收尾…')
+    return json(res, { ok: true, stopping: true, code: SCRAPE.code })
+  }
+  if (p === '/api/scrape/queue') {
+    if (req.method === 'GET') {
+      return json(res, {
+        ok: true, pending: AUTO_INGEST.queue.length, current: AUTO_INGEST.current,
+        done: AUTO_INGEST.done, okN: AUTO_INGEST.ok, fail: AUTO_INGEST.fail,
+        total: AUTO_INGEST.total, running: AUTO_INGEST.running, paused: !!AUTO_INGEST.paused,
+        head: AUTO_INGEST.queue.slice(0, 20),
+        scraping: SCRAPE.running ? { code: SCRAPE.code, phase: SCRAPE.phase, pct: SCRAPE.pct } : null
+      })
+    }
+    const act = String(body.action || '')
+    const q = AUTO_INGEST.queue
+    if (act === 'pause') { AUTO_INGEST.paused = true; return json(res, { ok: true, paused: true }) }
+    if (act === 'resume') {
+      AUTO_INGEST.paused = false; autoQSave()
+      autoIngestRun().catch(() => {})
+      return json(res, { ok: true, paused: false })
+    }
+    if (act === 'clear') {
+      const n = q.length
+      q.length = 0; AUTO_INGEST.paused = false; autoQSave()
+      console.log('[auto-ingest] 手动清空队列：' + n + ' 个番号')
+      return json(res, { ok: true, cleared: n, pending: 0 })
+    }
+    const code = String(body.code || '').trim().toUpperCase()
+    if (act === 'remove' && code) {
+      const i = q.indexOf(code)
+      if (i >= 0) { q.splice(i, 1); autoQSave(); return json(res, { ok: true, removed: code, pending: q.length }) }
+      return json(res, { ok: true, removed: '', pending: q.length })
+    }
+    if (act === 'front' && code) {
+      const i = q.indexOf(code)
+      if (i > 0) { q.splice(i, 1); q.unshift(code) }
+      else if (i < 0) { q.unshift(code); q.via = q.via || {}; q.via[code] = '手动' }
+      autoQSave(); autoIngestRun().catch(() => {})
+      return json(res, { ok: true, pos: q.indexOf(code) + 1, pending: q.length })
+    }
+    return json(res, { ok: false, error: '未知操作：' + act })
+  }
+  /* ---- 刮削历史（添加影片页「历史记录」栏）：GET 取（新→旧），POST {action:'clear'} 清空 ---- */
+  if (p === '/api/scrape/history') {
+    scrapeHistLoad()
+    if (req.method === 'POST') {
+      if ((body || {}).action === 'clear') { SCRAPE_HIST.list = []; try { fs.writeFileSync(SCRAPE_HIST_FILE(), '[]') } catch (_) {} }
+      return json(res, { ok: true, total: SCRAPE_HIST.list.length })
+    }
+    const lim = Math.min(600, Math.max(1, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 120))
+    return json(res, { ok: true, total: SCRAPE_HIST.list.length, list: SCRAPE_HIST.list.slice(-lim).reverse() })
+  }
   /* ---- 离线数据导入（添加影片页）：把按番号命名的缓存文件夹（meta.json + images/ + movie.nfo）拷回 cache/movies ---- */
   if (p === '/api/offline/scan') {
     try { return json(res, { ok: true, dir: String(body.dir || '').trim(), items: offlineScan(body.dir) }) }
@@ -5358,6 +6140,7 @@ function localSourceForCode(code) {
     const imgDirAbs = path.join(cacheDir(), 'movies', code.replace(/[^\w.-]/g, '_'), 'images')
     return json(res, {
       ok: true, code, fields: m.fields, images: imgs, sources, sourceData: srcVals,
+      offFilm: m.offFilm || null,
       sourcesAll: scrapeSourcesOverview(code, m),
       local: loc ? { values: loc.values, hasPoster: !!loc.posterPath, hasFanart: !!loc.fanartPath } : null,
       paths: {
@@ -5945,7 +6728,7 @@ try { if (!fs.existsSync(EXTRA_ROSTER)) fs.writeFileSync(EXTRA_ROSTER, '[]') } c
  * 默认每天 04:00 同步（CFG.rosterSyncHour 可改），CFG.rosterSync === false 可关闭。 */
 const RELAY_ROSTER_API = RELAY_API + 'roster.json'
 const ROSTER_SYNC_STATE = path.join(UI_ROOT, 'roster-sync-state.json')
-const ROSTER_SYNC = { running: false, phase: '', last: 0, ok: false, remote: 0, before: 0, added: 0, error: '', skipped: false, note: '', remoteSize: 0 }
+const ROSTER_SYNC = { running: false, phase: '', last: 0, ok: false, remote: 0, before: 0, added: 0, filled: 0, error: '', skipped: false, note: '', remoteSize: 0 }
 function rosterSyncState() { try { return JSON.parse(fs.readFileSync(ROSTER_SYNC_STATE, 'utf8')) || {} } catch (_) { return {} } }
 function rosterSyncHour() { const h = parseInt(CFG.rosterSyncHour, 10); return isNaN(h) ? 4 : Math.max(0, Math.min(23, h)) }
 function rosterSyncLast() { return +rosterSyncState().last || 0 }
@@ -5954,7 +6737,7 @@ function rosterSyncSave() {
   try {
     fs.writeFileSync(ROSTER_SYNC_STATE, JSON.stringify({
       last: ROSTER_SYNC.last, remote: ROSTER_SYNC.remote, before: ROSTER_SYNC.before,
-      added: ROSTER_SYNC.added, ok: ROSTER_SYNC.ok, skipped: ROSTER_SYNC.skipped,
+      added: ROSTER_SYNC.added, filled: ROSTER_SYNC.filled, ok: ROSTER_SYNC.ok, skipped: ROSTER_SYNC.skipped,
       note: ROSTER_SYNC.note, error: ROSTER_SYNC.error, remoteSize: ROSTER_SYNC.remoteSize
     }))
   } catch (_) {}
@@ -5995,24 +6778,48 @@ async function rosterSyncOnce(tag) {
     if (!Array.isArray(remote) || !remote.length) throw new Error('远端名册为空或格式异常')
     const before = rosterCount()
     ROSTER_SYNC.remote = remote.length; ROSTER_SYNC.before = before
-    /* ③ 安全阀：远端不比本地全就绝不覆盖 */
-    if (remote.length <= before) {
-      ROSTER_SYNC.ok = true; ROSTER_SYNC.skipped = true; ROSTER_SYNC.phase = '跳过'
-      ROSTER_SYNC.note = '远端 ' + remote.length + ' ≤ 本地 ' + before + '，不覆盖'
-      ROSTER_SYNC.remoteSize = rz || buf.length
-      ROSTER_SYNC.last = Date.now(); rosterSyncSave()
-      console.log('[roster-sync] ' + tag + '：' + ROSTER_SYNC.note)
-      return { ok: true, skipped: true, remote: remote.length, before, note: ROSTER_SYNC.note }
+    /* ③ 合并写回（2026-10-02 改造，原来是「远端条数更多才整体覆盖」）：
+     * 远端 CI 会全量补资料（愛称/公式サイト/现用名 mcanon/别名/标签…），条数不一定比本地多
+     * （本地手工补过的人不在远端），按条数做安全阀会把补全的资料永远挡在门外。
+     * 改成逐条合并 —— 只「填空」不覆盖：本地已有值的字段一律保留，远端只补本地为空的字段，
+     * 远端独有的女优整条追加。任何方向的回退都不可能发生。 */
+    const MERGE_FILL = ['furi', 'birthday', 'height', 'breast', 'cup', 'waist', 'hip', 'shoe',
+      'blood', 'place', 'hobby', 'period', 'debut', 'agency', 'blog', 'nick', 'official',
+      'mcanon', 'mimg', 'msrc', 'icon', 'iconRemote', 'debutDate', 'videoCount', 'type',
+      'name_ja', 'name_zh', 'name_en']
+    const isEmpty = v => v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length)
+    const byMnid = new Map(), byName = new Map()
+    let list
+    try { list = JSON.parse(fs.readFileSync(ROSTER, 'utf8')) } catch (_) { list = [] }
+    for (const a of list) {
+      if (!a) continue
+      const k = String(a.mnid || '').replace(/\D/g, '')
+      if (k && !byMnid.has(k)) byMnid.set(k, a)
+      const nk = cnormJa(a.name)
+      if (nk && !byName.has(nk)) byName.set(nk, a)
+      if (Array.isArray(a.alias)) for (const x of a.alias) { const ak = cnormJa(x); if (ak && !byName.has(ak)) byName.set(ak, a) }
+    }
+    let addedN = 0, filled = 0
+    for (const r of remote) {
+      if (!r) continue
+      const k = String(r.mnid || '').replace(/\D/g, '')
+      let a = k ? byMnid.get(k) : null
+      if (!a) { const nk = cnormJa(r.name); if (nk) a = byName.get(nk) }
+      if (!a) { list.push(r); if (k) byMnid.set(k, r); const nk = cnormJa(r.name); if (nk) byName.set(nk, r); addedN++; continue }
+      for (const f of MERGE_FILL) if (isEmpty(a[f]) && !isEmpty(r[f])) { a[f] = r[f]; filled++ }
+      if (isEmpty(a.alias) && Array.isArray(r.alias) && r.alias.length) a.alias = r.alias
+      if (isEmpty(a.tags) && Array.isArray(r.tags) && r.tags.length) a.tags = r.tags
+      if (isEmpty(a.rel) && Array.isArray(r.rel) && r.rel.length) a.rel = r.rel
     }
     ROSTER_SYNC.phase = '写回'
     const tmp = ROSTER + '.sync'
-    fs.writeFileSync(tmp, buf); fs.renameSync(tmp, ROSTER)
+    fs.writeFileSync(tmp, JSON.stringify(list, dropEmpty)); fs.renameSync(tmp, ROSTER)
     AVA_ONLINE_INDEX = null                    // 名册换了 → 头像在线索引作废
-    ROSTER_SYNC.added = remote.length - before; ROSTER_SYNC.ok = true; ROSTER_SYNC.phase = '完成'
+    ROSTER_SYNC.added = addedN; ROSTER_SYNC.filled = filled; ROSTER_SYNC.ok = true; ROSTER_SYNC.phase = '完成'
     ROSTER_SYNC.remoteSize = rz || buf.length
     ROSTER_SYNC.last = Date.now(); rosterSyncSave()
-    console.log('[roster-sync] ' + tag + '：名册已更新 ' + before + ' → ' + remote.length + '（+' + ROSTER_SYNC.added + '）')
-    return { ok: true, before, remote: remote.length, added: ROSTER_SYNC.added }
+    console.log('[roster-sync] %s：合并完成 远端 %d / 本地 %d → 新增 %d 人、补全字段 %d 处', tag, remote.length, before, addedN, filled)
+    return { ok: true, before, remote: remote.length, added: addedN, filled }
   } catch (e) {
     /* 失败**不**更新 last（last 只记「上次成功」）→ 定时器隔 1 小时会再试，
      * 否则一次网络抖动就把当天机会用光、要等明天。 */
@@ -6377,7 +7184,7 @@ const server = http.createServer((req, res) => {
         p === '/api/userdata' ||
         p === '/api/movie/delete' ||
         p === '/api/backup' || p === '/api/login' ||
-        p === '/api/favorites' || p === '/api/subscriptions' || p === '/api/subscriptions/feed' ||
+        p === '/api/favorites' || p === '/api/subscriptions' || p === '/api/subscriptions/feed' || p === '/api/jdbcodes' ||
         p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/direct' || p === '/api/online/image' || p === '/api/online/config' ||
         p === '/api/online/detail' || p === '/api/online/reviews' || p === '/api/online/board' || p === '/api/online/search' || p === '/api/online/actor' ||
         p === '/api/online/actor_movies' ||
@@ -6394,6 +7201,7 @@ const server = http.createServer((req, res) => {
         !(p === '/api/favorites' && req.method === 'GET') &&
         !(p === '/api/subscriptions' && req.method === 'GET') &&
         !(p === '/api/subscriptions/feed' && req.method === 'GET') &&
+        !(p === '/api/jdbcodes' && req.method === 'GET') &&
         !(p.startsWith('/api/online/') && req.method === 'GET') &&
         !(p === '/api/115/config' && req.method === 'GET') &&
         !(p === '/api/115/dirs' && req.method === 'GET') &&
@@ -6408,8 +7216,12 @@ const server = http.createServer((req, res) => {
       return
     }
     if (p.startsWith('/api/scrape/') || p.startsWith('/api/images/')) {
-      const isGet = p === '/api/scrape/status' || p === '/api/scrape/list' || p === '/api/scrape/meta'
-      if (isGet ? req.method !== 'GET' : req.method !== 'POST') { res.writeHead(405); return res.end() }
+      const isGet = p === '/api/scrape/status' || p === '/api/scrape/list' || p === '/api/scrape/meta' ||
+        (p === '/api/scrape/history' && req.method === 'GET')
+      /* 队列端点两种方法都要：GET 查状态 / POST 暂停·继续·清空·插队·移除。
+       * ⚠️ 别把它塞进 isGet —— 那样 POST 会被 405 挡掉（改队列管理时踩过）。 */
+      const bothWays = p === '/api/scrape/queue'
+      if (!bothWays && (isGet ? req.method !== 'GET' : req.method !== 'POST')) { res.writeHead(405); return res.end() }
       handleActorApi(req, res, p).catch(e => json(res, { ok: false, error: e.message }))
       return
     }
@@ -6565,6 +7377,13 @@ server.listen(PORT, '0.0.0.0', () => {
   /* 115 推送自动认领：恢复上次没盯完的任务（服务重启不丢） */
   w115Load()
   if (W115.jobs.some(j => j.status === 'watching')) setTimeout(w115Pump, 30000)
+  /* 订阅/扫描自动入库队列：恢复上次没跑完的（服务重启不丢） */
+  autoQLoad()
+  /* 女优 JavDB 代号回填：断点续跑 —— 接着上次跑的模式（名册全量 / 仅影片库）继续 */
+  setTimeout(() => {
+    const fn = JDB_RUN.mode === 'roster' ? jdbCodeRunAll() : jdbCodeBackfill({ mode: 'lib', phase: 2 })
+    fn.catch(() => {})
+  }, 20000)
 })
 
 process.on('SIGINT', () => { console.log('\n已停止'); process.exit(0) })

@@ -437,6 +437,8 @@ function parseProfilePage(html) {
     blood: kv['血液型'] || '', place: kv['出身地'] || '', hobby: kv['趣味・特技'] || '',
     period: kv['AV出演期間'] || '', debut: kv['デビュー作品'] || '',
     agency: kv['所属事務所'] || '', blog: kv['ブログ'] || '',
+    /* 愛称（こなみん 这类圈内昵称）与 公式サイト（事务所官方页）—— 2026-10-02 补全 */
+    nick: kv['愛称'] || '', official: kv['公式サイト'] || '',
     alias: alias.filter(Boolean), tags, rel
   }
 }
@@ -491,6 +493,8 @@ async function stageProfiles(list) {
     if (p.agency) a.agency = p.agency
     if (p.debut) a.debut = p.debut
     if (p.blog) a.blog = p.blog
+    if (p.nick) a.nick = p.nick
+    if (p.official) a.official = p.official
     if (p.alias && p.alias.length) a.alias = p.alias
     if (p.tags && p.tags.length) a.tags = p.tags
     if (p.rel && p.rel.length) a.rel = p.rel.map(x => String((x && x.id) || '')).filter(Boolean)
