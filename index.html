@@ -772,6 +772,11 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   .mvs-empty { color: #6d6d7a; font-size: 12.5px; }
   .mvs-note { font-size: 11.5px; color: #6d6d7a; margin-top: 12px; line-height: 1.7; }
   .mvs-note b { color: #9b9ba6; }
+  /* 同名不同作品（番号撞车）警告：多源聚合把另一部片的字段缝进来的话，必须让用户看见 */
+  .mvs-warn { margin-top: 10px; padding: 9px 12px; border-radius: 9px; font-size: 11.5px; line-height: 1.75;
+    background: rgba(214,140,60,.12); border: 1px solid rgba(214,140,60,.42); color: #c88a3c; }
+  .mvs-warn b { color: #e8b271; }
+  .mvs-warn em { font-style: normal; color: #e8b271; }
   /* 手动编辑字段 */
   .mvs-edit { border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 2px 6px; border-radius: 6px; vertical-align: middle; }
   .mvs-edit:hover { background: rgba(var(--accent-rgb),.12); color: var(--accent); }
@@ -2105,6 +2110,25 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
   .at-btn { font: inherit; font-size: 11.5px; padding: 4px 10px; border-radius: 7px; cursor: pointer; background: rgba(255,255,255,.05); color: var(--text-dim); border: 1px solid rgba(255,255,255,.12); }
   .at-btn:hover { border-color: var(--accent); color: #fff; }
   .at-empty { font-size: 12px; color: var(--text-dim); line-height: 1.75; padding: 16px 6px; text-align: center; }
+  /* ---- 刮削历史（服务端常驻）：序号 / 番号 / 成败 / 来源站 / 途径 / 时间 ---- */
+  .at-hist { margin-top: 14px; border-top: 1px dashed rgba(255,255,255,.12); padding-top: 11px; }
+  .ah-table { margin-top: 8px; max-height: 300px; overflow-y: auto; }
+  .ah-row { display: grid; grid-template-columns: 38px 118px 46px minmax(0,1fr) 78px 96px; gap: 8px; align-items: center; font-size: 12px; padding: 4px 8px; border-radius: 7px; color: #b9b9c4; cursor: pointer; }
+  .ah-row:hover { background: rgba(255,255,255,.05); }
+  .ah-row:nth-child(odd) { background: rgba(255,255,255,.022); }
+  .ah-row:nth-child(odd):hover { background: rgba(255,255,255,.05); }
+  .ah-row .ah-idx { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; }
+  .ah-row .ah-code { font-weight: 700; font-size: 11.5px; letter-spacing: .3px; color: #e2e2ea; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ah-row .ah-ok, .ah-row .ah-fail { font-size: 11px; padding: 1px 7px; border-radius: 5px; text-align: center; justify-self: start; }
+  .ah-row .ah-ok { background: rgba(70,209,125,.13); color: #46d17d; }
+  .ah-row .ah-fail { background: rgba(var(--accent-rgb),.14); color: #ffb3b3; cursor: help; }
+  .ah-row .ah-src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+  .ah-row.fail .ah-src { color: #d98a8a; }
+  .ah-row .ah-via { font-size: 10.5px; padding: 1px 7px; border-radius: 5px; background: rgba(255,255,255,.05); color: var(--text-dim); text-align: center; justify-self: start; }
+  .ah-row .ah-via.sub { background: rgba(var(--accent-rgb),.1); color: var(--accent-tint); }
+  .ah-row .ah-time { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; }
+  .ah-empty { font-size: 12px; color: var(--text-dim); line-height: 1.75; padding: 12px 6px; text-align: center; }
+  @media (max-width: 900px) { .ah-row { grid-template-columns: 30px 96px 42px minmax(0,1fr) 60px; } .ah-row .ah-time { display: none; } }
   .add-tasks .add-prog { margin-top: 0; border: none; background: none; padding: 0; }
   .add-tasks .ap-jobs { max-height: 320px; }
   .add-tasks .ap-job { cursor: pointer; }           /* 点一条 → 右侧结果栏显示它的刮削结果 */
@@ -3272,7 +3296,26 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
             <label class="sp-switch"><input type="checkbox" id="optShowHidden"><i></i></label>
           </div>
         </div>
-        <!-- ⑤ 调试与编辑 -->
+        <!-- ⑤ 订阅与自动入库 -->
+        <div class="sp-card sp-grp">
+          <div class="sp-grp-t">🔔 订阅与自动入库<small>订阅女优之后，她的作品要不要自己进库</small></div>
+          <div class="sp-row">
+            <div class="l">订阅女优后自动获取全部作品<small>在女优页点「✚ 订阅」的那一刻，就去线上把这个女优的<b>全部番号</b>逐页翻到底拉全（不是只拉最近新作），筛掉本机已有的，剩下的排队自动刮削入库 —— 相当于一键补全她的历史作品。开通后订阅页会显示抓取 / 入库进度。注意：热门女优可能有几百部，会连续刮挺久，所以默认关闭。已经订阅过的女优想补课，去订阅页「我的订阅」点「⇄ 补全全部作品」。</small></div>
+            <label class="sp-switch"><input type="checkbox" id="optSubsFull"><i></i></label>
+          </div>
+          <div class="sp-row">
+            <div class="l">女优 JavDB 代号回填<small>给女优查 JavDB 代号（后台限速跑，不影响刮削）：查完之后<b>订阅女优按名字也会精确锁人</b>（不再靠名字猜），女优详情页显示代号直达链接。线上查无此人的记 miss，每 7 天自动重试一次；服务重启会自动接着跑。<br><b>量程：</b>「⟳ 全名册」= 名册里约 2.5 万人全查（先快扫再精查，自适应限速，约数小时到十几小时）；「影片库」= 只查你片子里出现过的演员（几分钟）。限速会自己调节：连续成功就加速（最快 650ms/请求），一旦失败立刻退避到几十秒。</small>
+              <span id="jdbcStatus" style="display:block;margin-top:6px;font-size:12px;color:var(--text-2)"></span>
+            </div>
+            <div style="display:flex;gap:6px;flex:0 0 auto;align-items:center">
+              <button class="subs-btn ghost" onclick="jdbcStartAll()" title="对名册全部女优回填（两阶段，后台慢慢跑）">⟳ 全名册</button>
+              <button class="subs-btn ghost" onclick="jdbcStart()" title="只查影片库里出现过的演员">影片库</button>
+              <button class="subs-btn ghost" onclick="jdbcRetryMiss()" title="清掉「线上查无此人」的记录，用升级后的匹配规则精查一遍">↻ 重试 miss</button>
+              <button class="subs-btn ghost" onclick="jdbcStop()" title="停止进行中的回填">⏹</button>
+            </div>
+          </div>
+        </div>
+        <!-- ⑥ 调试与编辑 -->
         <div class="sp-card sp-grp">
           <div class="sp-grp-t">🛠 编辑与排查<small>平时用不到，排查问题或调版面时才开</small></div>
           <div class="sp-row">
@@ -3290,6 +3333,16 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
         <p class="hint">「霓虹」为深紫夜底 + 紫粉霓虹光效（Logo 会变成霓虹灯牌），是<strong>默认主题</strong>；「毛玻璃」为浅色毛玻璃风格（Apple Liquid Glass）。点一下立即生效并记住（保存在本机浏览器）。</p>
         <div class="sp-card">
           <div id="themeGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px"></div>
+          <!-- Dock 图标：只在 macOS 原生客户端里出现（由补丁脚本按 UA 显示），浏览器里隐藏 -->
+          <div id="dockIconRow" style="display:none;margin-top:18px;padding-top:14px;border-top:1px solid rgba(255,255,255,.08)">
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px">Dock 图标</div>
+            <div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:10px">改的是程序坞（Dock）和窗口里的 App 图标，切换后立刻生效并记住。</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+              <button class="lib-btn" data-dock-icon="neon" onclick="__setDockIcon('neon')">霓虹</button>
+              <button class="lib-btn" data-dock-icon="glass" onclick="__setDockIcon('glass')">毛玻璃</button>
+              <span id="dockIconNow" style="font-size:12px;color:var(--text-dim)"></span>
+            </div>
+          </div>
         </div>
       </section>
       <section class="sp-sec" data-sec="network">
@@ -3318,6 +3371,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
             <input id="optCacheDir" type="text" spellcheck="false" placeholder="离线数据目录（默认：项目内 cache/）"
               style="background:var(--input-bg);border:1px solid rgba(255,255,255,.09);border-radius:8px;color:var(--text);padding:9px 12px;font-size:13px;outline:none;width:100%;box-sizing:border-box">
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+              <button class="lib-btn" onclick="__pickOrBrowse('optCacheDir')">浏览…</button>
               <button class="lib-btn" onclick="saveCacheDir()">保存</button>
               <button class="lib-btn" onclick="loadCacheStats()">刷新大小</button>
               <span id="cacheStatus" style="font-size:12px;color:var(--text-dim)"></span>
@@ -3387,7 +3441,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
         <h2>关于</h2>
         <div class="sp-card">
           <div class="sp-row"><div class="l">JAVぱこ</div></div>
-          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.3.3 · 本地媒体库 + 多源刮削</small></div></div>
+          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.3.5 · 本地媒体库 + 多源刮削</small></div></div>
         </div>
         <div class="sp-card" style="margin-top:14px">
           <div class="sp-row"><div class="l">备份与恢复<small>把配置（媒体库 / 数据源 / 隐藏列表 / 偏好）+ 播放记录 + 评分备注标签打包成一个 JSON 文件下载；换机或清库前先导出，恢复后自动重扫</small></div></div>
@@ -3534,7 +3588,7 @@ window.addEventListener('error', e => {
 })
 window.addEventListener('unhandledrejection', e => {
   const r = e && e.reason
-  errReport('未处理的异步错误', (r && (r.message || r.error || String(r))) || '未知原因')
+  errReport('未处理的异步错误', (r && (r.message || r.error || String(r))) || '未知原因', r && r.stack ? String(r.stack).slice(0, 400) : '')
 })
 /* 包一层 fetch：网络层失败（服务没起来 / 连接断了）统一提示；
  * 业务层的 ok:false 仍由各调用方自己展示，避免同一个问题弹两条 */
@@ -3573,6 +3627,7 @@ const PREF_DEF = {
   theme: 'neon',     // 主题（'neon' 霓虹 = 默认；'glass' 毛玻璃；空值按 neon 处理）
   autoplay: '1',     // 详情页自动播放
   cupbadge: '1',     // 女优罩杯徽章（默认开：与设置页开关的 checked、cupBadgeOn() 的兜底保持一致）
+  subsfull: '0',     // 订阅女优后自动抓取她的「全部作品」并刮削入库（默认关；服务端读 uiPrefs.subsfull 执行）
   wallpic: '0',      // 海报墙横竖版：'0' 竖版海报（默认）/'1' 横版主图（导航栏 🖼 开关 + 设置→外观）
   mvposter: '0',     // 详情页主图用竖版海报
   srcpath: '0',      // 「刮削内容」面板里标注来源绝对路径（默认关：路径是容器内的，对普通用户没意义）
@@ -4116,6 +4171,7 @@ let _addPoll = null            // 状态轮询定时器（全页唯一，避免�
 let _addBusy = false           // 批量进行中
 let _addStopped = false        // 用户点了停止
 let _addWaiter = null          // 等「当前这部跑完」的 promise resolve
+let _addWaitT0 = 0             // 本条提交时刻：配合服务端 finishedAt 判定「我的这部刮完了」
 let _addT0 = 0                 // 本批开始时间
 let _addLast = null            // 最近一次 /api/scrape/status 结果
 let _ADD_JOBS = []             // 任务队列 [{ code, state: wait|run|ok|fail|skip, msg, job }]
@@ -4803,6 +4859,9 @@ function buildRoster() {
   ACTRESSES.forEach((a, i) => {
     const keys = new Set()
     acAliases(a.name).forEach(n => keys.add(acNorm(n)))
+    /* minnano 现用名（mcanon，站内规范名）也当主名索引 —— 改名系女优（小倉七海 → 兒玉七海）
+     * 名册里存的是旧名，按新艺名搜会整个扑空（连资料带影片全查不到），2026-10-02 修复 */
+    if (a.mcanon) acAliases(a.mcanon).forEach(n => keys.add(acNorm(n)))
     ;[a.name_ja, a.name_zh, a.name_en].forEach(n => { if (n) acAliases(n).forEach(x => keys.add(acNorm(x))) })
     keys.delete('')
     const primary = acNorm(a.name)
@@ -4817,6 +4876,7 @@ function buildRoster() {
       tags: Array.isArray(a.tags) ? a.tags : [], rel: Array.isArray(a.rel) ? a.rel : [],
       mnid: a.mnid || '', shoe: a.shoe || '', blog: a.blog || '', debut: a.debut || '',
       debutDate: a.debutDate || '', furi: a.furi || '',
+      mcanon: a.mcanon || '', nick: a.nick || '', official: a.official || '',
       films: [], nf: true
     }
     keys.forEach(k => { if (!index[k]) index[k] = r })
@@ -4842,7 +4902,8 @@ function buildRoster() {
         name, name_en: '', icon: '', uid: '', lid: '', birthday: '', height: '', cup: '',
         breast: '', waist: '', hip: '', works: 0, idx: 1e6, films: [], nf: false,
         blood: '', place: '', hobby: '', period: '', agency: '', alias: [], msrc: '',
-        tags: [], rel: [], mnid: '', shoe: '', blog: '', debut: ''
+        tags: [], rel: [], mnid: '', shoe: '', blog: '', debut: '',
+        debutDate: '', furi: '', mcanon: '', nick: '', official: ''
       }
       orphans.set(k, r); index[k] = r; recs.push(r)
     }
@@ -5638,18 +5699,47 @@ window.toggleFavActor = function (name, btn) {
   favActorsSave(); favPush('actresses', name, FAV_ACTORS.has(name))
   if (btn) { btn.classList.toggle('on', FAV_ACTORS.has(name)); btn.innerHTML = FAV_ACTORS.has(name) ? '<span class="h">♥</span> 已关注' : '<span class="h">♡</span> 关注' }
 }
-/* 订阅女优（订阅页据此拉线上新作） */
-window.subsAddActor = async function (name, btn) {
+/* 订阅女优（订阅页据此拉线上新作）。actorId：女优详情页的 JavDB 代号，带上了就按 id 精确锁人 */
+window.subsAddActor = async function (name, btn, actorId) {
   if (!name) return
   if (btn) { btn.disabled = true; btn.textContent = '订阅中…' }
   try {
     const d = await (await fetch('/api/subscriptions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'add', kind: 'actor', name })
+      body: JSON.stringify({ action: 'add', kind: 'actor', name, actorId: String(actorId || '').trim() || undefined })
     })).json()
-    if (btn) { btn.classList.add('on'); btn.textContent = d.dup ? '✓ 已订阅' : '✓ 已订阅' }
+    if (btn) {
+      btn.classList.add('on')
+      btn.textContent = d.fullGrab ? '✓ 已订阅 · 正在抓全部作品' : '✓ 已订阅'
+    }
+    /* 设置里开了「订阅女优后自动获取全部作品」→ 服务端此刻已在翻页抓全，给个即时反馈 */
+    if (d.fullGrab && typeof libToast === 'function') {
+      libToast('✓ 已订阅「' + libEsc(name) + '」<br><span style="opacity:.75">正在线上翻页抓取她的<b>全部作品</b>，筛掉本机已有的之后排队刮削入库 —— 进度看订阅页</span>', 'ok', 8000)
+    }
     subsBadgeRefresh()
   } catch (_) { if (btn) { btn.disabled = false; btn.textContent = '订阅失败' } }
+}
+/* 对「已订阅」的女优手动补全全部作品：开关没开、或订阅时忘开的补课入口（订阅页每条女优一个按钮） */
+window.subsFull = async function (id, btn) {
+  if (!id) return
+  const old = btn ? btn.textContent : ''
+  if (btn) { btn.disabled = true; btn.textContent = '启动中…' }
+  try {
+    const d = await (await fetch('/api/subscriptions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'full', id })
+    })).json()
+    if (!d.ok) {
+      if (btn) { btn.disabled = false; btn.textContent = old }
+      if (typeof libToast === 'function') libToast('✗ ' + libEsc(d.error || '启动失败'), 'warn', 7000)
+      return
+    }
+    if (btn) btn.textContent = '⟳ 抓取中…'
+    if (typeof libToast === 'function') {
+      libToast('⟳ 开始抓取「' + libEsc(d.name) + '」的全部作品…<br><span style="opacity:.75">抓完自动排队刮削入库，进度见本页顶部提示</span>', 'ok', 7000)
+    }
+    setTimeout(() => { try { subsLoadFeed(true).then(() => renderSubs()) } catch (_) {} }, 4000)
+  } catch (_) { if (btn) { btn.disabled = false; btn.textContent = old } }
 }
 /* 订阅系列（key 形如 P:MIDE）/ 订阅番号 */
 window.subsAddSeries = async function (key, label, btn) {
@@ -7018,8 +7108,12 @@ document.addEventListener('keydown', e => {
 let ACT_AVA_MAP = null
 function actorAvaOf(name) {
   if (!ACT_AVA_MAP) {
+    buildRoster()
     ACT_AVA_MAP = Object.create(null)
-    buildRoster().forEach(r => { if (r.icon && !ACT_AVA_MAP[acNorm(r.name)]) ACT_AVA_MAP[acNorm(r.name)] = r.icon })
+    /* 主名 + 别名 + minnano 现用名一起进表（ACR_KEY 已含三层索引）。
+     * 影片 NFO 里写的常是艺名/旧名（みなみ羽琉 的片子署名「水原聖子」「みなと羽琉」），
+     * 旧版只按主名建表 → 这类演员的小头像全丢。 */
+    for (const [k, r] of ACR_KEY) if (r && r.icon && !ACT_AVA_MAP[k]) ACT_AVA_MAP[k] = r.icon
   }
   return ACT_AVA_MAP[acNorm(name)] || ''
 }
@@ -7369,7 +7463,7 @@ function renderActorDetail(name) {
   const all = buildRoster()
   // 按名解析：先精确名，再走归一化索引（含 minnano 别名，例「花咲まどか」→「蜜香」）
   const a = all.find(x => x.name === name) || ACR_KEY.get(acNorm(name)) ||
-    { name, films: [], birthday: '', height: '', cup: '', breast: '', waist: '', hip: '', works: 0, icon: '', tags: [], rel: [], alias: [], blood: '', place: '', hobby: '', period: '', agency: '', shoe: '', blog: '', debut: '', debutDate: '', furi: '', msrc: '' }
+    { name, films: [], birthday: '', height: '', cup: '', breast: '', waist: '', hip: '', works: 0, icon: '', tags: [], rel: [], alias: [], blood: '', place: '', hobby: '', period: '', agency: '', shoe: '', blog: '', debut: '', debutDate: '', furi: '', msrc: '', mcanon: '', nick: '', official: '' }
   acChipSel = '全部'
   const cm = v => { const n = acNum(v); return n != null ? n + 'cm' : '——' }
   const cup = (a.cup || '').toUpperCase().trim()
@@ -7392,8 +7486,11 @@ function renderActorDetail(name) {
     ['爱好', a.hobby || '——']
   ]
   if (a.furi) rows.splice(1, 0, ['假名', a.furi])
+  /* minnano 愛称（こなみん、ぐらちゃん 这类圈内昵称），紧跟假名之后（资料页同款位置） */
+  if (a.nick) rows.splice(a.furi ? 2 : 1, 0, ['爱称', libEsc(a.nick)])
   if (a.shoe) rows.push(['鞋码', a.shoe])
   if (a.blog) rows.push(['博客', `<a class="ac-vlink" href="${a.blog}" target="_blank" rel="noopener">${a.blog}</a>`])
+  if (a.official) rows.push(['官网', `<a class="ac-vlink" href="${a.official}" target="_blank" rel="noopener">${libEsc(a.official)}</a>`])
   const vrows = rows.map(([k, v, cls]) => `<div class="ac-vrow${cls ? ' ' + cls : ''}"><span>${k}</span><b>${v}</b></div>`).join('')
   const chips = [...new Set(a.films.map(x => x.studio).filter(Boolean))]
   const sub = [`<b>${a.films.length}</b> 影片`]
@@ -7446,7 +7543,7 @@ function renderActorDetail(name) {
     <div class="ac-hero" data-mod="achero" data-st="achero">
       ${heroImg}
       <div class="ac-idname">
-        <div class="ac-name">${a.name}${scrapeBtn}${syncBtn}<button class="ac-fav${FAV_ACTORS.has(a.name) ? ' on' : ''}" data-n="${libEsc(a.name)}" onclick="toggleFavActor(this.dataset.n, this)">${FAV_ACTORS.has(a.name) ? '<span class="h">♥</span> 已关注' : '<span class="h">♡</span> 关注'}</button><button class="ac-fav ac-sub" data-n="${libEsc(a.name)}" onclick="subsAddActor(this.dataset.n, this)" title="订阅该女优：订阅页会去线上找她的新作品">✚ 订阅</button><button class="ac-fav ac-sub" data-n="${libEsc(a.name)}" onclick="subsActorWorks(this.dataset.n)" title="打开她的 JavDB 线上女优页：资料卡 + 全部作品">▣ JavDB 女优页</button></div>
+        <div class="ac-name">${a.name}${scrapeBtn}${syncBtn}<button class="ac-fav${FAV_ACTORS.has(a.name) ? ' on' : ''}" data-n="${libEsc(a.name)}" onclick="toggleFavActor(this.dataset.n, this)">${FAV_ACTORS.has(a.name) ? '<span class="h">♥</span> 已关注' : '<span class="h">♡</span> 关注'}</button><button class="ac-fav ac-sub" data-subs="actor" data-subs-name="${libEsc(a.name)}" data-n="${libEsc(a.name)}" onclick="subsToggle(this)" title="订阅该女优：订阅页会去线上找她的新作品（已订阅时再点一次 = 取消订阅）">✚ 订阅</button><button class="ac-fav ac-sub" data-n="${libEsc(a.name)}" onclick="subsActorWorks(this.dataset.n)" title="打开她的 JavDB 线上女优页：资料卡 + 全部作品">▣ JavDB 女优页</button></div>
         <div class="ac-count">${sub.join(' · ')}</div>
         ${al.length ? `<div class="ac-aliases">${al.map(x => `<span class="ac-alias">${x}</span>`).join('')}</div>` : ''}
       </div>
@@ -7491,7 +7588,8 @@ const ACM_FIELDS = [
   ['breast', '胸围', 0], ['waist', '腰围', 0], ['hip', '臀围', 0], ['cup', '罩杯', 0],
   ['blood', '血型', 0], ['place', '出身地', 0], ['period', '出道期间', 0], ['debutDate', '出道年月', 0],
   ['debut', '出道作品', 1], ['agency', '所属事务所', 0], ['hobby', '爱好', 1], ['shoe', '鞋码', 0],
-  ['blog', '博客', 1], ['works', '作品数', 0], ['alias', '别名（逗号分隔）', 1]
+  ['blog', '博客', 1], ['nick', '爱称', 1], ['official', '官网', 1],
+  ['works', '作品数', 0], ['alias', '别名（逗号分隔）', 1]
 ]
 const ACM_STATE = { iconPath: '', iconData: '', tags: null }
 window.acScrapeOpen = function () {
@@ -8854,6 +8952,7 @@ function mvsRender() {
   document.getElementById('mvScrapeBox').innerHTML = `
     <div class="acm-head"><h3>刮削内容 · ${libEsc(MVS_STATE.code)}</h3><button onclick="mvsClose()" title="关闭">×</button></div>
     ${mvsPathBlock(d)}
+    ${(d.offFilm && d.offFilm.length) ? `<div class="mvs-warn">⚠ <b>同名不同作品</b>（番号撞车）：${d.offFilm.map(x => `<em>${libEsc(mvsSrcName(x.id))}</em> 搜到的其实是《${libEsc(String(x.title || '').slice(0, 42))}》${x.year ? '（' + libEsc(x.year) + ' 年）' : ''}`).join('；')} —— 与本片对不上，它的标题 / 演员 / 剧情等文字字段已被排除，图片只在其它源全挂时才兜底。如果上面这些字段看着不对，就是番号撞车，可用「指定网址」刮削手动指定正确页面。</div>` : ''}
     <div class="mvs-imgs">${imgCard('fanart', '横版主图')}${imgCard('poster', '竖版海报')}</div>
     <div class="mvs-rows">${rows}</div>
     ${srcList}
@@ -9077,9 +9176,10 @@ function renderAdd() {
   addPage.innerHTML = acHead('#/', '添加影片') + `
   <div class="add-wrap" data-mod="addwrap" data-st="addwrap">
     <p class="add-hint">填<b>番号</b>即可多源刮削（元数据 + 竖版封面 + 横版主图 + 剧照），存进离线数据后出现在首页媒体库。也可填<b>详情页网址</b>或<b>指定某个网站</b>。</p>
+    <div class="add-grid2">
+    <div class="add-col-l">
     <div class="add-card">
-      <div class="add-split">
-        <div class="add-main">
+      <div class="add-main">
           <div class="add-row">
             <div class="add-f"><label>番号（多个用逗号或空格分隔，会依次刮削）</label><input type="text" id="addCode" placeholder="如 STARS-238  ABF-386"></div>
             <div class="add-f"><label>指定网站（可选）</label><select id="addSource"><option value="">自动（按优先级依次尝试）</option></select></div>
@@ -9090,35 +9190,6 @@ function renderAdd() {
             <button class="add-btn primary" id="addStartBtn" onclick="scrapeStart()">⟳ 开始刮削</button>
             <span id="addStatus" class="add-status"></span>
           </div>
-        </div>
-        <div class="add-tasks" id="addTasks" data-mod="addtasks" data-st="addtasks">
-          <div class="at-head">
-            <span class="at-title">刮削任务</span>
-            <span class="at-count" id="addTaskCount"></span>
-            <span class="at-act">
-              <button class="at-btn" id="addClearBtn" style="display:none" onclick="addClearDone()" title="只移除已经跑完（成功/失败）的记录，排队中和正在跑的保留">清空已完成</button>
-            </span>
-          </div>
-          <div class="at-split">
-            <div class="at-left">
-              <div id="addProg" class="add-prog" style="display:none">
-                <div class="ap-head">
-                  <div class="ap-title" id="addProgTitle"></div>
-                  <div class="ap-sub" id="addProgSub"></div>
-                  <span class="ap-act">
-                    <button class="ap-btn" id="addRetryBtn" style="display:none" onclick="addRetryFail()"></button>
-                    <button class="ap-btn stop" id="addStopBtn" style="display:none" onclick="addStop()">■ 停止</button>
-                  </span>
-                </div>
-                <div class="ap-bar"><i id="addProgBar"></i></div>
-                <div class="ap-jobs" id="addJobs"></div>
-                <details class="ap-logwrap" id="addLogWrap"><summary>站点明细（诊断用 · 每站返回结果实时刷）</summary><div class="ap-log" id="addProgLog"></div></details>
-              </div>
-              <div class="at-empty" id="addEmpty">暂无任务。<br>填左边番号点「开始刮削」就会排到这里——<b>刮削中也能继续加</b>，新番号会<b>排队等待</b>，不会再顶掉前面那条。</div>
-            </div>
-            <div class="at-result" id="addResult"></div>
-          </div>
-        </div>
       </div>
     </div>
     <h3 class="add-list-title">视频目录</h3>
@@ -9136,7 +9207,7 @@ function renderAdd() {
         <div class="lib-add">
           <input id="libPathInput" placeholder="容器内绝对路径，如 /media/无码流出（点「浏览」可逐级挑子文件夹）" onkeydown="if(event.key==='Enter')libAdd()">
           <button class="lib-btn primary" onclick="libAdd()">＋ 添加并扫描</button>
-          <button class="lib-btn" onclick="libBrowse()">浏览</button>
+          <button class="lib-btn" onclick="__pickOrBrowse('libPathInput')">浏览</button>
         </div>
         <div class="lib-browse" id="libBrowseBox" style="display:none"></div>
         <div class="lib-list" id="libList"></div>
@@ -9144,6 +9215,57 @@ function renderAdd() {
         <input type="file" id="dirInput" webkitdirectory multiple hidden>
       </div>
     </div>
+    </div><!-- /add-col-l -->
+    <div class="add-col-r">
+        <div class="add-tasks" id="addTasks" data-mod="addtasks" data-st="addtasks">
+          <div class="at-head">
+            <span class="at-title">刮削任务</span>
+            <span class="at-count" id="addTaskCount"></span>
+            <span class="at-act">
+              <button class="at-btn" id="addClearBtn" style="display:none" onclick="addClearDone()" title="只移除已经跑完（成功/失败）的记录，排队中和正在跑的保留">清空已完成</button>
+            </span>
+          </div>
+          <div id="addProg" class="add-prog" style="display:none">
+            <div class="ap-head">
+              <div class="ap-title" id="addProgTitle"></div>
+              <div class="ap-sub" id="addProgSub"></div>
+              <span class="ap-act">
+                <button class="ap-btn" id="addRetryBtn" style="display:none" onclick="addRetryFail()"></button>
+                <button class="ap-btn stop" id="addStopBtn" style="display:none" onclick="addStop()">■ 停止</button>
+              </span>
+            </div>
+            <div class="ap-bar"><i id="addProgBar"></i></div>
+            <details class="ap-logwrap" id="addLogWrap"><summary>站点明细（诊断用 · 每站返回结果实时刷）</summary><div class="ap-log" id="addProgLog"></div></details>
+          </div>
+          <div class="at-empty" id="addEmpty">暂无任务。<br>在左边填番号点「开始刮削」就会排到这里——<b>刮削中也能继续加</b>，新番号会<b>排队等待</b>，不会再顶掉前面那条。</div>
+          <div class="ap-cols">
+            <div class="ap-col">
+              <div class="ap-col-h"><span class="dot-wait"></span>排队中 <i id="addCntQ"></i></div>
+              <div class="ap-jobs ap-col-b" id="addJobsQ"></div>
+            </div>
+            <div class="ap-col">
+              <div class="ap-col-h"><span class="dot-run"></span>刮削中 <i id="addCntR"></i></div>
+              <div class="ap-jobs ap-col-b" id="addJobsR"></div>
+            </div>
+            <div class="ap-col">
+              <div class="ap-col-h"><span class="dot-fail"></span>失败 <i id="addCntF"></i></div>
+              <div class="ap-jobs ap-col-b" id="addJobsF"></div>
+            </div>
+          </div>
+          <div class="at-result" id="addResult"></div>
+          <div class="at-hist">
+            <div class="at-head" style="margin-bottom:0">
+              <span class="at-title">历史记录</span>
+              <span class="at-count" id="atHistCount"></span>
+              <span class="at-act">
+                <button class="at-btn" id="atHistClear" style="display:none" onclick="addHistClear()" title="清空服务端保存的全部刮削历史">清空历史</button>
+              </span>
+            </div>
+            <div class="ah-table" id="atHistTable"><div class="ah-empty">加载中…</div></div>
+          </div>
+        </div>
+    </div><!-- /add-col-r -->
+    </div><!-- /add-grid2 -->
     <div class="wc-bar" style="margin:30px 0 14px">
       <h3 class="add-list-title" style="margin:0;margin-right:auto">已刮削影片<span id="addCount"></span></h3>
       ${wcolsCtl('add', 'wc-tight')}
@@ -9153,6 +9275,7 @@ function renderAdd() {
   fillAddSources()
   loadAddList()
   addResume()   // 切走再回来：批量状态还在内存 / 空闲任务继续显示进度
+  addHistLoad()   // 打开添加页就拉一次服务端刮削历史
   libRender(); if (!scanTimer) checkScanOnce()   // 媒体库卡片已迁到本页：刷新逐库统计 + 若在扫描接上进度
 }
 /* ---- 离线数据：扫描 → 勾选 → 导入回缓存 ---- */
@@ -9246,13 +9369,22 @@ async function addRunLoop() {
     if (_addStopped) { row.state = 'skip'; row.msg = '已跳过（点了停止）'; addRender(_addLast); addJobsSave(); continue }
     const job = row.job || {}
     row.state = 'run'; row.msg = '等前面刮完…'; addRender(_addLast); addJobsSave()
-    /* 服务端一次只跑一部：先等它空出来再提交，避免"正在刮削 XX"被拒 */
-    if (!await addWaitIdle()) { row.state = 'fail'; row.msg = '等待空闲超时（服务端一直忙）'; addRender(_addLast); addJobsSave(); continue }
+    /* 服务端一次只跑一部：先等它空出来（最多 45 秒），等不到就直接提交 ——
+       服务端会把任务插进它自己的持久队列，再等下去只是白等几小时。 */
+    if (!await addWaitIdle(45000)) { /* 不阻塞了，交给服务端排队 */ }
     if (_addStopped) { row.state = 'skip'; row.msg = '已跳过（点了停止）'; addRender(_addLast); addJobsSave(); continue }
     row.msg = '提交中…'; addRender(_addLast)
     let r
-    try { r = await (await fetch('/api/scrape/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job) })).json() }
+    /* queue:'front' —— 服务端被订阅全量队列占满时，不再干等 15 分钟然后报「等待空闲超时」，
+       而是直接插到服务端队首（持久化），本轮继续下一条。 */
+    try { r = await (await fetch('/api/scrape/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({}, job, { queue: 'front' })) })).json() }
     catch (e) { r = { ok: false, error: '请求失败：' + e.message } }
+    if (r.queued) {
+      const pos = Number(r.pos) || 0
+      row.state = 'queue'
+      row.msg = pos > 1 ? `已入服务端队列 · 前面还有 ${pos - 1} 部` : '已入服务端队列 · 下一个就它'
+      addRender(_addLast); addJobsSave(); continue
+    }
     if (!r.ok) {
       /* 被别人抢先占用了（例如同时在详情页点了重新刮削）→ 退回去重排，最多试 3 次，不当作失败 */
       if (/正在刮削/.test(r.error || '') && (row.retry = (row.retry || 0) + 1) <= 3) {
@@ -9262,10 +9394,12 @@ async function addRunLoop() {
       row.state = 'fail'; row.msg = r.error || '提交失败'; addRender(_addLast); addJobsSave(); continue
     }
     row.code = r.code || row.code; row.msg = '刮削中…'; addRender(_addLast); addJobsSave()
+    _addWaitT0 = Date.now()                            // 配合 addTick：按 finishedAt 判单条完成
     const s = await addWait()                                   // 等这一部跑完（服务端一次只跑一部）
     if (s && s.error) { row.state = 'fail'; row.msg = s.error }
     else { row.state = 'ok'; row.msg = (s && s.title) ? s.title : '刮削完成'; loadAddList() }   // 边刮边让下方列表长出来
     addRender(_addLast); addJobsSave()
+    addHistLoad(true)                                           // 历史栏同步长出这条
   }
   _addBusy = false
   addRender(_addLast); addJobsSave()
@@ -9297,12 +9431,50 @@ window.addClearDone = function () {
   _ADD_JOBS = _ADD_JOBS.filter(j => j.state === 'wait' || j.state === 'run')
   addRender(_addLast); addJobsSave()
 }
+/* ---------- 刮削历史（服务端常驻）：手动/订阅/扫描的每一次成败都记一条，刷新换设备都在 ---------- */
+var _ADD_HIST = [], _ADD_HIST_AT = 0
+function addHistLoad(force) {
+  const box = document.getElementById('atHistTable'); if (!box) return
+  if (!force && Date.now() - _ADD_HIST_AT < 2500) return
+  _ADD_HIST_AT = Date.now()
+  fetch('/api/scrape/history?limit=150', { cache: 'no-store' }).then(r => r.json()).then(d => {
+    if (!d || !d.ok) return
+    _ADD_HIST = d.list || []
+    const c = document.getElementById('atHistCount')
+    if (c) c.textContent = d.total ? '共 ' + d.total + ' 条（服务端保存，重启不丢）' : '（空）'
+    const b = document.getElementById('atHistClear'); if (b) b.style.display = d.total ? '' : 'none'
+    addHistRender()
+  }).catch(() => {})
+}
+function addHistRender() {
+  const box = document.getElementById('atHistTable'); if (!box) return
+  if (!_ADD_HIST.length) { box.innerHTML = '<div class="ah-empty">还没有记录。左边排队刮的、订阅自动入库的、扫描自动刮的，每一次成败都会记在这里。</div>'; return }
+  box.innerHTML = _ADD_HIST.map((h, i) => {
+    const via = h.via || '手动'
+    const st = h.ok ? '<span class="ah-ok">成功</span>' : '<span class="ah-fail" title="' + libEsc(h.err || '失败') + '">失败</span>'
+    const src = h.ok ? (h.src || '—') : String(h.err || '失败')
+    const tm = h.at ? new Date(h.at) : null
+    const p2 = n => String(n).padStart(2, '0')
+    const tstr = tm ? p2(tm.getMonth() + 1) + '-' + p2(tm.getDate()) + ' ' + p2(tm.getHours()) + ':' + p2(tm.getMinutes()) + ':' + p2(tm.getSeconds()) : ''
+    return '<div class="ah-row' + (h.ok ? '' : ' fail') + '" title="' + libEsc((h.ok ? '刮削来源：' + (h.src || '—') : h.err || '失败') + (h.dur ? ' · 用时 ' + Math.round(h.dur / 1000) + 's' : '')) + '" onclick="openMovie(\'' + libEsc(h.code) + '\')">' +
+      '<span class="ah-idx">' + (_ADD_HIST.length - i) + '</span>' +
+      '<span class="ah-code">' + libEsc(h.code) + '</span>' + st +
+      '<span class="ah-src">' + libEsc(src) + '</span>' +
+      '<span class="ah-via' + (via === '手动' ? '' : ' sub') + '">' + libEsc(via) + '</span>' +
+      '<span class="ah-time">' + tstr + '</span></div>'
+  }).join('')
+}
+window.addHistClear = function () {
+  if (!confirm('清空全部刮削历史？（只清记录，不动已入库的影片）')) return
+  fetch('/api/scrape/history', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'clear' }) })
+    .then(() => addHistLoad(true)).catch(() => {})
+}
 /* ---------- 任务队列持久化（刷新页面不丢；刷新时正在跑的那条退回「排队中」） ---------- */
 const ADD_JOBS_KEY = 'javpaco.addjobs'
 function addJobsSave() {
   try {
     localStorage.setItem(ADD_JOBS_KEY, JSON.stringify(_ADD_JOBS.slice(-200).map(j => ({
-      code: j.code, state: j.state === 'run' ? 'wait' : j.state, msg: j.state === 'run' ? '排队中' : j.msg, job: j.job
+      code: j.code, state: (j.state === 'run' || j.state === 'wait') ? 'wait' : j.state, msg: (j.state === 'run' || j.state === 'wait') ? '排队中' : j.msg, job: j.job
     }))))
   } catch (_) {}
 }
@@ -9312,7 +9484,7 @@ function addJobsLoad() {
   if (!Array.isArray(arr)) return
   _ADD_JOBS = arr.filter(j => j && j.job).map(j => ({
     code: j.code || '（按网址识别）',
-    state: (j.state === 'ok' || j.state === 'fail' || j.state === 'skip') ? j.state : 'wait',
+    state: (j.state === 'ok' || j.state === 'fail' || j.state === 'skip' || j.state === 'queue') ? j.state : 'wait',
     msg: j.msg || '排队中', job: j.job, retry: 0
   }))
 }
@@ -9332,18 +9504,19 @@ function addWaitIdle(timeoutMs = 15 * 60 * 1000) {
   })
 }
 /* ---------- 总进度面板：逐条状态 + 当前站点 + 明细日志 ---------- */
-const ADD_ICO = { wait: '·', ok: '✓', fail: '✕', skip: '·' }
+const ADD_ICO = { wait: '·', run: '·', queue: '⋯', ok: '✓', fail: '✕', skip: '·' }
 function addRender(s) {
   const prog = document.getElementById('addProg'); if (!prog) return
   const total = _ADD_JOBS.length
   const waitN = _ADD_JOBS.filter(j => j.state === 'wait').length
-  const done = _ADD_JOBS.filter(j => j.state === 'ok' || j.state === 'fail' || j.state === 'skip').length
+  const qN = _ADD_JOBS.filter(j => j.state === 'queue').length
+  const done = _ADD_JOBS.filter(j => j.state === 'ok' || j.state === 'fail' || j.state === 'skip' || j.state === 'queue').length
   const okN = _ADD_JOBS.filter(j => j.state === 'ok').length
   const failN = _ADD_JOBS.filter(j => j.state === 'fail').length
   /* 面板外壳：任务数 / 空态 / 清空按钮 / 开始按钮文案 */
   const emptyEl = document.getElementById('addEmpty')
   const cntEl = document.getElementById('addTaskCount')
-  if (cntEl) cntEl.textContent = total ? `${total} 条 · 排队 ${waitN} · 已完成 ${done}` : ''
+  if (cntEl) cntEl.textContent = total ? `${total} 条 · 排队 ${waitN}${qN ? ' · 已入服务端队列 ' + qN : ''} · 已完成 ${done}` : ''
   const clrEl = document.getElementById('addClearBtn'); if (clrEl) clrEl.style.display = done ? '' : 'none'
   const sbtn = document.getElementById('addStartBtn')
   if (sbtn) sbtn.textContent = _addBusy ? '＋ 加入队列' : '⟳ 开始刮削'
@@ -9367,11 +9540,15 @@ function addRender(s) {
     ? `刮削中 <b>${done + (cur ? 1 : 0)}/${total}</b>${cur ? ' · ' + libEsc(cur.code) : ' · 准备中'}`
     : (_addStopped ? `已停止 · 成功 <b>${okN}</b> / 共 ${total} 条`
       : (waitN ? `待继续 · 排队 <b>${waitN}</b> 条`
-        : `全部完成 · 成功 <b>${okN}</b>${failN ? ' · 失败 <b>' + failN + '</b>' : ''}`))
+        : `全部完成 · 成功 <b>${okN}</b>${qN ? ' · 已入服务端队列 <b>' + qN + '</b>' : ''}${failN ? ' · 失败 <b>' + failN + '</b>' : ''}`))
   const sub = document.getElementById('addProgSub')
+  /* ⚠️ 「用时」是**整批**耗时（从点开始刮削起算），不是单条 —— 以前只写一个数字，
+     队列一跑几小时就被误读成「某个番号刮了两千多秒」。现在把服务端队列单列出来。 */
+  const srvQ = (s && s.queue) ? s.queue : null
   if (sub) sub.textContent = _addBusy
-    ? ((s && s.phase ? s.phase : '准备') + '…' + (secs ? ' · 已用 ' + secs + 's' : ''))
-    : `${total} 条 · 用时 ${secs}s`
+    ? ((s && s.phase ? s.phase : '准备') + '…' + (secs ? ' · 本批已用 ' + secs + 's' : '')
+       + (srvQ && srvQ.pending ? ` · 服务端队列还有 ${srvQ.pending} 部（在刮 ${libEsc(srvQ.current || '—')}）` : ''))
+    : `${total} 条 · 本批用时 ${secs}s` + (srvQ && srvQ.pending ? ` · 服务端队列还有 ${srvQ.pending} 部` : '')
   const sb = document.getElementById('addStopBtn')
   if (sb) { sb.style.display = _addBusy ? '' : 'none'; sb.disabled = _addStopped }
   const rb = document.getElementById('addRetryBtn')
@@ -9379,17 +9556,32 @@ function addRender(s) {
     rb.style.display = failN ? '' : 'none'
     rb.textContent = '↻ 重试失败项（' + failN + '）'
   }
-  const box = document.getElementById('addJobs')
-  if (box) {
-    const selI = _addSelIdx()
-    box.innerHTML = _ADD_JOBS.map((j, i) => {
-      const ico = j.state === 'run' ? '<span class="ap-spin"></span>' : `<span class="ic">${ADD_ICO[j.state] || '·'}</span>`
-      return `<div class="ap-job ${j.state}${i === selI ? ' sel' : ''}" title="点这里在右侧看这条的刮削结果" onclick="addSelJob(${i})"><span class="idx">${i + 1}</span>${ico}<span class="cd">${libEsc(j.code)}</span><span class="ms" title="${libEsc(j.msg || '')}">${libEsc(j.msg || '')}</span></div>`
-    }).join('')
-    /* 自动把正在跑的那条滚到看得见的位置（长队列时不用手动找） */
-    const curEl = box.querySelector('.ap-job.run')
-    if (curEl) box.scrollTop = Math.max(0, curEl.offsetTop - box.clientHeight / 2 + curEl.offsetHeight / 2)
+  /* 任务按状态分三列：排队中 / 刮削中 / 失败（已完成的不再占位，历史记录里全都有） */
+  const rowHtml = (j, i, selI) => {
+    const ico = j.state === 'run' ? '<span class="ap-spin"></span>' : `<span class="ic">${ADD_ICO[j.state] || '·'}</span>`
+    return `<div class="ap-job ${j.state}${i === selI ? ' sel' : ''}" title="点这里看这条的刮削结果" onclick="addSelJob(${i})"><span class="idx">${i + 1}</span>${ico}<span class="cd">${libEsc(j.code)}</span><span class="ms" title="${libEsc(j.msg || '')}">${libEsc(j.msg || '')}</span></div>`
   }
+  const COLS = [['addJobsQ', 'q', '排队中'], ['addJobsR', 'r', '刮削中'], ['addJobsF', 'f', '失败']]
+  COLS.forEach(([id, kind, label]) => {
+    const box = document.getElementById(id)
+    if (!box) return
+    const selI = _addSelIdx()
+    const rows = []
+    _ADD_JOBS.forEach((j, i) => {
+      const k = kind === 'q' ? ((j.state === 'wait' || j.state === 'queue') ? 1 : 0)
+        : kind === 'r' ? (j.state === 'run' ? 1 : 0)
+        : ((j.state === 'fail' || j.state === 'skip') ? 1 : 0)
+      if (k) rows.push(rowHtml(j, i, selI))
+    })
+    box.innerHTML = rows.join('') || `<div class="aq-none">${label}：暂无</div>`
+    const cnt = document.getElementById('addCnt' + id.slice(-1))
+    if (cnt) cnt.textContent = rows.length ? String(rows.length) : ''
+    /* 刮削中那一列：自动把正在跑的那条滚到看得见的位置（长队列时不用手动找） */
+    if (kind === 'r') {
+      const curEl = box.querySelector('.ap-job.run')
+      if (curEl) box.scrollTop = Math.max(0, curEl.offsetTop - box.clientHeight / 2 + curEl.offsetHeight / 2)
+    }
+  })
   addResultRender(s)
   const log = document.getElementById('addProgLog')
   if (log && s && s.log) {
@@ -9483,10 +9675,14 @@ async function addTick() {
     _addT0 = _addT0 || Date.now()
   }
   addRender(s)
-  if (!s.running) {
-    if (_addWaiter) { const w = _addWaiter; _addWaiter = null; w(s) }
-    if (!_addBusy) { addTickerStop(); addRender(s) }
+  /* 判定「我提交的那部刮完了」：光看 !s.running 是不够的 —— 服务端有订阅全量队列时
+     是一部接一部在跑，running 几乎一直是 true，等下去就是假卡死（曾出现 2000+ 秒）。
+     改成：只要 finishedAt 晚于本条提交时间，就算它完成。 */
+  if (_addWaiter) {
+    const myTurn = !!(s.finishedAt && _addWaitT0 && s.finishedAt >= _addWaitT0 - 5000)
+    if (!s.running || myTurn) { const w = _addWaiter; _addWaiter = null; _addWaitT0 = 0; w(s) }
   }
+  if (!_addBusy && !s.running) { addTickerStop(); addRender(s) }
 }
 function addWait() { return new Promise(res => { _addWaiter = res; addTicker() }) }
 /* 进入页面时恢复：批量进行中 → 直接重画；空闲 → 探一次状态（有单跑任务时也显示出来） */
@@ -9657,7 +9853,7 @@ function renderSeriesNo(keyEnc) {
           <h1>${libEsc(g.label)}</h1>
           <div class="sn-hero-btns">
             <button class="hbtn${FAV_SERIES.has(g.key) ? ' on' : ''}" onclick="toggleFavSeries('${libEsc(g.key)}', this)">${FAV_SERIES.has(g.key) ? '<span class="h">♥</span> 已收藏系列' : '<span class="h">♡</span> 收藏系列'}</button>
-            <button class="hbtn" onclick="subsAddSeries('${libEsc(g.key)}', '${libEsc(g.label)}', this)" title="订阅这个系列：订阅页会去线上找新作">✚ 订阅系列</button>
+            <button class="hbtn" data-subs="series" data-subs-name="${libEsc(g.label)}" data-subs-q="${libEsc(String(g.key).indexOf('P:') === 0 ? String(g.key).slice(2) : '')}" onclick="subsToggle(this)" title="订阅这个系列：订阅页会去线上找新作（已订阅时再点一次 = 取消订阅）">✚ 订阅系列</button>
           </div>
           <div class="sn-stats">
             ${serUni ? `<span>系列名 <b>${libEsc(serUni)}</b></span>` : ''}
@@ -9730,6 +9926,7 @@ function renderSeries(tag) {
           return `<i style="background:${grad}"></i>`
         }).join('')}</div>
         <div class="sno-meta"><b>${libEsc(g.label)}</b><em>${g.films.length} 部</em></div>
+        <button class="sno-fav sno-sub" data-subs="series" data-subs-name="${libEsc(g.label)}" data-subs-q="${libEsc(String(g.key).indexOf('P:') === 0 ? String(g.key).slice(2) : '')}" data-subs-ok="✓" title="订阅这个系列（已订阅时再点一次 = 取消订阅）" onclick="event.stopPropagation();subsToggle(this)">＋</button>
         <button class="sno-fav${FAV_SERIES.has(g.key) ? ' on' : ''}" title="收藏这个系列" onclick="event.stopPropagation();toggleFavSeries('${libEsc(g.key)}', this)">${FAV_SERIES.has(g.key) ? '♥' : '♡'}</button>
       </div>`
     listPage.innerHTML = acHead('#/', '系列') + `
@@ -10160,6 +10357,38 @@ window.subsReload = async function (force) {
   if (SUBS.tab === 'feed') { try { SUBS.feed = await (await fetch('/api/subscriptions/feed' + (force ? '?refresh=1' : ''), { cache: 'no-store' })).json() } catch (_) {} }
   renderSubs()
 }
+/* 「订阅女优 → 全量作品」的进度徽章（服务端 SUB_FULL：抓取阶段 running，抓完给 found/total）
+ * 抓取（翻页拉全）与入库（排队刮削）是两段：抓完 total 才有值，入库进度走 autoIngest。 */
+function subsFullBadge(f) {
+  if (!f) return ''
+  if (f.running) return ` <span class="mv-localbadge">⟳ 正在抓「${subsEsc(f.name)}」全部作品 · 已搜 ${f.page || 0} 页 / 命中 ${f.found || 0} 部</span>`
+  if (f.err) return ` <span class="mv-localbadge">✗ 全量抓取失败：${subsEsc(f.err)}</span>`
+  /* 线上没有同名女优时服务端直接跳过（硬搜会整批抓到别人的片子），把原因原样告诉用户 */
+  if (f.note) return ` <span class="mv-localbadge">⏭ 「${subsEsc(f.name)}」全量抓取已跳过：${subsEsc(f.note)}</span>`
+  if (f.total) {
+    const ex = f.expect ? `（线上作品数 ${f.expect} 部）` : ''
+    const dr = f.dropped ? ` · 已忽略 ${subsEsc(f.dropped)}` : ''
+    /* dry = 服务端只抓不入库的试算，别让「待入库」被误读成「已排队」 */
+    const dryTag = f.dry ? ' · 仅试算未入库' : ''
+    return ` <span class="mv-localbadge">补全「${subsEsc(f.name)}」：命中 ${f.found} 部 · 待入库 ${f.total} 部${ex}${dr}${dryTag}</span>`
+  }
+  if (f.at && f.name) {
+    const ex = f.expect ? `，线上作品数 ${f.expect} 部` : ''
+    const dryTag = f.dry ? ' · 仅试算未入库' : ''
+    return ` <span class="mv-localbadge">「${subsEsc(f.name)}」全部作品已在本机（抓取命中 ${f.found} 部${ex}）${dryTag}</span>`
+  }
+  return ''
+}
+/* 全量抓取进行中时，订阅页自己隔几秒刷新一次进度（不用用户手点「重新检查线上」） */
+var SUBS_FULL_TIMER = 0
+function subsFullPoll(f) {
+  clearTimeout(SUBS_FULL_TIMER)
+  if (!f || !f.running) return
+  SUBS_FULL_TIMER = setTimeout(() => {
+    if (location.hash !== '#/subs') return
+    try { subsLoadFeed(false).then(() => renderSubs()) } catch (_) {}
+  }, 4000)
+}
 async function subsLoadFeed(force) {
   try { SUBS.feed = await (await fetch('/api/subscriptions/feed' + (force ? '?refresh=1' : '') , { cache: 'no-store' })).json() } catch (_) {}
   subsBadgeRefresh()
@@ -10235,7 +10464,12 @@ window.subsNewSubmit = async function () {
     if (!d.ok) throw new Error(d.error || '添加失败')
     if (nameEl) nameEl.value = ''
     if (noteEl) noteEl.value = ''
-    if (st) st.textContent = d.dup ? '已经有这条订阅了' : ('✓ 已添加，正在检查线上新作…' + ((autoEl && autoEl.checked) ? '（该订阅已开自动入库）' : '（只发现新作，不自动入库）'))
+    if (st) {
+      const ad = d.added || {}
+      st.textContent = d.dup ? '已经有这条订阅了'
+        : ad.actorId ? '✓ 已按 JavDB 代号 ' + ad.actorId + ' 订阅「' + subsEsc(ad.name) + '」' + (ad.videosCount ? '（线上 ' + ad.videosCount + ' 部）' : '') + '，正在检查线上新作…' + ((autoEl && autoEl.checked) ? '（该订阅已开自动入库）' : '（只发现新作，不自动入库）')
+        : '✓ 已添加，正在检查线上新作…' + ((autoEl && autoEl.checked) ? '（该订阅已开自动入库）' : '（只发现新作，不自动入库）')
+    }
     await subsReload(true)
     subsBadgeRefresh()
   } catch (e) { if (st) st.textContent = '失败：' + e.message }
@@ -10292,19 +10526,22 @@ function jpTaskRender() {
   p.style.display = ''
   const ok = items.filter(x => x.state === 'ok').length
   const fail = items.filter(x => x.state === 'fail').length
-  const done = ok + fail
+  const qd = items.filter(x => x.state === 'queue').length
+  const done = ok + fail + qd
   const pct = st.total ? Math.round(Math.min(done, st.total) / st.total * 100) : 100
   const mark = s => s.state === 'run' ? '<i class="jp-spin"></i>'
     : s.state === 'ok' ? '<b style="color:#5ad07a;flex:none">✓</b>'
+    : s.state === 'queue' ? '<b style="color:#e8b45a;flex:none">⋯</b>'
     : s.state === 'fail' ? '<b style="color:#ff6b6b;flex:none">✗</b>' : '<b style="opacity:.4;flex:none">…</b>'
   const rows = items.map((s, i) => `<div class="jp-task-row" title="${libEsc(s.err || s.code)}">
       ${mark(s)}<span>${subsEsc(s.code)}</span>
       <em>${s.state === 'run' ? '抓取中…' : s.state === 'wait' ? '排队中'
+        : s.state === 'queue' ? libEsc((s.err || '已入服务端队列').slice(0, 40))
         : s.state === 'ok' ? (s.ms ? (s.ms / 1000).toFixed(0) + ' 秒' : '完成')
         : libEsc((s.err || '失败').slice(0, 40))}</em></div>`).join('')
   p.innerHTML = `<div class="jp-task-head" onclick="jpTaskToggle()">
       <span>⇣ 离线任务</span>
-      <em style="flex:1;text-align:right">${st.running ? `<b>${Math.min(st.idx, st.total) || done}/${st.total}</b> · 抓取中` : `完成：成功 ${ok}${fail ? ' · 失败 ' + fail : ''}`}</em>
+      <em style="flex:1;text-align:right">${st.running ? `<b>${Math.min(st.idx, st.total) || done}/${st.total}</b> · 抓取中` : `完成：成功 ${ok}${qd ? ' · 已排队 ' + qd : ''}${fail ? ' · 失败 ' + fail : ''}`}</em>
       ${st.running ? `<button class="jp-btn" onclick="event.stopPropagation();subsScrapeStop()">停止</button>`
         : `<button class="jp-btn" onclick="event.stopPropagation();jpTaskClear()">清空</button>`}
     </div>
@@ -10339,10 +10576,16 @@ async function subsScrapeRun() {
     st.cur = code; st.idx = i + 1
     it.state = 'run'; it.t0 = Date.now()
     jpTaskRender()
-    let ok = false, err = ''
+    let ok = false, err = '', queued = false, qpos = 0
     try {
-      const r = await (await fetch('/api/scrape/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })).json()
-      if (r.ok) {
+      /* queue:'front' —— 服务端正忙（订阅全量队列几百部）时不再直接失败，
+       * 而是插到服务端队首排队并回报位次；服务端空闲时照旧立刻开刮。 */
+      const r = await (await fetch('/api/scrape/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, queue: 'front' }) })).json()
+      if (r.queued) {
+        queued = true; qpos = Number(r.pos) || 0
+        err = qpos > 1 ? `已入服务端队列 · 前面还有 ${qpos - 1} 部` : '已入服务端队列 · 下一个就它'
+        try { if (typeof subsBadgeRefresh === 'function') subsBadgeRefresh() } catch (_) {}
+      } else if (r.ok) {
         ok = await new Promise(resolve => {
           const deadline = Date.now() + 240000
           const t = setInterval(async () => {
@@ -10359,9 +10602,9 @@ async function subsScrapeRun() {
       } else err = r.error || '任务启动失败'
     } catch (e) { err = e.message || '网络错误' }
     it.ms = Date.now() - it.t0
-    it.state = ok ? 'ok' : 'fail'
+    it.state = queued ? 'queue' : (ok ? 'ok' : 'fail')
     it.err = err
-    ok ? st.ok++ : st.fail++
+    if (queued) st.queued = (st.queued || 0) + 1; else ok ? st.ok++ : st.fail++
     jpTaskRender()
     if ((i + 1) % 5 === 0) { try { await loadServerLib() } catch (_) {} }
   }
@@ -10442,9 +10685,10 @@ function subsEditForm(s) {
     <select id="subE_kind" class="subs-input" title="订阅类型">
       <option value="actor"${s.kind === 'actor' ? ' selected' : ''}>女优</option>
       <option value="series"${s.kind === 'series' ? ' selected' : ''}>系列 / 番号前缀</option>
+      <option value="maker"${s.kind === 'maker' ? ' selected' : ''}>片商</option>
       <option value="code"${s.kind === 'code' ? ' selected' : ''}>单个番号</option>
     </select>
-    <input id="subE_name" class="subs-input" value="${libEsc(s.name)}" placeholder="订阅对象（女优名 / 前缀 / 番号）">
+    <input id="subE_name" class="subs-input" value="${libEsc(s.name)}" placeholder="订阅对象（女优名 / JavDB 代号或链接 / 前缀 / 番号）">
     <input id="subE_query" class="subs-input" value="${libEsc(s.query || s.name)}" placeholder="线上搜索关键词（默认同订阅对象）">
     <input id="subE_min" class="subs-input" type="number" min="0" value="${s.minSizeMb || 0}" placeholder="最小体积 MB">
     <input id="subE_max" class="subs-input" type="number" min="0" value="${s.maxSizeMb || 0}" placeholder="最大体积 MB（0 不限）">
@@ -10512,11 +10756,12 @@ function renderSubs() {
       ${shown.length ? `<button class="subs-btn" onclick="subsScrape(${JSON.stringify(shown.map(x => x.code)).replace(/"/g, '&quot;')})">⇩ 全部加入离线数据（${shown.length}）</button>` : ''}
       ${wcolsCtl('subs', 'wc-tight')}
     </div>
-    <div class="bd-note">订阅只负责<b>发现</b>新作；要不要入库，点卡片右下角 ⇩，或在「我的订阅」开自动入库。${(feed.autoIngest && (feed.autoIngest.running || feed.autoIngest.total)) ? ` <span class="mv-localbadge">自动入库 ${feed.autoIngest.done || 0}/${feed.autoIngest.total || 0}${feed.autoIngest.current ? ' · ' + subsEsc(feed.autoIngest.current) : ''}${feed.autoIngest.fail ? ' · 失败 ' + feed.autoIngest.fail : ''}</span>` : ''}</div>
+    <div class="bd-note">订阅只负责<b>发现</b>新作；要不要入库，点卡片右下角 ⇩，或在「我的订阅」开自动入库。${(feed.autoIngest && (feed.autoIngest.running || feed.autoIngest.total)) ? ` <span class="mv-localbadge">自动入库 ${feed.autoIngest.done || 0}/${feed.autoIngest.total || 0}${feed.autoIngest.current ? ' · ' + subsEsc(feed.autoIngest.current) : ''}${feed.autoIngest.fail ? ' · 失败 ' + feed.autoIngest.fail : ''}</span>` : ''}${subsFullBadge(feed.subFull)}</div>
     ${feed.error ? `<div class="subs-warn">线上检查出错：${subsEsc(feed.error)}</div>` : ''}
     <div class="subs-grid" data-wcols="subs">${shown.length ? shown.map(m => subsCard(m)).join('')
       : `<div class="mv-note">${subs.length ? '订阅里暂时没有线上新作（本机已全部入库，或线上还没有更新）。' : '还没有订阅。点「我的订阅」新建，或在女优页 / 系列页点「✚ 订阅」。'}</div>`}</div>
     ${feed.at ? `<div class="subs-foot">上次检查：${new Date(feed.at).toLocaleString('zh-CN')} · 本机媒体库 ${stats.local || 0} 部</div>` : ''}`
+    subsFullPoll(feed.subFull)      // 全量抓取进行中 → 本页自动刷新进度
 
     // 订阅详情一览（默认折叠，不占版面）
     const subRows = (feed.subs || []).map(s => `<div class="subs-srow">
@@ -10531,9 +10776,9 @@ function renderSubs() {
     body = `<div class="subs-newbox">
       <div class="subs-newrow">
         <select id="subsNewKind" class="subs-input" style="flex:0 0 96px">
-          <option value="actor">女优</option><option value="series">系列 / 番号前缀</option><option value="code">单个番号</option>
+          <option value="actor">女优</option><option value="series">系列 / 番号前缀</option><option value="maker">片商</option><option value="code">单个番号</option>
         </select>
-        <input id="subsNewName" class="subs-input" placeholder="订阅对象：女优名（如 三上悠亜）/ 系列前缀（如 MIDE）/ 番号（如 MIDE-295）">
+        <input id="subsNewName" class="subs-input" placeholder="订阅对象：女优名（如 三上悠亜）/ JavDB 女优链接或代号（如 A5yq，最准）/ 系列前缀（如 MIDE）/ 番号（如 MIDE-295）">
         <input id="subsNewNote" class="subs-input" placeholder="备注（可选）" style="flex:0 0 180px">
         <button class="subs-btn" onclick="subsNewSubmit()">＋ 添加订阅</button>
       </div>
@@ -10550,11 +10795,12 @@ function renderSubs() {
       : `<div class="subs-item${s.active === false ? ' off' : ''}">
         <span class="subs-kind k-${s.kind}">${SUBS_KIND_LB[s.kind] || s.kind}</span>
         <div class="subs-imain"><b>${subsEsc(s.name)}</b>
-          <em>${s.kind === 'actor' ? '线上按女优名匹配' : '线上按关键词「' + subsEsc(s.query || s.name) + '」搜索'}${s.lastCheckedAt ? ' · 上次检查 ' + new Date(s.lastCheckedAt).toLocaleString('zh-CN') : ''}${s.note ? ' · ' + subsEsc(s.note) : ''}${(s.minSizeMb || s.maxSizeMb) ? ' · 体积 ' + (s.minSizeMb ? s.minSizeMb + 'MB~' : '~') + (s.maxSizeMb ? s.maxSizeMb + 'MB' : '∞') : ''}</em></div>
+          <em>${s.kind === 'actor' ? (s.actorId ? 'JavDB 代号 ' + subsEsc(s.actorId) + ' · 按 id 精确锁定' + (s.videosCount ? ' · 线上 ' + s.videosCount + ' 部' : '') : '线上按女优名匹配') : '线上按关键词「' + subsEsc(s.query || s.name) + '」搜索'}${s.lastCheckedAt ? ' · 上次检查 ' + new Date(s.lastCheckedAt).toLocaleString('zh-CN') : ''}${s.note ? ' · ' + subsEsc(s.note) : ''}${(s.minSizeMb || s.maxSizeMb) ? ' · 体积 ' + (s.minSizeMb ? s.minSizeMb + 'MB~' : '~') + (s.maxSizeMb ? s.maxSizeMb + 'MB' : '∞') : ''}</em></div>
         <label class="subs-auto${s.autoIngest ? ' on' : ''}" title="开：检查到新作时自动刮削进离线数据。关：只在「线上新作」里列出来，要不要入库你自己点">
           <input type="checkbox"${s.autoIngest ? ' checked' : ''} onchange="subsAuto('${s.id}', this)">
           <span>自动入库</span>
         </label>
+        ${s.kind === 'actor' ? '<button class="subs-btn ghost" onclick="subsFull(\'' + s.id + '\',this)" title="去线上翻页拉全这位女优的全部作品，排队刮削入库（相当于补全她的历史作品）">⇄ 补全全部作品</button>' : ''}
         <button class="subs-btn ghost" onclick="subsEdit('${s.id}')" title="可视化编辑：类型 / 名称 / 搜索词 / 体积区间 / 备注">✎ 编辑</button>
         <button class="subs-btn ghost" onclick="subsAct('toggle','${s.id}',this)" title="暂停 / 恢复">${s.active === false ? '▶ 恢复' : '⏸ 暂停'}</button>
         <button class="subs-btn ghost danger" onclick="subsAct('remove','${s.id}',this)" title="取消订阅（不影响已入库的影片）">✕ 取消</button>
@@ -10630,7 +10876,7 @@ function renderSubs() {
             ${a.webUrl ? `<a href="${subsEsc(a.webUrl)}" target="_blank" rel="noopener" title="在 JavDB 网页版打开她">JavDB 网页版 ↗</a>` : ''}
             ${p.twitter ? `<a href="https://twitter.com/${subsEsc(p.twitter)}" target="_blank" rel="noopener" title="Twitter / X">𝕏 ${subsEsc(p.twitter)}</a>` : ''}
             ${p.instagram ? `<a href="https://instagram.com/${subsEsc(p.instagram)}" target="_blank" rel="noopener" title="Instagram">IG ${subsEsc(p.instagram)}</a>` : ''}
-            <button class="subs-btn ghost" onclick="subsAddActor('${subsEsc(p.name)}', this)" title="订阅该女优：有新作会在「线上新作」里提示">✚ 订阅她</button>
+            <button class="subs-btn ghost" data-subs="actor" data-subs-name="${subsEsc(p.name)}" data-subs-id="${libEsc(a.id || '')}" onclick="subsToggle(this)" title="订阅该女优：带上 JavDB 代号按 id 精确锁定，有新作会在「线上新作」里提示（已订阅时再点一次 = 取消订阅）">✚ 订阅她</button>
             <button class="subs-btn ghost" onclick="subsAwAskName()" title="换一位女优">✎ 换个名字</button>
             <button class="subs-btn ghost" onclick="subsTab('search')">‹ 返回搜索</button>
           </div>
@@ -10671,6 +10917,7 @@ function renderSubs() {
           <b>${subsEsc(ent.name || '…')}</b>
           <em>${ent.kind === 'maker' ? '片商' : '系列'}${ent.videos ? ' · 共 ' + ent.videos + ' 部作品' : ''}</em>
           <div class="sd-links">
+            <button class="subs-btn ghost" data-subs="${ent.kind === 'maker' ? 'maker' : 'series'}" data-subs-name="${subsEsc(ent.name || '')}" onclick="subsToggle(this)" title="订阅这个${ent.kind === 'maker' ? '片商' : '系列'}：订阅页会去线上搜它的新作（已订阅时再点一次 = 取消订阅）">✚ 订阅${ent.kind === 'maker' ? '片商' : '系列'}</button>
             ${ent.webUrl ? `<a href="${subsEsc(ent.webUrl)}" target="_blank" rel="noopener" title="在 JavDB 网页版打开">JavDB 网页版 ↗</a>` : ''}
             <button class="subs-btn ghost" onclick="subsEntBack()">‹ 返回${ent.kind === 'maker' ? '片商' : '系列'}列表</button>
           </div>
@@ -13649,7 +13896,8 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
       try { if (typeof libVisibleList === 'function') LIB = libVisibleList(LIB_ALL) } catch (e) {}
       if (typeof renderLibBrowse === 'function') { try { renderLibBrowse() } catch (e) {} }
     }],
-    ['optSrcPath', 'srcpath', null]    // 只影响「下次打开详情页」的渲染，不需要立刻重画
+    ['optSrcPath', 'srcpath', null],   // 只影响「下次打开详情页」的渲染，不需要立刻重画
+    ['optSubsFull', 'subsfull', null]  // 订阅女优全量抓取：由服务端在订阅那一刻读 uiPrefs.subsfull 执行，前端只需把值存下来
   ]
   function sync() {
     if (typeof PREF !== 'function') return
@@ -13680,6 +13928,591 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
   } catch (e) { boot() }
   setTimeout(boot, 1500)                                   // 兜底：网络慢 / 偏好没拉回来时再落一次
   addEventListener('hashchange', function () { if (location.hash === '#/settings') sync() })
+})();
+</script>
+<script>
+/* ==================== javpaco 库内女优 JavDB 代号（2026-10-03） ====================
+ * 服务端把影片库每位演员的 JavDB 代号回填到 cache/jdb-codes.json（GET /api/jdbcodes）。
+ * 这里做三件事：① 设置页显示回填进度/手动启停；② 女优详情页显示代号 + JavDB 直达链接；
+ * ③ 订阅按名字也能精确锁人（服务端 onlineActorSmartResolve 查这个缓存，前端无需配合）。 */
+(function () {
+  if (window.__jdbcPatch) return
+  window.__jdbcPatch = 1
+  var JDB = window.__JDB = window.__JDB || { map: {}, status: {}, at: 0 }
+  var TIMER = 0
+  function jdbcRefresh(force) {
+    if (!force && JDB.at && Date.now() - JDB.at < 10 * 60 * 1000) return Promise.resolve(JDB)
+    return fetch('/api/jdbcodes', { cache: 'no-store' }).then(r => r.json()).then(d => {
+      if (d && d.ok) { JDB.map = d.map || {}; JDB.status = d.status || {}; JDB.at = Date.now(); jdbcStatusRender() }
+      return JDB
+    }).catch(() => JDB)
+  }
+  window.jdbcStatusRender = function () {
+    const el = document.getElementById('jdbcStatus'); if (!el) return
+    const st = JDB.status || {}, m = JDB.map || {}
+    let total = 0, hits = 0
+    for (const k in m) { total++; if (m[k] && m[k].id) hits++ }
+    const eta = (ms) => { const s = Math.round(ms / 1000); if (s < 60) return s + ' 秒'; const mn = Math.round(s / 60); if (mn < 60) return mn + ' 分钟'; return (mn / 60).toFixed(1) + ' 小时' }
+    let txt = '已回填 ' + hits + ' / ' + total + ' 人' + (total - hits > 0 ? '（' + (total - hits) + ' 人线上查无代号）' : '')
+    if (st.running) {
+      txt += ' · ' + (st.mode === 'roster' ? '全名册' : '影片库') + (Number(st.phase) === 1 ? ' 快扫' : ' 精查')
+      txt += ' 「' + (st.cur || '') + '」' + (st.done || 0) + '/' + (st.total || 0)
+      if (st.etaMs) txt += ' · 预计还需 ' + eta(st.etaMs)
+      if (st.gap) txt += ' · 限速 ' + st.gap + 'ms' + (st.backoffs ? '（退避 ' + st.backoffs + ' 次）' : '')
+      if (st.reqs) txt += ' · 已发 ' + st.reqs + ' 次请求'
+    } else if (!total) txt = '还没有回填过 —— 点「⟳ 全名册回填」开始'
+    el.textContent = txt
+  }
+  window.jdbcStart = function () {
+    fetch('/api/jdbcodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start', mode: 'lib' }) })
+      .then(r => r.json()).then(() => {
+        jdbcRefresh(true); jdbcPoll()
+        if (typeof libToast === 'function') libToast('⟳ 开始回填影片库女优的 JavDB 代号', 'ok', 6000)
+      }).catch(() => {})
+  }
+  /* 全名册（2.5 万人）回填：两阶段 + 自适应限速，跑一整天也正常，随时可停可续 */
+  window.jdbcStartAll = function () {
+    if (!confirm('将对名册里全部女优（约 2.5 万人）逐个查 JavDB 代号。\n\n后台限速跑，预计需要数小时到十几小时，随时可以 ⏹ 停止并断点续跑。\n服务重启后会自动接着跑。\n\n确定开始吗？')) return
+    fetch('/api/jdbcodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start-all' }) })
+      .then(r => r.json()).then(() => {
+        jdbcRefresh(true); jdbcPoll()
+        if (typeof libToast === 'function') libToast('⟳ 全名册回填已开始：先快扫、再精查，自适应限速', 'ok', 6000)
+      }).catch(() => {})
+  }
+  window.jdbcStop = function () {
+    fetch('/api/jdbcodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }) })
+      .then(() => jdbcRefresh(true)).catch(() => {})
+  }
+  window.jdbcRetryMiss = function () {
+    fetch('/api/jdbcodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'retry-miss' }) })
+      .then(r => r.json()).then(() => { jdbcRefresh(true); jdbcPoll() }).catch(() => {})
+  }
+  function jdbcPoll() {
+    if (TIMER) return
+    TIMER = setInterval(() => {
+      jdbcRefresh(true).then(() => { const st = JDB.status || {}; if (!st.running) { clearInterval(TIMER); TIMER = 0 } })
+    }, 4000)
+  }
+  /* 女优详情页增强：代号行 + JavDB 搜索链接升级成直达链接 */
+  window.jdbcEnhanceActor = function (name) {
+    jdbcRefresh().then(() => {
+      const e = (JDB.map || {})[name]
+      const box = document.querySelector('.ac-vinfo'); if (!box) return
+      const old = document.getElementById('jdbcRow'); if (old) old.remove()
+      if (!(e && e.id)) return
+      const div = document.createElement('div'); div.className = 'ac-vrow'; div.id = 'jdbcRow'
+      div.innerHTML = '<span>JavDB 代号</span><b><a class="ac-vlink" href="https://javdb.com/actors/' + e.id + '" target="_blank" rel="noopener" title="打开她的 JavDB 女优页">' + e.id + ' ↗</a>' + (e.name ? '（' + e.name + (e.videos_count ? ' · 线上 ' + e.videos_count + ' 部' : '') + '）' : '') + '</b>'
+      box.appendChild(div)
+      const xl = document.querySelector('.ac-xlinks a[href*="javdb.com/search"]')
+      if (xl) xl.href = 'https://javdb.com/actors/' + e.id
+    })
+  }
+  /* 包一层女优详情渲染：渲染完自动增强（函数声明可重绑定） */
+  if (typeof renderActorDetail === 'function') {
+    const __acRD = renderActorDetail
+    renderActorDetail = function (name) { const r = __acRD(name); try { jdbcEnhanceActor(name) } catch (_) {} return r }
+  }
+  /* 设置页出现 jdbcStatus 时刷新状态（含回填进行中自动跟随） */
+  const mo = new MutationObserver(() => { if (document.getElementById('jdbcStatus')) jdbcRefresh().then(() => { if ((JDB.status || {}).running) jdbcPoll() }) })
+  try { mo.observe(document.body, { childList: true, subtree: true }) } catch (_) {}
+})();
+</script>
+
+<!-- ===== 补丁：macOS 原生客户端适配（左上返回键 + 浏览按钮走访达） =====
+     只在 AppDelegate 的 WKWebView 里生效（UA 含 javpaco-mac 且存在 window.webkit.messageHandlers.javpaco）；
+     浏览器里自动退回原来的行为：视频目录仍然是逐级浏览 libBrowse()，离线数据只能手输路径。 -->
+<button id="macBackBtn" title="返回上一页（⌘← / Esc 也可以）" style="display:none">‹</button>
+<style>
+  /* 就挂在导航条最左边（补丁脚本会把它插进 #nav 的第一个子元素），是个低调的圆形小按钮，
+     跟着导航走，不像浮层那样突兀。nav 整体是 pointer-events:none，这里要单独打开点击。 */
+  #macBackBtn { position: relative; z-index: 1; pointer-events: auto;
+    display: none; flex: none; align-items: center; justify-content: center;
+    width: 28px; height: 28px; padding: 0 0 2px 0; border-radius: 50%; cursor: pointer;
+    font: inherit; font-size: 15px; line-height: 1; color: var(--text-dim, #9b9ba6);
+    background: rgba(127,127,140,.12); border: 1px solid rgba(127,127,140,.22);
+    transition: background .15s, color .15s, border-color .15s; }
+  #macBackBtn:hover { background: rgba(127,127,140,.22); color: var(--text, #e8e8f0); border-color: rgba(127,127,140,.4); }
+  #macBackBtn:active { transform: scale(.94); }
+  html[data-is-app="0"] #macBackBtn { display: none !important; }
+  .jp-toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 9999;
+    max-width: min(620px, 88vw); padding: 10px 16px; border-radius: 10px; font-size: 13px; line-height: 1.5;
+    background: rgba(24,24,28,.95); color: #f2f2f5; border: 1px solid rgba(255,255,255,.14);
+    box-shadow: 0 8px 28px rgba(0,0,0,.35); }
+  .jp-toast.ok { border-color: rgba(108,192,108,.6); }
+</style>
+<script>
+(function () {
+  var IS_APP = /javpaco-mac/.test(navigator.userAgent || '');
+  try { document.documentElement.setAttribute('data-is-app', IS_APP ? '1' : '0') } catch (_) {}
+  if (!IS_APP) { window.__pickOrBrowse = function () { if (typeof window.libBrowse === 'function') window.libBrowse() }; return }
+
+  function toast(msg, ok) {
+    var d = document.createElement('div');
+    d.className = 'jp-toast' + (ok ? ' ok' : '');
+    d.textContent = msg;
+    (document.body || document.documentElement).appendChild(d);
+    setTimeout(function () { if (d.parentNode) d.parentNode.removeChild(d) }, 2600);
+  }
+  window.jpToast = toast;
+
+  /* ---- 原生访达选目录：Swift 侧 AppDelegate.chooseDir() 弹 NSOpenPanel，选完回调 __onNativePick ---- */
+  var _seq = 0, _wait = {};
+  window.__native = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.javpaco);
+  window.__onNativePick = function (id, p) { var f = _wait[id]; try { delete _wait[id] } catch (_) {} if (f) f(p || '') };
+  window.__pickDir = function (current, multiple, cb) {
+    if (!window.__native) return false;
+    var id = ++_seq; _wait[id] = cb;
+    try {
+      window.webkit.messageHandlers.javpaco.postMessage({ cmd: 'pickDir', cbId: id, current: current || '', multiple: !!multiple });
+      return true;
+    } catch (e) { try { delete _wait[id] } catch (_) {} return false; }
+  };
+  /** 浏览按钮：有原生桥接就弹访达，否则回退到网页内逐级浏览 libBrowse() */
+  window.__pickOrBrowse = function (inputId) {
+    var el = inputId ? document.getElementById(inputId) : null;
+    var cur = el && el.value ? String(el.value).trim() : '';
+    var done = window.__pickDir(cur, false, function (p) {
+      if (!p) return;
+      if (el) {
+        el.value = p;
+        try { el.dispatchEvent(new Event('input', { bubbles: true })) } catch (_) {}
+      }
+      toast('已选择：' + p, true);
+    });
+    if (!done) {                                  // 浏览器：保持原样
+      if (inputId === 'libPathInput' && typeof window.libBrowse === 'function') window.libBrowse();
+      else toast('浏览器里请直接粘贴路径，或用 Mac 版 App 点「浏览」选文件夹');
+    }
+  };
+
+  /* ---- 设置 → 外观：Dock 图标切换（走原生桥接，浏览器里整行隐藏） ---- */
+  window.__onNativeIcon = function (style) {
+    window.__dockIconNow = style || 'neon';
+    var row = document.getElementById('dockIconRow');
+    if (row) row.style.display = '';
+    document.querySelectorAll('[data-dock-icon]').forEach(function (b) {
+      var on = b.getAttribute('data-dock-icon') === window.__dockIconNow;
+      b.style.borderColor = on ? 'rgba(255,233,184,.75)' : '';
+      b.style.background = on ? 'rgba(255,233,184,.10)' : '';
+      b.style.fontWeight = on ? '600' : '';
+    });
+    var now = document.getElementById('dockIconNow');
+    if (now) now.textContent = '当前：' + ({ neon: '霓虹', glass: '毛玻璃' }[window.__dockIconNow] || window.__dockIconNow);
+  };
+  window.__setDockIcon = function (style) {
+    if (!window.__native) { return; }
+    try {
+      window.webkit.messageHandlers.javpaco.postMessage({ cmd: 'setIcon', style: style });
+      window.__onNativeIcon(style);
+    } catch (e) {}
+  };
+  window.__askDockIcon = function () {
+    if (!window.__native) return;
+    try { window.webkit.messageHandlers.javpaco.postMessage({ cmd: 'getIcon' }) } catch (_) {}
+  };
+
+  /* ---- 左上返回键：原生窗口没有浏览器工具栏，做成一个低调的圆形小按钮挂在导航栏最左边 ---- */
+  var btn = document.getElementById('macBackBtn');
+  if (btn) {
+    var nav = document.getElementById('nav');
+    if (nav && nav.firstChild) nav.insertBefore(btn, nav.firstChild);
+    btn.addEventListener('click', function () {
+      try { if (history.length > 1) { history.back(); return } } catch (_) {}
+      location.hash = '#/';
+    });
+  }
+  function isSubPage() {
+    var h = String(location.hash || '').replace(/^#\/?/, '');
+    if (h) return true;
+    var open = document.querySelector('.movie-page.open, .settings-page.open, .actors-page.open, .subs-page.open');
+    return !!(open && open.style.display !== 'none');
+  }
+  function sync() { if (btn) btn.style.display = isSubPage() ? 'inline-flex' : 'none'; }
+  window.addEventListener('hashchange', sync);
+  setInterval(sync, 350);
+  sync();
+
+  __askDockIcon();                     // 进页面先同步一次图标选中态
+  setInterval(__askDockIcon, 3000);    // 在原生设置面板里改了，网页这边也跟着变
+
+  /* 键盘也能后退（配合 title 里写的提示） */
+  function goBack() { try { if (history.length > 1) { history.back(); return } } catch (_) {} location.hash = '#/'; }
+  document.addEventListener('keydown', function (e) {
+    if (!btn || btn.style.display === 'none') return;
+    var typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || '');
+    if (typing) return;
+    if (e.key === 'Escape') { e.preventDefault(); goBack(); }
+    else if ((e.metaKey || e.ctrlKey) && e.key === 'ArrowLeft') { e.preventDefault(); goBack(); }
+  });
+})();
+</script>
+<script>
+/* ================= 订阅状态全局同步（2026-10-03） =================
+ * 需求：女优页（本地 + 订阅页内的 JavDB 女优页）、系列页、片商页上的「✚ 订阅」要三处一致：
+ *   ① 按钮自己变成「✓ 已订阅」  ② 订阅页里的 JavDB 女优页同步显示已订阅
+ *   ③ 「我的订阅」列表里出现这条订阅（含 tab 角标、导航角标）
+ * 实现：所有订阅按钮统一带 data-subs（类型）/ data-subs-name / data-subs-id（JavDB 代号）
+ *      / data-subs-q（线上搜索词），本脚本维护「订阅清单 SUBS.list」并按它刷新按钮外观。
+ *      SUBS.list 是「我的订阅」唯一的渲染源，保持它跟服务端一致 → 三处自动同步。 */
+(function () {
+  if (window.__subsSyncPatch) return
+  window.__subsSyncPatch = 1
+
+  try {
+    var st = document.createElement('style')
+    st.textContent = [
+      '.sno-sub { left: 8px; right: auto; }',
+      '.sno-sub.on { color: var(--accent); }',
+      '.subs-kind.k-maker { background: #c07a1f; }',
+      '.sn-hero-btns .hbtn.on, .ac-sub.on, .subs-btn.ghost.on { color: var(--accent-tint); border-color: rgba(var(--accent-rgb),.5); }'
+    ].join('\n')
+    document.head.appendChild(st)
+  } catch (_) {}
+  try { SUBS_KIND_LB.maker = '片商' } catch (_) {}
+
+  var MAP_KEY = 'javpaco.subsmap'   /* 本地页名字 → 订阅 id。服务端会把名字换成线上官方名，
+                                       没有这张表，本地页会认不出自己订阅的那条 */
+  var painting = false, timer = 0, lastLoad = 0, loading = false
+  var SUBS_OBS = null
+
+  function trim(s) { return String(s == null ? '' : s).trim() }
+  function L() {
+    try { return (typeof SUBS !== 'undefined' && SUBS && Array.isArray(SUBS.list)) ? SUBS.list : [] }
+    catch (_) { return [] }
+  }
+  function setList(list) { try { if (Array.isArray(list)) { SUBS.list = list; SUBS.loaded = true } } catch (_) {} }
+  function mapRead() { try { return JSON.parse(localStorage.getItem(MAP_KEY) || '{}') || {} } catch (_) { return {} } }
+  function mapWrite(m) { MAP = m; try { localStorage.setItem(MAP_KEY, JSON.stringify(m)) } catch (_) {} }
+  var MAP = {}                       /* 一次同步里对每个按钮都读一遍 localStorage 太浪费，按轮次缓存 */
+  function mapLoad() { MAP = mapRead() }
+  function keyOf(el) { return trim(el.getAttribute('data-subs')) + '|' + trim(el.getAttribute('data-subs-name')) }
+
+  /* 这个按钮对应的订阅记录：JavDB 代号 → 映射表 → 名字 / 搜索词 */
+  function subOf(el) {
+    var kind = trim(el.getAttribute('data-subs')), name = trim(el.getAttribute('data-subs-name'))
+    var id = trim(el.getAttribute('data-subs-id')), q = trim(el.getAttribute('data-subs-q'))
+    var list = L(), i, s
+    var mid = trim((MAP || mapRead())[keyOf(el)])
+    if (mid) for (i = 0; i < list.length; i++) if (trim(list[i].id) === mid) return list[i]
+    if (id) for (i = 0; i < list.length; i++) if (trim(list[i].actorId) === id) return list[i]
+    for (i = 0; i < list.length; i++) {
+      s = list[i]
+      if (s.kind !== kind) continue
+      if (trim(s.name) === name || trim(s.query) === name) return s
+      if (q && trim(s.query) === q) return s
+      /* s.locals = 服务端反查出的「库内写法」（同一 JavDB 代号的其它名字） */
+      var locals = s.locals || []
+      for (var j = 0; j < locals.length; j++) if (trim(locals[j]) === name) return s
+    }
+    return null
+  }
+
+  /* 订阅列表：任何带订阅按钮的页面都先拉一份（15 秒内不重复拉） */
+  async function ensure(force) {
+    if (loading) return
+    if (!force && lastLoad && Date.now() - lastLoad < 15000) return
+    loading = true
+    try {
+      var d = await (await fetch('/api/subscriptions', { cache: 'no-store' })).json()
+      if (d && d.ok) { setList(d.subs); lastLoad = Date.now() }
+    } catch (_) {}
+    loading = false
+    sync()
+  }
+
+  function paint(el) {
+    var s = subOf(el)
+    if (el.getAttribute('data-subs-h0') == null) el.setAttribute('data-subs-h0', el.innerHTML)
+    if (el.getAttribute('data-subs-t0') == null) el.setAttribute('data-subs-t0', el.title || '')
+    var want = s ? (s.active === false ? '2' : '1') : '0'
+    if (el.getAttribute('data-subs-on') === want) return      // 状态没变别动 DOM（免得 observer 递归）
+    el.setAttribute('data-subs-on', want)
+    if (want === '0') {
+      el.innerHTML = el.getAttribute('data-subs-h0') || ''
+      el.title = el.getAttribute('data-subs-t0') || ''
+      el.classList.remove('on')
+    } else {
+      el.innerHTML = trim(el.getAttribute('data-subs-ok')) || (want === '2' ? '⏸ 已暂停' : '✓ 已订阅')
+      el.title = '已订阅「' + trim(s.name) + '」· 再点一次取消订阅'
+      el.classList.add('on')
+    }
+  }
+
+  function sync() {
+    var els = document.querySelectorAll('[data-subs]')
+    mapLoad()
+    painting = true
+    try {
+      for (var i = 0; i < els.length; i++) { try { paint(els[i]) } catch (_) {} }
+    } finally {
+      painting = false      /* 必须 finally 复位：一旦这里抛错，painting 永远为 true，
+                                下面的守卫会把所有后续刷新全部挡掉（实测踩过：按钮再也不亮） */
+    }
+  }
+
+  function afterChange(grabName) {
+    lastLoad = 0
+    sync()
+    try { if (typeof subsBadgeRefresh === 'function') subsBadgeRefresh() } catch (_) {}
+    /* 人已经在订阅页 → 整页重画（「我的订阅」列表和 tab 角标读的都是同一份 SUBS.list） */
+    if (String(location.hash || '').indexOf('#/subs') === 0) {
+      try { if (typeof subsReload === 'function') subsReload(true) } catch (_) {}
+    }
+    if (grabName && typeof libToast === 'function') {
+      libToast('✓ 已订阅「' + trim(grabName) + '」<br><span style="opacity:.75">正在线上翻页抓取她的<b>全部作品</b>，筛掉本机已有的之后排队刮削入库 —— 进度看订阅页</span>', 'ok', 8000)
+    }
+  }
+
+  /* 统一的订阅 / 取消订阅入口：按钮 onclick="subsToggle(this)" */
+  window.subsToggle = async function (el) {
+    if (!el) return
+    if (el.getAttribute('data-subs-h0') == null) el.setAttribute('data-subs-h0', el.innerHTML)
+    await ensure(true)
+    var s = subOf(el)
+    if (s) {                                   // 已订阅 → 再点一次就是取消
+      if (!window.confirm('取消订阅「' + trim(s.name) + '」？\n（已入库的影片不受影响）')) return
+      el.disabled = true
+      try {
+        var rd = await (await fetch('/api/subscriptions', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'remove', id: s.id })
+        })).json()
+        if (rd && rd.ok) setList(rd.subs)
+      } catch (_) {}
+      el.disabled = false
+      afterChange('')
+      return
+    }
+    var kind = trim(el.getAttribute('data-subs')) || 'actor'
+    var name = trim(el.getAttribute('data-subs-name'))
+    if (!name) return
+    var q = trim(el.getAttribute('data-subs-q'))
+    var aid = trim(el.getAttribute('data-subs-id'))
+    var old = el.getAttribute('data-subs-h0') || el.innerHTML
+    el.disabled = true
+    el.innerHTML = kind === 'actor' ? '订阅中…' : '订阅中…'
+    try {
+      var d = await (await fetch('/api/subscriptions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add', kind: kind, name: name, query: q || name, actorId: aid || undefined })
+      })).json()
+      if (!d || !d.ok) throw new Error((d && d.error) || '订阅失败')
+      setList(d.subs)
+      /* 服务端命中 JavDB 代号时会把名字换成线上官方名 → 记下 id，本地页才认得出已订阅 */
+      var added = d.added || (Array.isArray(d.subs) ? d.subs[d.subs.length - 1] : null)
+      if (added && added.id) { var m = mapRead(); m[keyOf(el)] = String(added.id); mapWrite(m) }
+      el.disabled = false
+      afterChange(d.fullGrab ? trim((added && added.name) || name) : '')
+    } catch (e) {
+      el.disabled = false
+      el.innerHTML = old
+      if (typeof libToast === 'function') libToast('✗ ' + trim(e.message || '订阅失败'), 'warn', 6000)
+    }
+  }
+
+  /* 旧的两个订阅函数（别处还在用）补一刀：加完把清单拉回来，按钮状态跟着走 */
+  ;[['subsAddActor'], ['subsAddSeries']].forEach(function (pair) {
+    var fn = pair[0]
+    if (typeof window[fn] !== 'function') return
+    var orig = window[fn]
+    window[fn] = function () {
+      var p = orig.apply(this, arguments)
+      if (p && p.then) p.then(function () { lastLoad = 0; ensure(true) })
+      return p
+    }
+  })
+
+  /* 状态刷新：MutationObserver 立即响应 + 1 秒兜底轮询。
+   * ⚠️ 两个坑都踩过：① `new MutationObserver(...)` 不留引用时实测不回调（同一页面里另建的探针
+   *    观察器却正常），所以必须存成变量；② painting 守卫必须靠 try/finally 复位，否则一次异常
+   *    之后所有刷新都被挡掉。首屏整块 innerHTML 渲染（系列页一次插 70+ 个按钮）也靠轮询兜底。 */
+  if (window.MutationObserver) {
+    SUBS_OBS = new MutationObserver(function () {
+      if (painting) return
+      clearTimeout(timer); timer = setTimeout(sync, 80)
+    })
+    SUBS_OBS.observe(document.body, { childList: true, subtree: true })
+  }
+  setInterval(function () { try { sync() } catch (_) {} }, 900)
+
+  ensure(false)
+  window.addEventListener('hashchange', function () { ensure(false) })
+  window.__subsSync = function () { ensure(true) }
+})();
+</script>
+<script>
+/* ================= 任务面板 + 右下角常驻任务卡（2026-10-03） =================
+ * 添加影片页的「刮削任务」模块里常驻一条队列控制条：
+ *   待跑几部 · 正在刮哪部 · 已完成/失败 · ⏸暂停 ▶继续 ⏭停止当前 ⏹清空待跑
+ * 另外：**任何页面**右下角都有一张常驻任务卡（有任务才出现，没任务自动消失），
+ *   显示正在刮的番号 + 进度条 + 队列剩余，点一下跳到添加页。
+ * 接口：GET /api/scrape/queue · POST /api/scrape/queue {action:pause|resume|clear} · POST /api/scrape/stop
+ * 说明：「停止当前」只中止这一部（服务端逐阶段检查 stop 标志，不会写半成品）；
+ *      「清空待跑」丢的是还没刮的番号，已经入库的影片不受影响。 */
+(function () {
+  if (window.__addQueueBar) return
+  window.__addQueueBar = 1
+  try {
+  var STYLE = [
+      /* ---- 添加页：左「番号添加 + 视频目录」，右「刮削任务」大块（两列底边对齐） ---- */
+      '.add-grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.32fr); gap: 20px; align-items: stretch; }',
+      '@media (max-width: 1180px) { .add-grid2 { grid-template-columns: minmax(0, 1fr); } }',
+      '.add-col-l, .add-col-r { min-width: 0; display: flex; flex-direction: column; }',
+      /* 左列底边 = 视频目录卡的底边（去掉它自己的下外边距，两列才真正齐平） */
+      '.add-col-l > .lib-card { margin-bottom: 0; }',
+      /* 右列：任务卡撑满整列高度，内部三列吃掉多余空间 → 底边与左侧对齐 */
+      '.add-col-r .add-tasks { position: static; flex: 1 1 auto; display: flex; flex-direction: column; }',
+      '.add-col-r .at-hist { margin-top: auto; }',
+      /* 任务三列：排队中 / 刮削中 / 失败（历史记录仍在下方） */
+      '.ap-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 4px; flex: 1 1 auto; min-height: 0; }',
+      '@media (max-width: 860px) { .ap-cols { grid-template-columns: minmax(0, 1fr); } }',
+      '.ap-col { min-width: 0; border: 1px solid rgba(255,255,255,.07); border-radius: 12px;',
+      '  background: rgba(255,255,255,.025); padding: 9px 10px 10px; display: flex; flex-direction: column; }',
+      '.ap-col-h { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2);',
+      '  font-weight: 600; margin-bottom: 7px; padding-bottom: 6px; border-bottom: 1px dashed rgba(255,255,255,.1); }',
+      '.ap-col-h i { margin-left: auto; font-style: normal; font-size: 11px; color: var(--text-dim); }',
+      '.ap-col-h .dot-wait, .ap-col-h .dot-run, .ap-col-h .dot-fail { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }',
+      '.ap-col-h .dot-wait { background: #e8b45a; } .ap-col-h .dot-run { background: #4cc2ff; }',
+      '.ap-col-h .dot-fail { background: #ff6b6b; }',
+      /* 列身随卡片一起长高（内部各自滚动）；上限 620px 免得空队列时过于瘦长 */
+      '.ap-col-b { flex: 1 1 auto; min-height: 120px; max-height: 620px; overflow-y: auto; }',
+      '.aq-none { font-size: 11.5px; color: var(--text-dim); padding: 10px 2px; }',
+      '.add-queue-bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0 0 10px; padding:8px 12px;',
+      '  border-radius:10px; background:rgba(127,127,127,.10); border:1px solid rgba(255,255,255,.07); font-size:12px; color:var(--text-2); }',
+      '.add-queue-bar .aq-info { flex:1 1 auto; min-width:0; line-height:1.5; }',
+      '.add-queue-bar .aq-btns { display:flex; gap:6px; flex:0 0 auto; }',
+      /* ---- 右下角常驻任务卡：有任务才出现，没任务自动消失 ---- */
+      '.jp-taskcard { position: fixed; right: 20px; bottom: 20px; width: 320px; z-index: 380;',
+      '  border-radius: 14px; padding: 12px 14px; background: rgba(22,22,28,.86);',
+      '  border: 1px solid rgba(255,255,255,.14); box-shadow: 0 14px 44px rgba(0,0,0,.5);',
+      '  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); color: var(--text); font-size: 12.5px; }',
+      '.jp-taskcard .jtc-h { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 12.5px; margin-bottom: 7px; }',
+      '.jp-taskcard .jtc-h b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+      '.jp-taskcard .jtc-h button { flex: 0 0 auto; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }',
+      '.jp-taskcard .jtc-h button:hover { color: #fff; }',
+      '.jp-taskcard .jtc-bar { height: 4px; border-radius: 3px; background: rgba(255,255,255,.12); overflow: hidden; margin-bottom: 7px; }',
+      '.jp-taskcard .jtc-bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--accent-hi), var(--accent-lo)); }',
+      '.jp-taskcard .jtc-sub { color: var(--text-dim); font-size: 11.5px; display: flex; gap: 10px; flex-wrap: wrap; }',
+      '.jp-taskcard .jtc-go { margin-top: 8px; width: 100%; padding: 6px 0; border-radius: 8px; cursor: pointer;',
+      '  border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: var(--text-2); font-size: 12px; }',
+      '.jp-taskcard .jtc-go:hover { background: rgba(255,255,255,.12); color: #fff; }',
+      '@media (max-width: 720px) { .jp-taskcard { right: 12px; left: 12px; bottom: 12px; width: auto; } }'
+    ]
+    var st = document.createElement('style')
+    st.textContent = STYLE.join('\n')
+    document.head.appendChild(st)
+  } catch (_) {}
+
+  var host = null
+  function ensureBar() {
+    var box = document.querySelector('.add-tasks')
+    if (!box) { host = null; return null }
+    if (host && host.isConnected && host.parentNode === box) return host
+    host = document.getElementById('addQueueBar')
+    if (!host) {
+      host = document.createElement('div')
+      host.id = 'addQueueBar'
+      host.className = 'add-queue-bar'
+      host.innerHTML = '<span class="aq-info">正在读队列…</span><span class="aq-btns">' +
+        '<button class="at-btn" id="aqPause" onclick="aqAct(\'pause\')">⏸ 暂停队列</button>' +
+        '<button class="at-btn" id="aqResume" onclick="aqAct(\'resume\')" style="display:none">▶ 继续队列</button>' +
+        '<button class="at-btn stop" id="aqStop" onclick="aqAct(\'stop\')" style="display:none">⏭ 停止当前</button>' +
+        '<button class="at-btn" id="aqClear" onclick="aqAct(\'clear\')">⏹ 清空待跑</button></span>'
+      /* ⚠️ 锚点必须在 **box 内部** 查。原来用 document.getElementById('addProg')，
+       * 那个节点不一定在同一个父容器里（页面重渲染后 getElementById 可能命中别的容器里的同名节点），
+       * insertBefore 遇到「参照节点不是自己的子节点」会抛 NotFoundError ——
+       * WebKit 的文案就是 “The object can not be found here.”，而且因为在 async 里，
+       * 会以「未处理的异步错误」的形式弹出来（Chrome 文案不同，无头测试看不到）。 */
+      var prog = null
+      try { prog = box.querySelector('#addProg') } catch (_) {}
+      if (prog && prog.parentNode !== box) prog = null
+      if (!prog) { try { prog = box.firstChild } catch (_) {} }
+      if (prog && prog.parentNode === box) box.insertBefore(host, prog)
+      else box.appendChild(host)
+    } else if (host.parentNode !== box) {
+      try { box.appendChild(host) } catch (_) {}      // 旧节点被搬到了别处 → 挪回来
+    }
+    return host
+  }
+
+  /* ---- 右下角常驻任务卡：任何页面都盯着一份，有任务才出现、没任务立刻消失 ---- */
+  var card = null
+  function ensureCard() {
+    if (card && card.isConnected) return card
+    card = document.getElementById('jpTaskCard')
+    if (card) return card
+    card = document.createElement('div')
+    card.id = 'jpTaskCard'
+    card.className = 'jp-taskcard'
+    card.style.display = 'none'
+    card.innerHTML = '<div class="jtc-h"><span class="jtc-dot"></span><b class="jtc-code"></b>' +
+      '<button class="jtc-x" title="隐藏（任务还在跑，右下角图标会再出现）">×</button></div>' +
+      '<div class="jtc-bar"><i></i></div>' +
+      '<div class="jtc-sub"><span class="jtc-a"></span><span class="jtc-b"></span></div>' +
+      '<button class="jtc-go" onclick="location.hash=\'#/add\'">去添加影片页 →</button>'
+    card.querySelector('.jtc-x').addEventListener('click', function () {
+      card.style.display = 'none'
+      try { sessionStorage.setItem('javpaco.hideTaskCard', '1') } catch (_) {}
+    })
+    document.body.appendChild(card)
+    return card
+  }
+  function renderCard(d, sc) {
+    var c = ensureCard()
+    if (!c) return
+    var hidden = false
+    try { hidden = sessionStorage.getItem('javpaco.hideTaskCard') === '1' } catch (_) {}
+    var busy = !!sc || (d.pending > 0)
+    if (!busy || hidden) { c.style.display = 'none'; return }   // 没任务 → 自动消失
+    c.style.display = ''
+    var pct = sc ? Math.max(2, Math.min(100, Number(sc.pct) || 0)) : 0
+    c.querySelector('.jtc-bar i').style.width = pct + '%'
+    c.querySelector('.jtc-code').textContent = sc ? ('刮削中 · ' + sc.code) : ('队列中 · 待跑 ' + d.pending + ' 部')
+    c.querySelector('.jtc-a').textContent = sc ? (sc.phase || '处理中') + ' ' + pct + '%' : (d.paused ? '已暂停' : '排队中')
+    c.querySelector('.jtc-b').textContent = '已完成 ' + (d.done || 0) + (d.fail ? ' · 失败 ' + d.fail : '') + (d.pending ? ' · 待跑 ' + d.pending : '')
+    var dot = c.querySelector('.jtc-dot')
+    dot.style.cssText = 'width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:' + (d.paused ? '#e8b45a' : (sc ? '#4cc2ff' : '#5ad07a'))
+  }
+
+  async function aqPoll() {
+    try {
+      var d = null
+      try { d = await (await fetch('/api/scrape/queue', { cache: 'no-store' })).json() } catch (_) {}
+      if (!d || !d.ok) return
+      var sc = d.scraping
+      renderCard(d, sc)
+      var bar = ensureBar()
+      if (!bar) return
+      var txt = '入库队列：待跑 ' + (d.pending || 0) + ' 部'
+      txt += sc ? ' · 正在刮 ' + sc.code + '（' + (sc.phase || '处理中') + ' ' + (sc.pct || 0) + '%）'
+        : (d.pending ? ' · 队列运行中' : ' · 空闲')
+      txt += ' · 已完成 ' + (d.done || 0) + (d.fail ? '（失败 ' + d.fail + '）' : '')
+      if (d.paused) txt += ' · ⏸ 已暂停'
+      var info = bar.querySelector('.aq-info')
+      if (info && info.textContent !== txt) info.textContent = txt
+      var pb = document.getElementById('aqPause'), rb = document.getElementById('aqResume')
+      if (pb) pb.style.display = d.paused ? 'none' : ''
+      if (rb) rb.style.display = d.paused ? '' : 'none'
+      var sb = document.getElementById('aqStop')
+      if (sb) { sb.style.display = sc ? '' : 'none'; if (sc) sb.setAttribute('title', '中止正在刮的「' + sc.code + '」，队列里其余不受影响') }
+      var cb = document.getElementById('aqClear')
+      if (cb) cb.setAttribute('title', '清掉待跑的 ' + (d.pending || 0) + ' 部（已入库的不受影响）')
+    } catch (e) {
+      /* 轮询里的任何异常都不许冒泡成「未处理的异步错误」去打扰用户 */
+      try { console.warn('[javpaco] 队列工具条刷新失败', e && e.message) } catch (_) {}
+    }
+  }
+  window.aqAct = async function (act) {
+    if (act === 'clear' && !window.confirm('清空待跑队列？\n队列里还没刮的番号会被丢弃，已经入库的影片不受影响。')) return
+    if (act === 'stop' && !window.confirm('停止正在刮的这一部？\n队列里其余番号会接着跑。')) return
+    var url = act === 'stop' ? '/api/scrape/stop' : '/api/scrape/queue'
+    try {
+      await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: act }) })
+    } catch (_) {}
+    setTimeout(aqPoll, 400)
+  }
+  setInterval(aqPoll, 2000)
+  aqPoll()
 })();
 </script>
 </body></html>
