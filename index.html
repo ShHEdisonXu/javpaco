@@ -3565,7 +3565,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
         <h2>关于</h2>
         <div class="sp-card">
           <div class="sp-row"><div class="l">JAVぱこ</div></div>
-          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.3.7 · 本地媒体库 + 多源刮削</small></div></div>
+          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.3.8 · 本地媒体库 + 多源刮削</small></div></div>
         </div>
         <div class="sp-card" style="margin-top:14px">
           <div class="sp-row"><div class="l">备份与恢复<small>把配置（媒体库 / 数据源 / 隐藏列表 / 偏好）+ 播放记录 + 评分备注标签打包成一个 JSON 文件下载；换机或清库前先导出，恢复后自动重扫</small></div></div>
@@ -13542,6 +13542,14 @@ function setBrowserPicker(on) {
 const libFolderIco = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#edd9a6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path><path d="M3 11h18"></path></svg>'
 let LIB_DIRS = [], LIB_PARENT = null, LIB_STATS = {}, LIB_ROOT = ''
 async function libRender() {
+  /* 「服务端已配置哪些媒体库」要在 #libList 的早退之前记下来：
+   * #libList 只存在于添加页（#/add），在首页/影片库页 libRender 会第一行就 return，
+   * 若把记录放在 fetch 之后，这些页永远拿不到 → 状态栏会误判成「未设置媒体库」。 */
+  fetch('/api/library', { cache: 'no-store' }).then(r => r.json()).then(d => {
+    if (!d || !d.ok) return
+    try { window.__jpLibInfo = { root: d.root || '', libraries: (d.libraries || []).slice(), native: !!d.native } } catch (_) {}
+    try { if (typeof jpUpdateLibStatusSoon === 'function') jpUpdateLibStatusSoon() } catch (_) {}
+  }).catch(() => {})
   const box = document.getElementById('libList'); if (!box) return
   try {
     const d = await (await fetch('/api/library', { cache: 'no-store' })).json()
@@ -13853,7 +13861,7 @@ loadWatch().then(() => loadUDB()).then(() => loadServerLib()).then(ok => {
   try { setTimeout(subsBadgeRefresh, 1200) } catch (_) {}   // 导航「订阅」角标：线上新作数
   if (!ok) {
     const el = document.getElementById('libStatus')
-    if (el && (el.textContent === '未设置媒体库' || el.textContent === ''))
+    if (el && (el.textContent === '未设置媒体库' || el.textContent === '' || el.textContent.indexOf('未设置媒体库') === 0))
       el.innerHTML = '<span class="okdot" style="background:#6a6a76;box-shadow:none"></span>未连接本地服务<br><span style="opacity:.6;font-size:11px">运行 server.js 后刷新即自动连接；或直接添加媒体文件夹（纯浏览器模式）</span>'
   }
 })
@@ -17527,4 +17535,292 @@ window.setAutoDlMax = async function () {
 <style>
 .lb-pv{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;z-index:4;background:#000}
 </style>
+<style>
+/* ---- 扫描进度 v2：常驻横幅（跨页面）+ 可点取消 + 实时「已处理/总数」 ----
+ * 之前的问题：
+ *  1) 进度只写在「添加页」的 #libStatus 里 → 切到别的页再回来（甚至从没去过添加页）就看不到，
+ *     只剩右下角一个 pointer-events:none 的小卡片，既不知道扫到多少也不能取消。
+ *  2) 取消不了：卡片 pointer-events:none，页面上也没有停止按钮。
+ *  3) walk 阶段（云盘遍历可能几十分钟）服务端不报数字 → 只能显示 indeterminate 条，
+ *     用户看不到「已扫到多少个视频」。
+ * 现在：顶部常驻横幅（任何页面可见）+ 数字实时滚动 + 「停止扫描」真取消（服务端 /api/scan/cancel）。 */
+#scanBanner {
+  position: fixed; left: 50%; top: 14px; transform: translateX(-50%); z-index: 1400;
+  width: min(560px, calc(100vw - 28px));
+  background: rgba(16,16,24,.94); color: #e8e8f0; border: 1px solid rgba(255,255,255,.13);
+  border-radius: 14px; padding: 12px 14px; font-size: 12.5px; line-height: 1.55;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5); backdrop-filter: blur(10px);
+  display: none; pointer-events: auto;
+}
+#scanBanner.on { display: block; }
+#scanBanner .sb-t { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13px; }
+#scanBanner .sb-t .okdot { width: 8px; height: 8px; border-radius: 50%; background: #3b82f6; box-shadow: 0 0 8px rgba(59,130,246,.75); flex: 0 0 auto; }
+#scanBanner .sb-t b { font-variant-numeric: tabular-nums; }
+#scanBanner .sb-x {
+  margin-left: auto; font: inherit; font-size: 11.5px; font-weight: 600; color: #e08585;
+  background: rgba(224,133,133,.12); border: 1px solid rgba(224,133,133,.34);
+  border-radius: 999px; padding: 3px 12px; cursor: pointer; flex: 0 0 auto;
+}
+#scanBanner .sb-x:hover { background: rgba(224,133,133,.24); color: #fff; }
+#scanBanner .sb-x[disabled] { opacity: .5; cursor: default; }
+#scanBanner .sb-bar { position: relative; height: 6px; margin: 9px 0 8px; border-radius: 3px; overflow: hidden; background: rgba(255,255,255,.12); }
+#scanBanner .sb-bar i { position: absolute; inset: 0 auto 0 0; display: block; border-radius: 3px; background: linear-gradient(90deg,#3b82f6,#8b5cf6); transition: width .4s ease; }
+#scanBanner .sb-bar.ind i { width: 34%; animation: sbInd 1.2s ease-in-out infinite alternate; }
+@keyframes sbInd { from { margin-left: 0 } to { margin-left: 66% } }
+#scanBanner .sb-n { display: flex; flex-wrap: wrap; gap: 6px; }
+#scanBanner .sb-n span { background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.08); border-radius: 7px; padding: 2px 8px; opacity: .9; }
+#scanBanner .sb-n b { font-variant-numeric: tabular-nums; }
+#scanBanner .sb-cur { margin-top: 6px; opacity: .6; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#scanBanner.done .sb-t .okdot { background: #5fd39b; box-shadow: 0 0 8px rgba(95,211,155,.7); }
+#scanBanner.stopped .sb-t .okdot { background: #f59e0b; box-shadow: 0 0 8px rgba(245,158,11,.7); }
+/* 右下角旧卡片：让出位置给顶部横幅，并允许点击（不再 pointer-events:none） */
+#globalScanPill { pointer-events: auto; }
+#globalScanPill .gsp-x { margin-top: 8px; font: inherit; font-size: 11.5px; font-weight: 600; color: #e08585; background: rgba(224,133,133,.12); border: 1px solid rgba(224,133,133,.34); border-radius: 999px; padding: 3px 12px; cursor: pointer; width: 100%; }
+#globalScanPill .gsp-x:hover { background: rgba(224,133,133,.24); color: #fff; }
+/* 播放器所在容器永远不是放大镜：hover 出 magnifier、点一下弹封面大图是最容易误触的组合。
+ * ⚠ 两处 specificity 陷阱（都踩过）：
+ *   1) `.vwrap *{cursor:default}` 会连按钮的 pointer 一起盖掉（`.vwrap *` 是 0,1,0，
+ *      压过 .vpbtn 自己的 cursor:pointer）→ 改用 :not() 把可交互元素排除。
+ *   2) `!important` 更狠：`.mv-fanart.playing *{...!important}` 会把上面那条 pointer 也压掉，
+ *      播放时按钮全部点不动。所以 !important 只用在「容器自己」上，子元素靠 :not() 排除法。 */
+.mv-fanart.playing { cursor: default !important; }
+.mv-fanart.playing *:not(button):not(input):not(a):not([role="button"]) { cursor: default !important; }
+.mv-fanart.playing button, .mv-fanart.playing input, .mv-fanart.playing a,
+.mv-fanart.playing [role="button"], .mv-fanart.playing .vprog,
+.mv-fanart.playing .vpr-track, .mv-fanart.playing .vpr-dot,
+.mv-fanart.playing .vpr-play, .mv-fanart.playing .vpr-buf { cursor: pointer !important; }
+.vwrap, .vwrap *:not(button):not(input):not(a):not([role="button"]) { cursor: default; }
+.vwrap button, .vwrap input, .vwrap a, .vwrap [role="button"] { cursor: pointer; }
+.vwrap .vprog, .vwrap .vpr-track, .vwrap .vpr-dot,
+.vwrap .vpr-play, .vwrap .vpr-buf { cursor: pointer; }
+</style>
+<script>
+/* =====================================================================
+ * 扫描进度 v2 + 媒体库状态修正 + 播放器光标修正（追加式补丁，不改既有函数体）
+ * 同名函数后定义覆盖 + window 挂载，供各处调用。
+ * ===================================================================== */
+(function () {
+  'use strict';
+  if (window.__scanV2) return; window.__scanV2 = true;
+
+  var PHASE = { walk: '正在遍历媒体库目录', index: '正在建立封面 / NFO 索引', match: '正在匹配番号与元数据', done: '扫描完成', cancelled: '已取消' };
+  var banner = null, bannerState = null, pollTimer = null, hideTimer = null, cancelling = false;
+
+  function fmt(n) { try { return (n || 0).toLocaleString() } catch (_) { return String(n || 0) } }
+
+  function ensureBanner() {
+    if (banner && banner.isConnected) return banner;
+    banner = document.createElement('div');
+    banner.id = 'scanBanner';
+    document.body.appendChild(banner);
+    return banner;
+  }
+
+  /* walk 阶段也报数字：videos 是「已发现」，scanned 是「已处理」，两者含义不同要分开说。
+   * pct 只在 match 阶段（分母确定）才是真百分比；walk 阶段用 indeterminate 条 + 计数。 */
+  function renderBanner(s) {
+    var el = ensureBanner();
+    var st = s || {};
+    var phase = PHASE[st.phase] || '准备中';
+    var videos = st.videos || 0, scanned = st.scanned || 0;
+    var known = st.phase === 'match' || st.phase === 'done' || st.phase === 'cancelled' || st.phase === 'index';
+    var pct = (known && videos) ? Math.min(100, Math.round(scanned / videos * 100)) : null;
+    var cls = 'on' + (st.phase === 'done' ? ' done' : '') + (st.phase === 'cancelled' ? ' stopped' : '');
+    var chips = [];
+    if (st.phase === 'walk') {
+      /* 遍历阶段：分母还不存在，报「已看目录 / 已找到视频 / 第几个库」 */
+      chips.push('<span>已遍历目录 <b>' + fmt(st.dirs) + '</b></span>');
+      chips.push('<span>已找到视频 <b>' + fmt(st.found || videos) + '</b></span>');
+      if (st.libsTotal) chips.push('<span>媒体库 <b>' + fmt(st.libsDone) + '</b> / ' + fmt(st.libsTotal) + '</span>');
+    } else {
+      chips.push('<span>共扫到视频 <b>' + fmt(videos) + '</b></span>');
+      chips.push('<span>已处理 <b>' + fmt(scanned) + '</b> / ' + fmt(videos) + '</span>');
+      chips.push('<span>成功 <b style="color:#5fd39b">' + fmt(st.okCount) + '</b></span>');
+      chips.push('<span>失败 <b style="color:' + ((st.failCount || 0) ? '#e08585' : 'inherit') + '">' + fmt(st.failCount) + '</b></span>');
+      chips.push('<span>封面匹配 <b>' + fmt(st.matched) + '</b></span>');
+      if (pct !== null) chips.push('<span><b>' + pct + '%</b></span>');
+    }
+    var cur = st.current ? ('正在处理：' + st.current) : '';
+    el.className = cls;
+    el.innerHTML =
+      '<div class="sb-t"><span class="okdot"></span><b>媒体库扫描中</b> · ' + phase +
+      (pct !== null ? ' · ' + pct + '%' : '') +
+      '<button class="sb-x" id="sbCancel"' + (cancelling ? ' disabled' : '') + '>' + (cancelling ? '正在停止…' : '停止扫描') + '</button></div>' +
+      '<div class="sb-bar' + (pct === null ? ' ind' : '') + '"><i style="width:' + (pct === null ? 34 : pct) + '%"></i></div>' +
+      '<div class="sb-n">' + chips.join('') + '</div>' +
+      (cur ? '<div class="sb-cur">' + cur + '</div>' : '');
+    var btn = document.getElementById('sbCancel');
+    if (btn) btn.onclick = function (e) { e.stopPropagation(); doCancel() };
+  }
+
+  /* 真取消：POST /api/scan/cancel，服务端在可中断点停下（不落盘半成品、不排自动刮削）。
+   * 前端只是发指令 + 停轮询；「真的停了」由服务端 running=false 且 cancelled=true 确认。 */
+  function doCancel() {
+    if (cancelling) return;
+    cancelling = true;
+    renderBanner(bannerState);
+    fetch('/api/scan/cancel', { method: 'POST' }).catch(function () {});
+    /* 服务端最多处理完当前这一部；给 3 秒后即使没回也把横幅收掉，不让用户干等 */
+    setTimeout(function () {
+      fetch('/api/scan', { cache: 'no-store' }).then(function (r) { return r.json() }).then(function (s) {
+        if (s && s.running) { cancelling = false; renderBanner(s); poll(); return }   // 还在跑，继续等
+        stop(true);
+      }).catch(function () { stop(true) });
+    }, 1500);
+  }
+  window.scanDoCancel = doCancel;
+
+  function stop(keepBanner) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+    cancelling = false;
+    if (typeof scanTimer !== 'undefined' && scanTimer) { try { clearInterval(scanTimer) } catch (_) {} }
+    try { if (typeof window.scanTimer !== 'undefined') window.scanTimer = null } catch (_) {}
+    scanTimer = null;
+    bannerState = null;
+    try { globalScanStatus(null) } catch (_) {}
+    /* 「已取消 / 扫描完成」先挂 2.6 秒让人看到结局，再彻底清空（含 innerText，
+     * 否则横幅虽然隐藏了，DOM 里还留着「正在停止…」和旧数字，下次开新的横幅会闪一下旧内容）。 */
+    if (banner) {
+      banner.className = banner.className.replace(/\bon\b/g, '').trim();
+      if (keepBanner) setTimeout(function () { if (banner) { banner.className = ''; banner.innerHTML = '' } }, 2600);
+      else banner.innerHTML = '';
+    }
+  }
+  window.scanStopWatch = stop;
+
+  /* 轮询：任何页面都开着（banner 常驻），所以切页面回来进度自动接上 */
+  function tick() {
+    fetch('/api/scan', { cache: 'no-store' }).then(function (r) { return r.json() }).then(function (s) {
+      if (!s) return;
+      if (s.running) {
+        bannerState = s; cancelling = false;
+        renderBanner(s);
+        try { globalScanStatus(s) } catch (_) {}      // 右下角旧卡片同步（页面级状态若有也刷）
+        if (typeof watchScan === 'function') { try { watchScan() } catch (_) {} }   // 原逻辑继续负责海报墙渐进铺
+        return;
+      }
+      /* 结束：成功 / 取消 / 出错，都收横幅 */
+      bannerState = s;
+      if (s.phase === 'cancelled') { renderBanner(s); stop(true); finish(true); return }
+      if (s.error) { renderBanner({ phase: 'done', error: s.error }); stop(true); return }
+      stop(true); finish(false);
+    }).catch(function () {});
+  }
+  /* 收尾：拉全量刷新（扫描成功才刷，取消不动已有数据） */
+  function finish(ok) {
+    try { if (typeof loadServerLib === 'function') loadServerLib().then(function () { try { renderLibrary() } catch (_) {} }) } catch (_) {}
+    try { if (typeof libRender === 'function') libRender() } catch (_) {}
+    if (!ok) { try { toast && toast('扫描已取消，已保留上一次的结果') } catch (_) {} }
+  }
+  function poll() {
+    if (pollTimer) return;
+    tick();
+    pollTimer = setInterval(tick, 1000);
+  }
+  /* 启动/复用：进页面、路由切换都调一次，已在轮询就直接返回 */
+  function ensureWatch() {
+    if (pollTimer) { tick(); return }
+    fetch('/api/scan', { cache: 'no-store' }).then(function (r) { return r.json() }).then(function (s) {
+      if (s && s.running) poll();
+    }).catch(function () {});
+  }
+  window.scanEnsureWatch = ensureWatch;
+
+  /* 扫描是「页面加载之后」才被触发的（点重新扫描 / 添加目录后自动扫），
+   * 光在加载时探一次不够 —— 那样横幅永远不出现。这里挂一个低频兜底轮询：
+   * 空闲时 2.5 秒探一次（几乎无成本），一旦 running 立刻切回 1 秒高频。 */
+  setInterval(function () { if (!pollTimer) ensureWatch() }, 2500);
+
+  /* 路由切换 → 立刻探一次：切回影片库/添加页/任意页都能看到正在扫 */
+  try {
+    if (typeof PREF === 'function') { /* 保持与既有偏好体系一致（当前无新增偏好键） */ }
+  } catch (_) {}
+  window.addEventListener('hashchange', function () { setTimeout(ensureWatch, 60) });
+  document.addEventListener('DOMContentLoaded', function () { setTimeout(ensureWatch, 300) });
+  /* 脚本执行期先探一次（首屏 renderLibrary 早已跑过，这里补上扫描态） */
+  setTimeout(ensureWatch, 600);
+
+  /* 包一层 watchScan：用户点「⟳ 全部重新扫描」或添加目录触发扫描时，横幅立刻出现，
+   * 不用等兜底轮询那 2.5 秒。原函数照常执行（海报墙渐进铺仍靠它）。 */
+  try {
+    if (typeof watchScan === 'function' && !watchScan.__v2) {
+      var _ws0 = watchScan;
+      var _ws = function () { try { poll() } catch (_) {} return _ws0.apply(this, arguments) };
+      _ws.__v2 = true;
+      window.watchScan = _ws;
+    }
+  } catch (_) {}
+
+  /* ---- 媒体库状态：已添加媒体库但还没扫到片时，不再显示「未设置媒体库」 ----
+   * 原来 updateLibStatus 只看 LIB.length（影片数）：媒体库已配置但扫描未跑/扫到 0 部时，
+   * LIB 为空 → 谎报「未设置媒体库」，用户以为刚加的目录没生效。
+   * 现在用服务端 /api/library 的 libraries 数量判断「有没有配媒体库」。 */
+  function libConfigured() {
+    try {
+      if (typeof LIB_DIRS_OK !== 'undefined' && LIB_DIRS_OK) return true;
+      if (typeof LIB_ROOT !== 'undefined' && LIB_ROOT) return true;
+    } catch (_) {}
+    try {
+      var d = window.__jpLibInfo;
+      if (d && Array.isArray(d.libraries) && d.libraries.length) return true;
+    } catch (_) {}
+    return false;
+  }
+  window.jpLibConfigured = libConfigured;
+
+  /* libRender 是 async 的，等它把 window.__jpLibInfo 填好再刷新状态（否则会先用旧值判成「未设置」）。
+   * 用微任务 + 一次 rAF 双保险：libRender 的 fetch 返回后同一轮里 DOM 还没写完。 */
+  var _stT = null;
+  function jpUpdateLibStatusSoon() {
+    if (_stT) return;
+    _stT = setTimeout(function () {
+      _stT = null;
+      try { window.updateLibStatus() } catch (_) {}
+    }, 0);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(function () {
+      try { window.updateLibStatus() } catch (_) {}
+    });
+  }
+  window.jpUpdateLibStatusSoon = jpUpdateLibStatusSoon;
+
+  /* 覆写 updateLibStatus：媒体库已配置但 0 部 → 明确说「已配置，等待扫描」，不再说未设置 */
+  window.updateLibStatus = function () {
+    var el = document.getElementById('libStatus');
+    if (!el) return;
+    var has = Array.isArray(LIB) && LIB.length > 0;
+    if (!has) {
+      if (libConfigured()) {
+        el.innerHTML = '<span class="okdot" style="background:#f59e0b;box-shadow:0 0 8px rgba(245,158,11,.75)"></span>媒体库已添加，正在等待扫描收录' +
+          '<br><span style="opacity:.7;font-size:11px">若长时间没有影片，点下方「⟳ 全部重新扫描」；空文件夹不会产生影片</span>';
+      } else {
+        el.textContent = LIB_CONNECTED ? '该文件夹中没有视频文件' : '未设置媒体库';
+      }
+      return;
+    }
+    var total = LIB.reduce(function (s, x) { return s + x.size }, 0);
+    var withCover = LIB.filter(function (x) { return x.posterUrl || x.fanartUrl }).length;
+    el.innerHTML = LIB_CONNECTED
+      ? '已连接 <b>' + LIB.length + '</b> 个影片（封面匹配 <b>' + withCover + '</b>）· 共 <b>' + fmtSize(total) + '</b><br><span style="opacity:.7">' + (LIB[0].relPath.split('/')[0]) + ' /</span>'
+      : '上次库：<b>' + LIB.length + '</b> 个影片（浏览器刷新后需重新选择文件夹连接）';
+  };
+
+  /* ---- 播放器：容器 hover 不该是放大镜，点容器不该弹封面大图 ----
+   * 详情页内嵌播放时 host(.mv-fanart) 加了 .playing（CSS 里已把 cursor 变 default），
+   * 但仍有两处漏：① 在线详情页的 .mv-fanart 没加 playing 守卫；② 弹层播放器容器同理。
+   * 统一在 capture 阶段拦掉「播放器内部点击」冒泡到封面灯箱，并强制容器光标。 */
+  function isPlayerNode(el) {
+    return !!(el && el.closest && el.closest('.vwrap, .mv-fanart.playing'));
+  }
+  document.addEventListener('mouseover', function (e) {
+    var fan = e.target && e.target.closest && e.target.closest('.mv-fanart');
+    if (!fan) return;
+    if (isPlayerNode(fan) || fan.classList.contains('playing')) fan.style.cursor = 'default';
+  }, true);
+  document.addEventListener('click', function (e) {
+    var fan = e.target && e.target.closest && e.target.closest('.mv-fanart');
+    if (!fan) return;
+    if (isPlayerNode(fan) || fan.classList.contains('playing')) { e.stopPropagation(); e.preventDefault() }
+  }, true);
+})();
+</script>
 </body></html>

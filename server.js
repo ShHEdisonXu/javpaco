@@ -1140,33 +1140,74 @@ function walk(dir, out = []) {
   return out
 }
 /* 异步版（扫描专用）：网盘挂载上 readdir 也可能卡数秒，主线程不能停 */
-async function walkAsync(dir, out = []) {
+/* 递归收集视频文件。onDir/onFile 是扫描进度与取消的回调（每处理一个目录/文件调一次）：
+ * 云盘挂载下这一阶段可能跑几十分钟，没有实时计数前端只能显示一条 indeterminate 进度条。 */
+async function walkAsync(dir, out = [], onDir, onFile) {
   let entries = []
   try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch (_) { return out }
+  if (onDir) onDir(dir)
   for (const e of entries) {
     if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === '_trash') continue
     const fp = path.join(dir, e.name)
-    if (e.isDirectory()) await walkAsync(fp, out)
-    else if (VIDEO_EXT.includes(extOf(e.name))) out.push(fp)
+    if (e.isDirectory()) await walkAsync(fp, out, onDir, onFile)
+    else if (VIDEO_EXT.includes(extOf(e.name))) { out.push(fp); if (onFile) onFile(fp) }
   }
   return out
 }
 
-/* ---------- 扫描（后台异步 + 进度上报，前端轮询 /api/scan 显示进度条） ---------- */
-const SCAN = { running: false, phase: '', videos: 0, scanned: 0, matched: 0, okCount: 0, failCount: 0, startedAt: 0, finishedAt: 0, ms: 0, error: '', pending: false }
+/* ---------- 扫描（后台异步 + 进度上报 + 可随时彻底取消，前端轮询 /api/scan 显示进度条） ----------
+ * 取消语义：SCAN.cancel = true 是「请求取消」，scanAsync 在每个可中断点检查它，
+ * 抛 CANCELLED 走 catch 统一收尾（清队列、不落盘半成品 DATA、不触发自动刮削、不自动续跑 pending）。
+ * 这样取消后不留残根：队列里没轮到的番号不会被自动刮削，磁盘上的 scan-result.json 保持上一次完整结果。 */
+const SCAN_CANCELLED = '已取消'
+const SCAN = {
+  running: false, phase: '', videos: 0, scanned: 0, matched: 0, okCount: 0, failCount: 0,
+  startedAt: 0, finishedAt: 0, ms: 0, error: '', pending: false, cancel: false, cancelled: false,
+  dirs: 0, found: 0, libsTotal: 0, libsDone: 0, current: ''
+}
+/* 扫描可中断点：取消时抛 SCAN_CANCELLED（区别于真错误），并且只在真正该中断时抛 */
+function scScanCheck() { if (SCAN.cancel) throw new Error(SCAN_CANCELLED) }
+function scScanReset() {
+  SCAN.running = true; SCAN.error = ''; SCAN.cancel = false; SCAN.cancelled = false
+  SCAN.phase = 'walk'; SCAN.videos = 0; SCAN.scanned = 0; SCAN.matched = 0; SCAN.okCount = 0; SCAN.failCount = 0
+  SCAN.autoQueued = 0; SCAN.dirs = 0; SCAN.found = 0; SCAN.libsDone = 0; SCAN.current = ''
+  SCAN.libsTotal = LIBS.length
+  SCAN.startedAt = Date.now(); SCAN.finishedAt = 0
+}
+/* 请求取消（幂等）：不在扫描中也安全调用，返回当前状态让前端统一处理 */
+function scScanCancel() {
+  SCAN.pending = false          // 取消顺手撤掉「扫完自动再扫一遍」，否则取消后又自己跑起来
+  SCAN.cancel = true
+  if (!SCAN.running) SCAN.cancelled = true
+  return { ok: true, running: SCAN.running, cancelled: SCAN.cancelled, error: SCAN.error }
+}
 
 async function scanAsync() {
   const t0 = Date.now()
-  SCAN.running = true; SCAN.error = ''
-  SCAN.phase = 'walk'; SCAN.videos = 0; SCAN.scanned = 0; SCAN.matched = 0; SCAN.okCount = 0; SCAN.failCount = 0; SCAN.autoQueued = 0
-  SCAN.startedAt = t0; SCAN.finishedAt = 0
+  scScanReset()
   const yieldLoop = () => new Promise(r => setImmediate(r))
   try {
     // 遍历所有媒体库（库之间去重，防止嵌套重复收录）；rel 仍相对挂载根，/media/ 直出不变
     const seen = new Set()
     const videos = []
-    for (const lib of LIBS) for (const v of await walkAsync(lib)) if (!seen.has(v)) { seen.add(v); videos.push(v) }
+    /* walk 阶段也给实时计数（dirs 已看目录数 / found 已找到视频数 / libsDone 当前第几个库），
+     * 不然云盘挂载扫几十分钟，前端只能看到一条 indeterminate 进度条、没有数字。 */
+    for (let li = 0; li < LIBS.length; li++) {
+      const lib = LIBS[li]
+      SCAN.libsDone = li; SCAN.current = path.basename(lib) || lib
+      for (const v of await walkAsync(lib, [], () => {
+        SCAN.dirs++
+        if (SCAN.cancel) throw new Error(SCAN_CANCELLED)
+      }, () => { SCAN.found++; if (SCAN.found % 32 === 0) SCAN.videos = SCAN.found })) {
+        if (seen.has(v)) continue
+        seen.add(v); videos.push(v)
+      }
+      SCAN.libsDone = li + 1
+      await yieldLoop()
+    }
     SCAN.videos = videos.length
+    SCAN.found = videos.length
+    scScanCheck()
     SCAN.phase = 'index'
     await yieldLoop()
     const items = []
@@ -1177,6 +1218,7 @@ async function scanAsync() {
       let entries = []
       try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch (_) { return }
       for (const e of entries) {
+        if (SCAN.cancel) throw new Error(SCAN_CANCELLED)
         if (e.name.startsWith('.')) continue
         const fp = path.join(dir, e.name)
         if (e.isDirectory()) await indexImgs(fp)
@@ -1184,12 +1226,15 @@ async function scanAsync() {
       }
     }
     for (const lib of LIBS) { await indexImgs(lib); await yieldLoop() }
+    scScanCheck()
 
     SCAN.phase = 'match'
     PROBE_TASKS.clear(); VPROBE_OFF = false; PROBE_SLOW = 0   // 每次扫描重试熔断（网盘可能已恢复）
     const MANUAL_CODES = loadManualCodes()   // 手动指定的番号覆盖（relVideo → code），重扫后仍生效
     let i = 0
     for (const vp of videos) {
+      if (SCAN.cancel) throw new Error(SCAN_CANCELLED)   // 每部都查，取消了立刻停（不做完当前这部）
+      SCAN.current = path.basename(vp)
       const dir = path.dirname(vp)
       const p = parseName(vp)
       const relVideo = path.relative(MEDIA_ROOT, vp).split(path.sep).join('/')
@@ -1292,16 +1337,25 @@ async function scanAsync() {
     saveScanResult()   // 落盘：容器重建/更新后重启不必重扫云盘也能立刻显示影片库
     vprobeFlush()   // 分辨率探测结果落盘，重扫不重复解析
   } catch (e) {
-    SCAN.error = e.message
-    console.log('[scan] error:', e.message)
+    /* 取消不是错误：不写半成品 DATA、不落盘、不排自动刮削、不续跑 pending。
+     * 磁盘上的 scan-result.json 与内存 DATA 保持「上一次完整结果」，取消是无残留的。 */
+    if (e && e.message === SCAN_CANCELLED) {
+      SCAN.cancelled = true; SCAN.error = ''
+      console.log(`[scan] 已取消（已处理 ${SCAN.scanned}/${SCAN.videos}，用时 ${Date.now() - t0}ms），保留上一次扫描结果`)
+    } else {
+      SCAN.error = e.message
+      console.log('[scan] error:', e.message)
+    }
   }
   SCAN.ms = Date.now() - t0
-  SCAN.phase = 'done'
+  SCAN.phase = SCAN.cancelled ? 'cancelled' : 'done'
   SCAN.finishedAt = Date.now()
   SCAN.running = false
-  schedulePreviews()   // 扫描完成 → 给新建档的实体影片安排悬停预览生成（低负担串行）
-  /* 扫描中又有人添加/删除了媒体库 → 立刻按新列表再扫一遍（否则改动要等下次手动重扫） */
-  if (SCAN.pending) { SCAN.pending = false; setTimeout(() => { if (!SCAN.running) scanAsync() }, 250) }
+  SCAN.current = ''
+  if (!SCAN.cancelled) schedulePreviews()   // 扫描完成 → 给新建档的实体影片安排悬停预览生成（低负担串行）
+  /* 扫描中又有人添加/删除了媒体库 → 立刻按新列表再扫一遍（否则改动要等下次手动重扫）。
+   * ⚠ 用户点了取消就不许自己再跑起来（scScanCancel 已把 pending 清掉，这里再兜一层）。 */
+  if (SCAN.pending && !SCAN.cancelled) { SCAN.pending = false; setTimeout(() => { if (!SCAN.running) scanAsync() }, 250) }
 }
 
 /* ---------- HTTP ---------- */
@@ -1400,6 +1454,7 @@ function previewPrune() {   // 缓存上限 80 部，超出删最旧
 }
 
 function rescan() {
+  SCAN.cancel = false; SCAN.cancelled = false   // 新一轮扫描清掉上次的取消标记
   if (SCAN.running) { SCAN.pending = true; return }   // 已在扫描中 → 记一笔，扫完自动再扫
   scanAsync()
 }
@@ -1549,9 +1604,30 @@ function compressibleType(type) {
   return /text|json|javascript|svg|xml/.test(type)
 }
 
-/* 海报墙缩略图生成（ffmpeg，按需+并发去重+落盘缓存 cache/thumbs/，源图更新自动失效） */
+/* 海报墙缩略图生成（纯 JS / jpeg-js，不依赖 ffmpeg —— Mac/Win 原生版没有 ffmpeg 也能出小图；
+ * 按需+并发去重+落盘缓存 cache/thumbs/，源图更新自动失效。原图仍留给详情页。） */
+const jpegLib = require('jpeg-js')
 const THUMB_DIR = () => path.join(cacheDir(), 'thumbs')
 const thumbInFlight = new Map()   // key -> Promise<Buffer|null>
+/* 盒式降采样（区域均值），比逐点采样更干净，小图也不会糊边 */
+function downscaleRGBA(src, sw, sh, dw, dh) {
+  const dst = Buffer.alloc(dw * dh * 4)
+  const rx = sw / dw, ry = sh / dh
+  for (let y = 0; y < dh; y++) {
+    const sy0 = Math.floor(y * ry), sy1 = Math.max(sy0 + 1, Math.min(sh, Math.floor((y + 1) * ry)))
+    for (let x = 0; x < dw; x++) {
+      const sx0 = Math.floor(x * rx), sx1 = Math.max(sx0 + 1, Math.min(sw, Math.floor((x + 1) * rx)))
+      let r = 0, g = 0, b = 0, a = 0, n = 0
+      for (let sy = sy0; sy < sy1; sy++) {
+        let o = (sy * sw + sx0) * 4
+        for (let sx = sx0; sx < sx1; sx++, o += 4) { r += src[o]; g += src[o + 1]; b += src[o + 2]; a += src[o + 3]; n++ }
+      }
+      const di = (y * dw + x) * 4
+      dst[di] = r / n; dst[di + 1] = g / n; dst[di + 2] = b / n; dst[di + 3] = a / n
+    }
+  }
+  return dst
+}
 async function movieThumb(code, kind) {
   if (!/^[A-Za-z0-9._-]+$/.test(code) || !['poster', 'fanart'].includes(kind)) return null
   const src = path.join(cacheDir(), 'movies', code, 'images', kind + '.jpg')
@@ -1565,13 +1641,22 @@ async function movieThumb(code, kind) {
   let pr = thumbInFlight.get(key)
   if (!pr) {
     pr = new Promise(resolve => {
+      const done = buf => { thumbInFlight.delete(key); resolve(buf) }
       try { fs.mkdirSync(THUMB_DIR(), { recursive: true }) } catch (_) {}
-      const vf = kind === 'poster' ? 'scale=-2:720' : 'scale=960:-2'
-      execFile('ffmpeg', ['-i', src, '-frames:v', '1', '-vf', vf, '-q:v', '5', '-y', out], { timeout: 30000 }, e => {
-        thumbInFlight.delete(key)
-        if (e) { try { fs.unlinkSync(out) } catch (_) {}; return resolve(null) }
-        try { resolve(fs.readFileSync(out)) } catch (_) { resolve(null) }
-      })
+      // 限高 720（海报）/ 限宽 960（大图），不放大；纯 JS 缩放，无需 ffmpeg
+      let raw
+      try { raw = jpegLib.decode(fs.readFileSync(src), { useTArray: true, maxMemoryUsageInMB: 256 }) } catch (_) { return done(null) }
+      const sw = raw.width, sh = raw.height
+      let dw, dh
+      if (kind === 'poster') { dh = Math.min(720, sh); dw = Math.max(1, Math.round(sw * dh / sh / 2) * 2) }
+      else { dw = Math.min(960, sw); dh = Math.max(1, Math.round(sh * dw / sw / 2) * 2) }
+      try {
+        const srcData = Buffer.from(raw.data)
+        const data = (dw === sw && dh === sh) ? srcData : downscaleRGBA(srcData, sw, sh, dw, dh)
+        const enc = jpegLib.encode({ data, width: dw, height: dh }, 80)
+        fs.writeFileSync(out, enc.data)
+        return done(enc.data)
+      } catch (_) { try { fs.unlinkSync(out) } catch (_) {}; return done(null) }
     })
     thumbInFlight.set(key, pr)
   }
@@ -6462,19 +6547,11 @@ async function handleActorApi(req, res, p) {
       return res.end(r.buf)
     } catch (_) { res.writeHead(404); return res.end('Not Found') }
   }
-  /* ---------- 海报墙缩略图：/thumb/<番号>/<poster|fanart> ----------
-   * 全尺寸原图（海报可到 1032×1468、大图 2184×1468，单张几百 KB ~ 1MB）直接喂墙会拖慢滚动，
-   * 这里用 ffmpeg 压成墙用小图（海报限高 720 / 大图限宽 960），原图仍留给详情页。
-   * 缩略图缓存 cache/thumbs/，按源图 mtime 失效；生成失败回退原图。 */
-  const MT = /^\/thumb\/([A-Za-z0-9._-]+)\/(poster|fanart)$/.exec(p)
-  if (MT) {
-    const tb = await movieThumb(MT[1], MT[2])
-    if (tb) {
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': tb.length, 'Cache-Control': 'public, max-age=604800' })
-      return res.end(tb)
-    }
-    return sendFile(req, res, path.join(cacheDir(), 'movies', MT[1], 'images', MT[2] + '.jpg'))
-  }
+  /* ⚠ 海报墙缩略图 /thumb/<番号>/<poster|fanart> 的路由已挪到主 createServer 处理器里。
+   * 原来它写在这儿（handleActorApi 内部），而 handleActorApi 只被 /api/actor|offline|import|scrape|images
+   * 这几类路径调用 —— /thumb/ 永远进不来，前端 thumbOf() 改写后全部 404，再静默回退全尺寸原图，
+   * 于是「缩略图优化」等于没生效，首页铺几百张 1MB 海报（Mac 上尤其慢，因为还没 ffmpeg）。 */
+
   /* ---------- 外挂字幕：找同目录同名字幕，srt/ass 现场转成 WebVTT 再喂给 <track>（浏览器只认 vtt） ---------- */
   if (p === '/api/subs') {
     const rel = String(body.rel || '')
@@ -8678,6 +8755,26 @@ const server = http.createServer((req, res) => {
         res.writeHead(302, { Location: '/login' }); return res.end()
       }
     }
+    /* ---------- 海报墙缩略图：/thumb/<番号>/<poster|fanart> ----------
+     * 全尺寸原图（海报可到 1032×1468、大图 2184×1468，单张几百 KB ~ 1MB）直接喂墙会拖慢滚动，
+     * 这里压成墙用小图（海报限高 720 / 大图限宽 960），原图仍留给详情页。
+     * 缩略图缓存 cache/thumbs/，按源图 mtime 失效；生成失败回退原图。
+     * ⚠ 这段必须放在主处理器里：之前它被误写在 handleActorApi 内部，而那个函数只服务
+     *   /api/* 几类路径，/thumb/ 永远 404 → 前端静默回退全尺寸原图，缩略图优化形同虚设。 */
+    if (p.startsWith('/thumb/')) {
+      const MT = /^\/thumb\/([A-Za-z0-9._-]+)\/(poster|fanart)$/.exec(p)
+      if (MT) {
+        movieThumb(MT[1], MT[2]).then(tb => {
+          if (tb) {
+            res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': tb.length, 'Cache-Control': 'public, max-age=604800' })
+            return res.end(tb)
+          }
+          sendFile(req, res, path.join(cacheDir(), 'movies', MT[1], 'images', MT[2] + '.jpg'))
+        }).catch(() => { try { res.writeHead(404); res.end('Not Found') } catch (_) {} })
+        return
+      }
+      res.writeHead(404); return res.end('Not Found')
+    }
     if (p === '/api/library/browse') return json(res, libraryBrowse(u.searchParams.get('path') || ''))
     /* ---------- 进度条缩略图：ffmpeg 按需抽帧（GET，无 body） ----------
      * /api/preview?rel=      → 状态（首次调用会排队后台生成，20~48 帧）
@@ -8770,6 +8867,12 @@ const server = http.createServer((req, res) => {
     }
     if (p === '/api/scan') {
       return json(res, Object.assign({ ok: true }, SCAN, { hasData: !!DATA }))
+    }
+    /* 取消扫描：POST /api/scan/cancel —— 幂等，不在扫描中也返回 ok。
+     * 前端「停止」按钮用；服务端在每个可中断点检查 SCAN.cancel 真正停下来（不是前端假装的）。 */
+    if (p === '/api/scan/cancel') {
+      if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+      return json(res, scScanCancel())
     }
     if (p === '/api/movie' || p === '/api/cache' || p === '/api/cache/clean') {
       const okM = (p === '/api/movie' && req.method === 'POST') ||
