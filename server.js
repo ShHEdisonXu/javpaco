@@ -118,6 +118,158 @@ function cacheDir() {
     || path.join(UI_ROOT, 'cache'))
 }
 
+/* ================= 海报悬停预览动图（B方案） =================
+ * 实体影片（relVideo 本地文件）加入后，自动抽 **6 段 × 各 2 秒**（合计约 12s）的静音 480p mp4，
+ * 6 段取自影片不同时间点，串成一条短片循环播放，存进 cache/movies/<番号>/pv6.mp4。
+ * 低负担原则：单 worker 串行、任务间留 2s 间隔、扫描进行中让路、ffmpeg 走 nice -n 15。
+ * 纯在线条目（relVideo 以 web:// 开头、无本地文件）不生成。
+ * ⚠ 本块必须在模块顶层（不能放进 handleActorApi 等函数体内）——函数声明提升只在同作用域生效，
+ *   放进函数里会导致启动时顶层调用 schedulePreviews 报 not defined。
+ * ⚠ 文件名带版本（pv6 而非 preview）：抽帧参数一改就换名，旧文件自动失效、整批重生成，
+ *   不需要写迁移逻辑。PREV_VER 同步 bump，previews.json 里版本不匹配时触发一次性清理+重排。 */
+const PREV_FILE = 'pv6.mp4'
+const PREV_OLD_FILE = 'preview.mp4'   // v1（旧）：单段 5s，只为清理用
+const PREV_VER = 2                    // v1=单段5s / v2=6段×2s
+const PREV_SEG = 2                    // 每段秒数
+const PREV_SEGS = 6                   // 段数
+const PREV_TMP = '.pvseg'
+let PREV_QUEUE = [], PREV_RUN = false
+const PREV_SET = new Set()
+const PREV_PATH = path.join(cacheDir(), 'previews.json')
+function previewHas(code) { try { return fs.existsSync(path.join(cacheDir(), 'movies', code, PREV_FILE)) } catch (_) { return false } }
+function previewLoad() {
+  try {
+    const v = JSON.parse(fs.readFileSync(PREV_PATH, 'utf8'))
+    if (v && v.v === PREV_VER && Array.isArray(v.codes)) { v.codes.forEach(c => PREV_SET.add(c)); return false }
+  } catch (_) {}
+  return true   // 版本不匹配 / 文件损坏 → 需要整批重做
+}
+function previewSave() { try { fs.mkdirSync(cacheDir(), { recursive: true }); fs.writeFileSync(PREV_PATH, JSON.stringify({ v: PREV_VER, codes: [...PREV_SET] })) } catch (_) {} }
+/* 版本升级的一次性清理：删掉旧版单段 preview.mp4，让这些番号重新排队 */
+function previewCleanupOld() {
+  try {
+    const root = path.join(cacheDir(), 'movies'); let n = 0
+    for (const d of fs.readdirSync(root)) {
+      const op = path.join(root, d, PREV_OLD_FILE)
+      try { if (fs.existsSync(op)) { fs.unlinkSync(op); n++ } } catch (_) {}
+    }
+    if (n) { console.log('[preview] 旧版预览已清理 ' + n + ' 个，将按 6 段×2s 重新生成'); previewSave() }
+  } catch (_) {}
+}
+function previewScanCodes() { const root = path.join(cacheDir(), 'movies'); const out = []; try { for (const d of fs.readdirSync(root)) { if (previewHas(d)) out.push(d) } } catch (_) {} return out }
+/* 总开关：设置 → 偏好「生成海报悬停预览」（uiPrefs.hpreview，值是字符串 '0'/'1'）。没设置过 = 开。
+ * 关掉后只是「不再生成新的」，已生成的 pv6.mp4 原地保留 —— 用户重新打开开关立刻恢复显示。 */
+function previewEnabled() {
+  try { const u = CFG && CFG.uiPrefs; if (!u) return true; const v = u.hpreview; return !(v === '0' || v === 0 || v === 'false') } catch (_) { return true }
+}
+function enqueuePreview(code) {
+  if (!previewEnabled()) return
+  code = bare(code); if (!code) return
+  if (previewHas(code)) { PREV_SET.add(code); return }
+  if (PREV_QUEUE.indexOf(code) >= 0) return
+  PREV_QUEUE.push(code); if (!PREV_RUN) hprvPump()
+}
+function schedulePreviews() {
+  if (!previewEnabled()) return
+  const items = (DATA && DATA.items) || []
+  for (const it of items) { if (it && it.relVideo && !/^web:\/\//i.test(it.relVideo)) enqueuePreview(it.code) }
+}
+function hprvPump() {
+  if (PREV_RUN) return
+  PREV_RUN = true
+  const step = () => {
+    if (!PREV_QUEUE.length) { PREV_RUN = false; return }
+    /* 开关关掉 → 丢掉未开始的队列（正在跑的那部让它跑完，避免留半成品文件） */
+    if (!previewEnabled()) { PREV_QUEUE = []; PREV_RUN = false; console.log('[preview] 开关已关闭，停止排队生成'); return }
+    if (SCAN.running) { setTimeout(step, 15000); return }
+    const code = PREV_QUEUE.shift()
+    if (previewHas(code) || PREV_SET.has(code)) { setTimeout(step, 300); return }
+    genPreview(code).then(() => setTimeout(step, 2000)).catch(() => setTimeout(step, 2000))
+  }
+  step()
+}
+/* 6 个采样起点：跳过片头（可能黑场/Logo），铺满整部影片，末尾也留余量避免抽到片尾字幕。
+ * 片子太短放不下 6 段时按可容纳数量降段（至少 1 段）。 */
+function hprvStarts(d) {
+  const lo = Math.max(0.8, Math.min(d * 0.02, 30))
+  const hi = Math.max(lo, d - PREV_SEG - Math.min(30, d * 0.02))
+  const n = Math.max(1, Math.min(PREV_SEGS, Math.floor((hi - lo) / PREV_SEG)))
+  if (n === 1) return [(lo + hi) / 2]
+  const out = []
+  for (let i = 0; i < n; i++) out.push(lo + (hi - lo) * i / (n - 1))
+  return out
+}
+/* 跑一条 ffmpeg，macOS 没有 nice 时自动回退裸 ffmpeg（args 必须原样传下去） */
+function hprvRun(args, to, cb) {
+  const attempt = useNice => {
+    const cmd = useNice ? 'nice' : 'ffmpeg'
+    const a = useNice ? ['-n', '15', 'ffmpeg'].concat(args) : args
+    execFile(cmd, a, { timeout: to, killSignal: 'SIGKILL' }, err => {
+      if (err && err.code === 'ENOENT' && useNice) return attempt(false)
+      cb(err || null)
+    })
+  }
+  attempt(true)
+}
+function genPreview(code) {
+  return new Promise(res => {
+    const it = (DATA && DATA.items || []).find(x => bare(x.code) === code && x.relVideo && !/^web:\/\//i.test(x.relVideo))
+    if (!it) return res()
+    const video = safeMediaPath(it.relVideo)
+    if (!video || !fs.existsSync(video)) return res()
+    const dir = path.join(cacheDir(), 'movies', code)
+    const out = path.join(dir, PREV_FILE)
+    const tmp = path.join(dir, PREV_TMP)
+    const done = ok => {
+      try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (_) {}
+      if (ok && fs.existsSync(out) && fs.statSync(out).size >= 8000) {
+        PREV_SET.add(code); previewSave()
+        console.log('[preview] ✓ ' + code + ' 6 段×2s 已生成 (' + fs.statSync(out).size + 'B)')
+      } else { try { fs.unlinkSync(out) } catch (_) {} }
+      res()
+    }
+    execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', video], { timeout: 30000 }, (e, so) => {
+      const dur = parseFloat(String(so || ''))
+      if (!e && isFinite(dur) && dur > PREV_SEG) return startBuild(dur)
+      console.log('[preview] ✗ ' + code + ' 取时长失败/过短，跳过')
+      done(false)
+    })
+
+    function startBuild(dur) {
+      const starts = hprvStarts(dur)
+      try { fs.mkdirSync(tmp, { recursive: true }) } catch (_) {}
+      const segs = []
+      const step = i => {
+        if (i >= starts.length) return concatAll()
+        const seg = path.join(tmp, 's' + i + '.mp4')
+        /* -ss 放在 -i 前 = 输入端快速 seek（不必从 0 解码），长影片尤其关键 */
+        const args = ['-y', '-ss', starts[i].toFixed(1), '-i', video, '-t', String(PREV_SEG),
+          '-an', '-vf', 'scale=-2:480', '-c:v', 'libx264', '-crf', '30', '-preset', 'veryfast',
+          '-pix_fmt', 'yuv420p', '-threads', '1', seg]
+        hprvRun(args, 120000, err => {
+          let bad = !!err
+          try { bad = bad || !fs.existsSync(seg) || fs.statSync(seg).size < 1000 } catch (_) { bad = true }
+          if (bad) { console.log('[preview] ✗ ' + code + ' 第 ' + (i + 1) + ' 段失败 @' + starts[i].toFixed(1) + 's'); return done(false) }
+          segs.push(seg); step(i + 1)
+        })
+      }
+      /* concat demuxer：6 段编码参数完全一致，可 stream copy 拼接，无需二次编码 */
+      function concatAll() {
+        const list = path.join(tmp, 'list.txt')
+        try {
+          fs.writeFileSync(list, segs.map(s => "file '" + s.split("'").join("'\\''") + "'").join('\n'))
+        } catch (_) { return done(false) }
+        execFile('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', out],
+          { timeout: 120000, killSignal: 'SIGKILL' }, err => {
+            if (err) { console.log('[preview] ✗ ' + code + ' 拼接失败: ' + String(err.message).slice(0, 120)) }
+            done(!err)
+          })
+      }
+      step(0)
+    }
+  })
+}
+
 /* ---------- 线上数据源：JavDB 直连（国内线路，不依赖任何中间服务 / 不出海） ----------
  * 上游 = JavDB 移动端 API，鉴权只有一个「应用级签名」，与账号无关：
  *   jdsignature = {unix秒}.{part2}.{md5(秒 + part1)}
@@ -137,6 +289,28 @@ const onlineCfg = () => {
   const list = (Array.isArray(o.lines) && o.lines.length ? o.lines : JDB_LINES_DEFAULT)
     .map(s => String(s || '').trim().replace(/\/+$/, '')).filter(Boolean)
   return { enabled: o.enabled !== false, lines: list.length ? list : JDB_LINES_DEFAULT.slice(), img: String(o.img || JDB_IMG_DEFAULT).replace(/\/+$/, '') }
+}
+/* ---------- 在线播放源（详情页「在线播放」区块的可配置站点列表） ----------
+ * 旧版 playLinksOf 在前端写死 4 项；现抽到服务端，设置页可增删/排序/开关，加站不用改代码+部署。
+ * 每条：{ n:名称, u:URL模板(含{CODE}/{lcode}占位，act 类留空), d:说明, act:可选(missav=应用内HLS中转), on:是否显示 } */
+const PLAYLINES_DEFAULT = [
+  { n: '在线播放', act: 'missav', u: '', d: '解析 MissAV 免翻线路，应用内直接播放（视频经 NAS 中转国内 CDN）' },
+  { n: 'MissAV 搜索', u: 'https://missav.ai/ja/search/{CODE}', d: 'MissAV 站内搜索（新窗口打开）' },
+  { n: 'Jable', u: 'https://jable.tv/videos/{lcode}/', d: 'Jable 播放页（通常为有码片）' },
+  { n: 'SupJav', u: 'https://supjav.com/?s={CODE}', d: 'SupJav 聚合搜索' },
+  { n: 'Xeden', u: 'https://xeden.net/search?q={CODE}', d: 'Xeden 搜索（URL 模板可改）' },
+  { n: 'Omgjav', u: 'https://omgjav.com/search?q={CODE}', d: 'Omgjav 搜索' },
+  { n: 'MythAV', u: 'https://mythav.org/?s={CODE}', d: 'MythAV 搜索（WordPress）' },
+  { n: 'Manko', u: 'https://manko.fun/search?q={CODE}', d: 'Manko 搜索' },
+  { n: 'JavSB', u: 'https://jav.sb/en/search?q={CODE}', d: 'JavSB 搜索（反爬，浏览器可开）' },
+  { n: 'NJav', u: 'https://www.njav.com/en/search?q={CODE}', d: 'NJav 搜索' },
+  { n: 'MissAV(t41)', u: 'https://missavt41.com/ja/search/{CODE}', d: 'MissAV 镜像 t41 搜索' }
+]
+function playLinesCfg() {
+  const arr = (CFG.playlines && Array.isArray(CFG.playlines)) ? CFG.playlines : null
+  const base = (arr && arr.length) ? arr : PLAYLINES_DEFAULT
+  // 归一化：旧配置里 act=missav 且名为旧名的，统一改名为「在线播放」（无侵入，用户手动改名不受影响）
+  return base.map(x => (x && x.act === 'missav' && x.n === 'MissAV 在线') ? Object.assign({}, x, { n: '在线播放' }) : x)
 }
 /* 应用级签名（与账号无关的固定常量） */
 function jdbSign() {
@@ -179,6 +353,10 @@ async function onlineGetPaced(rel, opt) {
   catch (e) { if (!/线上数据源未启用/.test(String((e && e.message) || ''))) rateBad(); throw e }
 }
 let JDB_LINE_OK = ''                                // 上次成功的线路优先复用
+/* 最近一次线路探测结果（三条线路各探一次，慢且限频，所以只探一次、缓存复用）。
+ * 订阅页 GET /api/subscriptions 不发探测请求，但要能回答「到底通不通」——以前它只回
+ * enabled/lines/active（没有 reachable/probe），前端 chip 就永远显示「不通」（假阴性）。 */
+let JDB_PROBE = { at: 0, probe: [], reachable: false, error: '' }
 async function onlineGet(rel, { timeout = 20000, raw = false, tries = 3 } = {}) {
   const c = onlineCfg()
   if (!c.enabled) throw new Error('线上数据源未启用（设置 → 订阅 里开启）')
@@ -538,6 +716,10 @@ const DEFAULT_PRIORITIES = {
   },
   ignore_fields: {}
 }
+/* 在某些网络（如 NAS 出口）下恒定 403、纯浪费时间的源。默认禁用这 3 个；
+ * 想在其他网络恢复它们，设环境变量 JAVPACO_DISABLE_SOURCES 为空字符串即可覆盖。 */
+const DISABLED_SOURCES = new Set((process.env.JAVPACO_DISABLE_SOURCES !== undefined
+  ? process.env.JAVPACO_DISABLE_SOURCES : 'avbase,airav_io,miss_av').split(',').map(s => s.trim()).filter(Boolean))
 const DEFAULT_KEYWORDS = { jav_censored: [], jav_uncensored: [], jav_amateur: [], cn: [], ea: [] }
 function cleanPriorities(p) {
   const ids = v => (Array.isArray(v) ? v.map(x => String(x || '').trim()).filter(Boolean) : [])
@@ -1093,6 +1275,7 @@ async function scanAsync() {
   SCAN.phase = 'done'
   SCAN.finishedAt = Date.now()
   SCAN.running = false
+  schedulePreviews()   // 扫描完成 → 给新建档的实体影片安排悬停预览生成（低负担串行）
   /* 扫描中又有人添加/删除了媒体库 → 立刻按新列表再扫一遍（否则改动要等下次手动重扫） */
   if (SCAN.pending) { SCAN.pending = false; setTimeout(() => { if (!SCAN.running) scanAsync() }, 250) }
 }
@@ -1303,6 +1486,7 @@ function bootOfflineCache() {
       }
       const merged = [...map.values()].sort((a, b) => (b.mtime || 0) - (a.mtime || 0))
       DATA = { root: saved.root || readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: merged }
+      schedulePreviews()   // 启动恢复扫描结果 → 给实体影片补生成悬停预览
       console.log('[scan] 启动恢复上次扫描结果：本地 ' + keep.length + ' 部 + 离线缓存 ' + offline.length + ' 部 → 共 ' + merged.length + ' 条' +
         (saved.savedAt ? '（结果存于 ' + new Date(saved.savedAt).toLocaleString('zh-CN') + '；要刷新请点重扫）' : ''))
       restored = true
@@ -1310,6 +1494,7 @@ function bootOfflineCache() {
   } catch (e) { console.log('[scan] 恢复扫描结果失败（退回离线条目）：' + e.message) }
   if (!restored) {
     DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: offline }
+    schedulePreviews()   // 离线缓存兜底启动 → 给实体影片补生成悬停预览
     console.log('[scan] 启动不自动扫描：已载入离线缓存 ' + offline.length + ' 部做展示；媒体库扫描请在添加页添加/重扫触发')
   }
 }
@@ -1455,7 +1640,7 @@ const MN_BASE = 'https://www.minnano-av.com/'
  * 读取顺序：raw.githubusercontent.com → cdn.jsdelivr.net → api.github.com（配了 token 则带鉴权）。 */
 const RELAY_REPO = 'ShHEdisonXu/javpaco-relay'
 const RELAY_RAW = 'https://raw.githubusercontent.com/' + RELAY_REPO + '/main/relay/'
-const RELAY_CDN = 'https://cdn.jsdelivr.net/gh/' + RELAY_REPO + '@main/relay/'
+const RELAY_CDN = 'https://cdn.jsdelivr.net/gh/' + RELAY_REPO + '@latest/relay/'
 const RELAY_API = 'https://api.github.com/repos/' + RELAY_REPO + '/contents/relay/'
 const relayCache = new Map()   // p → {ts, buf|null}（10 分钟，避开上游限频）
 async function relayBuf(p, ms) {
@@ -2145,6 +2330,103 @@ function sbMagnet(hash, title) {
   return 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodeURIComponent(title) +
     SB_TRACKERS.map(t => '&tr=' + encodeURIComponent(t)).join('')
 }
+/* 把 JavDB 页磁力返回的「size（单位 MB 整数）」转成可读串，风格对齐 sukebei 的 "13.3GiB" */
+function fmtMB(n) {
+  n = Number(n) || 0
+  if (!n) return ''
+  const b = n * 1024 * 1024
+  return b >= (1 << 30) ? (b / (1 << 30)).toFixed(2) + ' GB' : (b / (1 << 20)).toFixed(1) + ' MB'
+}
+/* ---------- JavDB 评论区挖磁 / ED2K（P0 · 2026-10-04） ----------
+ * AVdb-Only 磁力强在「评论区挖矿」：很多老番 / 冷门番的磁力只存在于影片评论里。
+ * JavDB app API 的 /reviews 返回评论正文（一次最热 6 条，翻页拿不到更多），用户常把
+ * magnet:/ed2k:// 贴进去。解析出来作为「本地缓存 → sukebei → JavDB 评论区」三级回退的
+ * 第三来源，合入影片磁力区。 */
+/* 评论正文落前先洗一遍：挖出来的整串 magnet:/ed2k: 链接本身没什么好看的，留着会把
+ * 「（）」撑成一整屏乱码；去掉链接、压平空白、截断 200 字够看清「这条磁力是什么来头」了。 */
+function jdbCommentText(t) {
+  let s = String(t || '')
+  /* ed2k：整串换成它的**文件名**。原文长这样：
+   *   ed2k://|file|SNIS-789-U 女优人气大调查….mp4|30243744838|EB6BCE……|/
+   * 体积和 hash 那两段全是噪音，文件名才是「这条链接到底是什么」。 */
+  s = s.replace(/ed2k:\/\/\|file\|([^|]+)\|[^\s"'<>]*\|[^\s"'<>]*\|?\/?/gi, '$1')
+  s = s.replace(/ed2k:\/\/[^\s"'<>]+/gi, '')
+  /* magnet：同理留 dn（种子名），不要那串 xt=urn:btih:…&tr=… */
+  s = s.replace(/magnet:\?[^\s"'<>]+/gi, m => {
+    const dn = /[?&]dn=([^&]*)/i.exec(m)
+    if (!dn) return ''
+    try { return decodeURIComponent(dn[1].replace(/\+/g, ' ')) } catch (_) { return dn[1] }
+  })
+  return s.replace(/\s+/g, ' ').replace(/[\uFF08(]\s*[\uFF09)]/g, '').trim().slice(0, 200)
+}
+async function jdbCommentMagnets(code) {
+  const out = []
+  try {
+    if (!onlineCfg().enabled) return out
+    const s = await onlineScrapeSource(code)        // 先搜到 JavDB onlineId
+    if (!s || !s.onlineId) return out
+    const j = await onlineGet('v1/movies/' + s.onlineId + '/reviews?page=1').catch(() => null)
+    const reviews = (((j || {}).data || {}).reviews) || []
+    if (!Array.isArray(reviews)) return out
+    const seen = new Set()
+    const add = (magnet, type, rvText) => {
+      magnet = String(magnet || '').replace(/&amp;/g, '&').trim()
+      if (!magnet) return
+      const key = magnet.toLowerCase()
+      if (seen.has(key)) return
+      seen.add(key)
+      const hash = (magnet.match(/btih:([a-f0-9]{32,40})/i) || [])[1] || ''
+      out.push({
+        title: type === 'ed2k' ? 'ED2K 链接（来自 JavDB 评论）' : 'JavDB 评论磁力',
+        hash, size: '', date: '', seeders: 0, leechers: 0,
+        magnet, source: 'javdb-comment', type, fromComment: true,
+        /* 评论正文（已清洗）：详情页在磁力标题后以「（…）」展示，
+         * 看得出这条链接是评论里说的「4K 中字版」还是「补档」，不用点开猜。 */
+        comment: jdbCommentText(rvText)
+      })
+    }
+    for (const rv of reviews) {
+      const txt = (rv && (rv.content || '')) || ''
+      if (!txt) continue
+      let m
+      const reM = /magnet:[^"'<\s)]+/gi, reE = /ed2k:\/\/[^"'<\s]+/gi
+      while ((m = reM.exec(txt))) add(m[0], 'magnet', txt)
+      while ((m = reE.exec(txt))) add(m[0], 'ed2k', txt)
+    }
+  } catch (_) {}
+  return out
+}
+/* ---------- JavDB 原番号页磁力（P0 · 2026-10-07） ----------
+ * 与「评论区挖矿」（javdb-comment）是两条不同来源：这是 JavDB 影片页「磁力链接」区直接列出的
+ * 官方多条 BT，字段更规整（name / size(MB) / cnsub 中字 / hd / created_at），质量通常比评论里
+ * 随手贴的高。按 hash 去重交给 movieDetail 的合并段处理；这里只负责把每条转成统一磁力对象。 */
+async function jdbPageMagnets(code) {
+  const out = []
+  try {
+    if (!onlineCfg().enabled) return out
+    const s = await onlineScrapeSource(code)        // 先搜到 JavDB onlineId
+    if (!s || !s.onlineId) return out
+    const d = await onlineGet('v2/movies/' + s.onlineId).catch(() => null)
+    const mags = (((d || {}).data || {}).movie || {}).magnets
+    if (!Array.isArray(mags)) return out
+    const seen = new Set()
+    for (const m of mags) {
+      const hash = String(m.hash || '').trim().toLowerCase()
+      if (!hash || seen.has(hash)) continue
+      seen.add(hash)
+      const name = String(m.name || (code + ' magnet')).trim()
+      out.push({
+        title: name, hash,
+        size: fmtMB(m.size),
+        date: String(m.created_at || '').slice(0, 10),
+        seeders: 0, leechers: 0,
+        magnet: 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodeURIComponent(name),
+        source: 'javdb', type: 'magnet', cnsub: !!m.cnsub, hd: !!m.hd
+      })
+    }
+  } catch (_) {}
+  return out
+}
 function movieCacheFile(code) {
   const safe = String(code).replace(/[^\w.-]/g, '_')
   return path.join(cacheDir(), 'movies', safe, 'meta.json')
@@ -2341,7 +2623,7 @@ async function probeVideoAsync(rel) {
         if (t) { w = t.w; h = t.h } else if (head.length >= 65536) slow = true   // 头尾都没找到 moov 且文件确实读全了 → 可能不是 MP4，不算慢
       }
     }
-    if (slow) { PROBE_SLOW++; if (PROBE_SLOW >= 3 && !VPROBE_OFF) { VPROBE_OFF = true; scLog('视频分辨率探测连续超时（网盘读取受限），本次扫描改用文件名标注') } }
+    if (slow) { PROBE_SLOW++; if (PROBE_SLOW >= 3 && !VPROBE_OFF) { VPROBE_OFF = true; scLog(SCRAPE, '视频分辨率探测连续超时（网盘读取受限），本次扫描改用文件名标注') } }
     else PROBE_SLOW = 0
     if (slow) return { w: 0, h: 0, slow: true }   // 超时不缓存，下次扫描重试
     const e = { w, h, m: st.mtimeMs, s: st.size }
@@ -2498,6 +2780,69 @@ async function movieDetail(code, refresh) {
       if (!meta) return { ok: false, error: '无法访问 sukebei.nyaa（检查网络或设置页代理），且该影片没有离线数据' }
     }
   }
+  /* P0（2026-10-04）：本地缓存 → sukebei → JavDB 评论区 三级回退。
+   * 合入评论区挖出的 magnet:/ed2k: 链接；已抓过（meta 里已有 javdb-comment）则不重复请求，
+   * 仅在 refresh 或首次才向 JavDB 评论 API 取一次。 */
+  try {
+    const mags = (meta.magnets || [])
+    /* 「是否还要去评论区挖」的三个触发条件：
+     *   ① 从没挖过（没有 javdb-comment 条目）
+     *   ② 挖过但没带评论正文（2026-10-06 之前入库的老数据）——补一次只为填上「（）」里的那句话，
+     *      补完写回 meta.json，下次就不用再请求了
+     *   ③ 用户点了详情页的「联网重新抓取」 */
+    const _cmOld = mags.filter(m => m && m.source === 'javdb-comment')
+    const hasComment = _cmOld.length > 0
+    const missingCmt = _cmOld.some(m => !m.comment)
+    if (!hasComment || missingCmt || refresh) {
+      const cm = await jdbCommentMagnets(code)
+      if (cm.length) {
+        const have = new Set(mags.map(m => String((m && m.magnet) || '').toLowerCase()).filter(Boolean))
+        for (const x of cm) {
+          if (have.has(x.magnet.toLowerCase())) {
+            /* 已经有了：这条可能是老数据缺 comment，就地补上（不动链接本身） */
+            const hit = mags.find(m => String((m && m.magnet) || '').toLowerCase() === x.magnet.toLowerCase())
+            if (hit && !hit.comment && x.comment) hit.comment = x.comment
+            continue
+          }
+          mags.push(x); have.add(x.magnet.toLowerCase())
+        }
+        meta.magnets = mags
+        /* 只在还没记过的时候追加一次：refresh（详情页「刷新磁力」）每次都会重取评论，
+         * 无条件追加会让 meta.source 变成「xxx + javdb评论 + javdb评论 + …」并写回 meta.json。 */
+        if (!/javdb评论/.test(String(meta.source || ''))) meta.source = (meta.source ? meta.source + ' + ' : '') + 'javdb评论'
+        try { fs.mkdirSync(path.dirname(movieCacheFile(code)), { recursive: true }); fs.writeFileSync(movieCacheFile(code), JSON.stringify(meta, null, 2)) } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  /* P0（2026-10-07）：合入 JavDB 原番号页（v2/movies/<id>.magnets）列出的官方磁力。
+   * 与评论区挖矿（javdb-comment）并列、但来源不同。按 hash 去重：
+   *   ① 已在 sukebei 命中（带 seeders）的 → 保留，只补上 cnsub/hd 标记；
+   *   ② 评论区已有同 hash 的 → 不重复加；
+   *   ③ 仅本页独有的（不同 hash）→ 入列。
+   * 仅首次 / refresh 才向 JavDB 取一次，之后随 meta.json 落盘，下次直接读缓存。 */
+  try {
+    const hasPage = (meta.magnets || []).some(m => m && m.source === 'javdb')
+    if (!hasPage || refresh) {
+      const pm = await jdbPageMagnets(code)
+      if (pm.length) {
+        const haveHash = new Set((meta.magnets || []).map(m => String((m && m.hash) || '').toLowerCase()).filter(Boolean))
+        for (const x of pm) {
+          if (!x.hash) continue
+          if (haveHash.has(x.hash)) {
+            const hit = (meta.magnets || []).find(m => String((m && m.hash) || '').toLowerCase() === x.hash)
+            if (hit) { if (x.cnsub) hit.cnsub = true; if (x.hd) hit.hd = true }
+            continue
+          }
+          meta.magnets.push(x); haveHash.add(x.hash)
+        }
+        if (!/javdb/.test(String(meta.source || ''))) meta.source = (meta.source ? meta.source + ' + ' : '') + 'javdb'
+        try {
+          fs.mkdirSync(path.dirname(movieCacheFile(code)), { recursive: true })
+          fs.writeFileSync(movieCacheFile(code), JSON.stringify(meta, null, 2))
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
   return { ok: true, cached: !!readMovieCache(code) && !refresh, item, meta }
 }
 /* 缓存目录统计（设置页「读取」用） */
@@ -2625,16 +2970,58 @@ function offlineScan(dir) {
  * 元数据 + 竖版封面 + 横版主图 + 剧照 → 图片下载进缓存目录
  * meta.json 落盘 cache/movies/<番号>/（磁力与已有缓存合并保留）
  * ================================================================ */
-const SCRAPE = { running: false, code: '', title: '', phase: '', pct: 0, log: [], error: '', finishedAt: 0, stop: false }
+const SCRAPE = { running: false, code: '', title: '', phase: '', pct: 0, log: [], error: '', finishedAt: 0, stop: false, via: '' }
+/* 每个并发刮削任务一份独立状态（手动单跑复用全局 SCRAPE；自动入库的 worker 各拿一份），
+ * 这样多部片子同时刮削时进度/中止/错误互不串台。 */
+function scMakeState() {
+  return { running: false, code: '', title: '', phase: '', pct: 0, log: [], error: '', finishedAt: 0, stop: false, via: '' }
+}
 /* 手动中止：POST /api/scrape/stop。刮削是长流程（11 个源逐个试 + 下载图片），
  * 碰上某个源一直挂着就整条卡住，除了重启容器没有别的办法。置 stop 后各阶段自行收工。 */
-function scCheckStop() { if (SCRAPE.stop) throw new Error('已手动停止') }
-function scLog(s) {
-  SCRAPE.log.push(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${s}`)
-  if (SCRAPE.log.length > 200) SCRAPE.log.shift()
+function scCheckStop(S = SCRAPE) { if (S.stop) throw new Error('已手动停止') }
+function scLog(S, s) {
+  S.log.push(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${s}`)
+  if (S.log.length > 200) S.log.shift()
   console.log('[scrape]', s)
 }
 /* 低层抓取：暴露状态码与响应头（mnFetch 不暴露），支持代理 + 重定向跟随 + POST + 原始响应 */
+/* 每主机并发闸：所有刮削 HTTP 都经 scOnce，这里把「同一主机同时最多 HOST_MAX 个请求」卡住，
+ * 既防被源站 ban，也避免几十个请求瞬间齐发把 NAS/代理打爆。跨电影的并发靠 AUTO_INGEST 的 worker 池，
+ * 跨源的并发靠 scrapeAsync 的批次，本闸是最后一道「按域名」的兜底。 */
+const HOST_SEM = new Map()
+const HOST_MAX = 4
+/* 图片下载专用信号量：图片是带宽瓶颈不是 API 限频，且常来自静态 CDN，可放得更宽，
+ * 不让 HOST_MAX=4 把单部 ~14 张图的下载也卡成 4 路串行轮询。
+ * 12（2026-10-06 由 8 上调）：单部剧照上限就是 12 张，闸开到 8 时 12 张会被切成 8+4 两批，
+ * 第二批要等第一批里**最慢**那张腾出名额才开工（尾延迟白等一轮）；开到 12 才能一批齐发。
+ * 注意这是「每域名」上限而非全局：多部片子并行时不同域名各算各的，实测未见源站限流。 */
+const IMG_HOST_SEM = new Map()
+const IMG_HOST_MAX = 12
+const HOST_ACQUIRE_MAX_MS = 60000   // 排队等主机闸的最长时间：到点强行放行（宁可略微超并发，也不能永久卡住）
+function hostAcquire(host, sem, max) {
+  let e = sem.get(host)
+  if (!e) { e = { n: 0, waiters: [] }; sem.set(host, e) }
+  if (e.n < max) { e.n++; return Promise.resolve() }
+  /* 等太久就放行：并发计数一旦因为某条异常路径漂移（漏 release），
+   * 没有这个上限的话后面所有请求都会永远排在这道闸上——整条刮削流水线就此停摆
+   *（2026-10-06 DV-1582 卡在「下载图片」近 9 小时，后面排队的 10 部一部都没开工）。 */
+  return new Promise(res => {
+    let to = null
+    const done = () => { if (to) clearTimeout(to); res() }
+    to = setTimeout(() => {
+      const i = e.waiters.indexOf(done)
+      if (i >= 0) e.waiters.splice(i, 1)
+      done()
+    }, HOST_ACQUIRE_MAX_MS)
+    e.waiters.push(done)
+  })
+}
+function hostRelease(host, sem, max) {
+  const e = sem.get(host)
+  if (!e) return
+  if (e.waiters.length && e.n >= max) { const w = e.waiters.shift(); w() }
+  else e.n = Math.max(0, e.n - 1)
+}
 function scOnce(url, opts = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url)
@@ -2657,24 +3044,55 @@ function scOnce(url, opts = {}) {
       try { ag = opts._forceProxy ? tunnelAgent(pUrl) : agentMaybe(u, pUrl) } catch (_) {}
       if (ag) o.agent = ag
     }
-    const rq = https.request(o, rs => {
-      const chunks = []
-      rs.on('data', c => chunks.push(c))
-      rs.on('end', () => { clearTimeout(deadline); resolve({ status: rs.statusCode, headers: rs.headers, buf: Buffer.concat(chunks) }) })
-    })
-    // 硬性总时限：25s 的 setTimeout 是"空闲超时"，响应慢速细流会不断重置它导致永久挂起
-    // （airav/missav 经代理时出现过单请求挂 10+ 分钟），所以再加一个不看重活动的墙钟上限
-    const deadline = setTimeout(() => rq.destroy(new Error('timeout')), opts.deadline || 45000)
-    rq.on('error', e => { clearTimeout(deadline); reject(e) })
-    rq.setTimeout(25000, () => rq.destroy(new Error('timeout')))
-    if (body) rq.write(body)
-    rq.end()
+    const isImg = !!opts.img
+    const hSem = isImg ? IMG_HOST_SEM : HOST_SEM
+    const hMax = isImg ? IMG_HOST_MAX : HOST_MAX
+    let released = false, guard = null, settled = false
+    const rel = () => { if (released) return; released = true; hostRelease(u.hostname, hSem, hMax) }
+    /* ★ 墙钟守卫（2026-10-06 加）：不论请求最终走了哪条分支，到点必定 settle。
+     * 没有它的时候，以下几种序列会让这个 promise 永远悬挂 —— destroy 没触发 error、end 也没来、
+     * 主机闸放行后又卡在 waiters 队列上…… scrapeAsync 会一直 await 在这里不动，
+     * 结果就是整条入库队列被一部片子堵死（DV-1582 卡在「下载图片」近 9 小时，后面排队的 10 部一部都没开工）。
+     * 有了守卫，最坏情况只是这部失败，队列继续往下走。 */
+    const clearGuard = () => { if (guard) { clearTimeout(guard); guard = null } }
+    const finOK = v => { if (settled) return; settled = true; clearGuard(); rel(); resolve(v) }
+    const finErr = e => { if (settled) return; settled = true; clearGuard(); rel(); reject(e) }
+    guard = setTimeout(() => finErr(new Error('timeout（守卫超时）')), (Number(opts.deadline) || 45000) + 4000)
+    const doReq = () => {
+      let deadline = null
+      let rq = null
+      try {
+        rq = https.request(o, rs => {
+          const chunks = []
+          rs.on('data', c => chunks.push(c))
+          rs.on('end', () => {
+            if (deadline) { clearTimeout(deadline); deadline = null }
+            finOK({ status: rs.statusCode, headers: rs.headers, buf: Buffer.concat(chunks) })
+          })
+        })
+      } catch (e) { finErr(e); return }
+      // 硬性总时限：25s 的 setTimeout 是"空闲超时"，响应慢速细流会不断重置它导致永久挂起
+      // （airav/missav 经代理时出现过单请求挂 10+ 分钟），所以再加一个不看重活动的墙钟上限
+      deadline = setTimeout(() => { try { rq.destroy(new Error('timeout')) } catch (_) {}; rel() }, opts.deadline || 45000)
+      rq.on('error', e => { if (deadline) { clearTimeout(deadline); deadline = null } finErr(e) })
+      rq.setTimeout(25000, () => { try { rq.destroy(new Error('timeout')) } catch (_) {}; rel() })
+      if (body) rq.write(body)
+      rq.end()
+    }
+    hostAcquire(u.hostname, hSem, hMax).then(doReq).catch(e => finErr(e))
   })
 }
 async function scFetch(url, opts = {}) {
   let cur = String(url)
   const post = opts.method === 'POST' && opts.body
+  /* 单个资源的总时限：域名闸 + 多次重定向 + 双通道重试叠加起来，scFetch 最坏能拖到几分钟，
+   * 一部片子十几个资源串行下去就足以让队列停滞。这里再压一层上限（图片更短，看图而不是出字）。
+   * _dead：上层任务已被判定卡死/中止时快速放弃，别继续占着网络资源。 */
+  const totalMs = Number(opts.totalMs) || (opts.bin || opts.img ? 70000 : 120000)
+  const deadlineAt = Date.now() + totalMs
   for (let hop = 0; hop < 5; hop++) {
+    if (opts._dead && opts._dead()) throw new Error('任务已放弃（超时或已中止）')
+    if (Date.now() > deadlineAt) throw new Error('抓取超时（' + Math.round(totalMs / 1000) + 's）')
     let rs = null
     const tryOnce = (extra) => scOnce(cur, Object.assign({}, opts, extra || {}, hop === 0 ? {} : { method: 'GET', body: '' }))
     for (let i = 0; i < 2; i++) {
@@ -3003,7 +3421,7 @@ async function scMdcCandidate(code, c, rule) {
   const enc = String(((rule.settings || {}).encoding) || '').toLowerCase()
   const decode = b => enc.includes('8859-1') || enc.includes('latin') ? b.toString('latin1') : b.toString('utf8')
   let logN = 0
-  const log = s => { if (logN++ < 12) scLog('  · ' + c.id + '：' + s) }
+  const log = s => { if (logN++ < 12) scLog(SCRAPE, '  · ' + c.id + '：' + s) }
   const res = await Promise.race([
     MDCNG.scrape(c.id, code, async (url, o = {}) => {
       const hdrs = {}
@@ -3020,8 +3438,9 @@ async function scMdcCandidate(code, c, rule) {
       return decode(r.buf)
     }, log),
     // 单源整体兜底：规则可能带多个搜索地址/预热请求，逐请求限时之外再封个总顶，
-    // 超时记为"未命中"继续下一个源，不让整个刮削队列卡死
-    new Promise(s => setTimeout(() => s({ ok: false, reason: '抓取超时（90s）' }), 90000))
+    // 超时记为"未命中"继续下一个源，不让整个刮削队列卡死。总顶压到 45s（与通用路径 scOnce 的
+    // deadline 对齐）—— 一个源若连 45s 都拿不到数据，再等也没意义，只会把整批拖死。
+    new Promise(s => setTimeout(() => s({ ok: false, reason: '抓取超时（45s）' }), 45000))
   ])
   if (!res || !res.ok) return { parsed: null, reason: (res && res.reason) || '规则执行失败', rule }
   const parsed = scMdcToParsed(res.fields, res.usedUrl)
@@ -3037,6 +3456,7 @@ async function scMdcCandidate(code, c, rule) {
 /* 造一个候选对象。有 mdc-ng 规则的源不依赖配置里的 search 模板（搜索地址由规则自带），
  * 所以 airav_io / avbase / fc2_hub / freejavbt / hbox_jp / xiao_huang_shu 这些空模板源也能进候选 */
 function scMakeCand(s, code) {
+  if (DISABLED_SOURCES.has(s.id)) return null   // 该网络下恒定 403 的源，直接不进候选（覆盖所有路径含 by_fields）
   const rule = MDCNG.ruleFor(s.id)
   const tpl = (s.search && s.search.includes('{code}')) ? s.search : ''
   if (!tpl && !rule) return null
@@ -3188,6 +3608,58 @@ function scDmmCandsFromCids(cids) {
   for (let i = 1; i <= 10 && cids[0]; i++) samples.push('https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/' + cids[0] + '/' + cids[0] + 'jp-' + i + '.jpg')
   return { poster, fanart, samples }
 }
+/* ---------- DMM 图床 cid 前缀爆破（2026-10-07） ----------
+ * scDmmCdnCands 照番号猜 cid（前缀 + 5 位补零）只对一半：DMM 内部 cid 常带厂商/レーベル编号前缀，
+ * 番号里根本看不出来 —— DLDSS-537 的真身是 1dldss00537（猜成 dldss00537 只换回 now_printing 占位图，
+ * 于是整部片子丢掉 DMM 的 1032×1467 高清封面，只能退回 JavDB 的 147×200 缩略图）；
+ * START-549 → 1start00549、SS-061 → h_113ss00061 同理。
+ * 基础 cid 在图床上探不到时，按前缀并发试探（只取前 1KB 看状态码，命中才正式下载），
+ * 命中就把前缀记进 cache/dmm-cid-prefix.json —— 同系列（DLDSS-*）下次一步命中，不用再爆。 */
+const DMM_CID_PFX_FILE = 'dmm-cid-prefix.json'
+let _dmmPfx = null
+function dmmPfxMap() {
+  if (_dmmPfx) return _dmmPfx
+  try { _dmmPfx = JSON.parse(fs.readFileSync(path.join(cacheDir(), DMM_CID_PFX_FILE), 'utf8')) || {} } catch (_) { _dmmPfx = {} }
+  return _dmmPfx
+}
+function dmmPfxSet(key, pfx) {
+  const m = dmmPfxMap()
+  if (m[key] === pfx) return
+  m[key] = pfx
+  try { fs.writeFileSync(path.join(cacheDir(), DMM_CID_PFX_FILE), JSON.stringify(m)) } catch (_) {}
+}
+/* 探某个 cid 在不在图床上：pics_dig 路径不存在时是 404（旧图床则是 302 到 now_printing，
+ * 所以只认 200/206 —— 拿到就算有图，尺寸由后面正式下载时复核）。走 scOnce 单次请求，
+ * 不像 scFetch 那样失败重试 + 换通道再试一轮（爆破十几个候选时不值得）。 */
+async function dmmCidHasImg(cid) {
+  const u = 'https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/' + cid + '/' + cid + 'ps.jpg'
+  try {
+    const r = await scOnce(u, { bin: true, img: true, deadline: 8000, hdrs: { referer: u, range: 'bytes=0-1023' } })
+    const st = Number(r && r.status) || 0
+    return st === 200 || st === 206
+  } catch (_) { return false }
+}
+async function scDmmResolveCid(code) {
+  const s = MDCNG.splitNumber(code)
+  if (!s.serial_name || !/^\d+$/.test(s.serial_number || '')) return ''
+  const base = s.serial_name.toLowerCase().replace(/[^a-z0-9]/g, '') + String(s.serial_number).padStart(5, '0')
+  const key = String(s.serial_name || '').toUpperCase()
+  const seen = new Set()
+  const probe = async c => {
+    if (!c || seen.has(c)) return ''
+    seen.add(c)
+    return (await dmmCidHasImg(c)) ? c : ''
+  }
+  const memo = dmmPfxMap()[key]
+  if (memo && await probe(memo + base)) return memo + base          // 同系列以前爆出来过的前缀：一次命中
+  if (await probe(base)) { dmmPfxSet(key, ''); return base }        // 大多数片子：番号直接就是 cid
+  const PFX = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'h_113', 'h_068', 'h_150', 'h_175', 'h_055', 'h_001']
+  for (let i = 0; i < PFX.length; i += 8) {
+    const got = (await Promise.all(PFX.slice(i, i + 8).map(p => probe(p + base)))).filter(Boolean)
+    if (got.length) { dmmPfxSet(key, got[0].slice(0, got[0].length - base.length)); return got[0] }
+  }
+  return ''
+}
 /* 从详情页网址里抠番号（「输入番号详细网址」用）：
  *   dmm:    https://www.dmm.co.jp/digital/videoa/-/detail/=/cid=vrkm00625/  → VRKM-625
  *           https://video.dmm.co.jp/av/content/?id=vrkm00625                → VRKM-625
@@ -3221,16 +3693,16 @@ function scCodeFromUrl(raw) {
  * 正文里又恰好含番号文本 → 曾被解析成「影片」入库，主页轮播出垃圾。命中这类标题一律视为未搜到。 */
 const SC_SEARCHY = /的搜尋結果|的搜索结果|search[\s_-]?results?\b|搜尋結果|搜索結果/i
 
-async function scTryCandidate(code, c) {
+async function scTryCandidate(code, c, S = SCRAPE) {
   const rule = MDCNG.ruleFor(c.id)
   if (rule) {
     try {
       const r = await scMdcCandidate(code, c, rule)
-      if (r.parsed && r.parsed.title && !SC_SEARCHY.test(r.parsed.title)) { scLog('✓ ' + c.id + ' 命中（mdc-ng 规则 ' + rule.__file + '）'); return r.parsed }
-      if (r.parsed && r.parsed.title && SC_SEARCHY.test(r.parsed.title)) scLog(c.id + '：抓到的是搜索结果页（' + String(r.parsed.title).slice(0, 40) + '），不算命中')
-      scLog(c.id + '：mdc-ng 规则未命中（' + (r.reason || '无内容') + '）' + (c.ruleOnly ? '，该源只由规则驱动，跳过通用解析' : '，改用通用解析兜底'))
+      if (r.parsed && r.parsed.title && !SC_SEARCHY.test(r.parsed.title)) { scLog(S, '✓ ' + c.id + ' 命中（mdc-ng 规则 ' + rule.__file + '）'); return r.parsed }
+      if (r.parsed && r.parsed.title && SC_SEARCHY.test(r.parsed.title)) scLog(S, c.id + '：抓到的是搜索结果页（' + String(r.parsed.title).slice(0, 40) + '），不算命中')
+      scLog(S, c.id + '：mdc-ng 规则未命中（' + (r.reason || '无内容') + '）' + (c.ruleOnly ? '，该源只由规则驱动，跳过通用解析' : '，改用通用解析兜底'))
     } catch (e) {
-      scLog(c.id + '：mdc-ng 规则执行出错（' + e.message + '）' + (c.ruleOnly ? '，跳过通用解析' : '，改用通用解析兜底'))
+      scLog(S, c.id + '：mdc-ng 规则执行出错（' + e.message + '）' + (c.ruleOnly ? '，跳过通用解析' : '，改用通用解析兜底'))
     }
     if (c.ruleOnly) return null
   }
@@ -3275,6 +3747,12 @@ function scPlaceholderImg(sz, bytes) {
   if (!sz || !sz.w) return true
   if (sz.w <= 96 && sz.h <= 130) return true                             // now printing（90×122）
   if (sz.w <= 170 && sz.h <= 215 && (bytes || 0) < 4200) return true     // noimage（147×200 / 2.6KB）
+  /* ⚠️ 加了这条才拦得住「缩放版占位图」：DMM 图床 cid 不存在时不返回 404，而是 302 到
+   * now_printing.jpg 并**按请求参数重新渲染**（例：MIDE-566 请求 pl 规格 → 拿到 590×800 / 19KB 的白板，
+   * 尺寸和字节都完全正常，上面两条判据全部失效，于是白板被当成海报存了下来 —— 用户看到就是「没有封面」）。
+   * 判据用「字节/像素」：纯色块的 JPEG 压得极小。实测 80 张正常封面**最低 0.182**（中位 0.263），
+   * 而这类白板只有 0.041 —— 阈值取 0.10 有 1.8 倍安全余量，不会误杀真实封面。 */
+  if (bytes && sz.h && bytes / (sz.w * sz.h) < 0.10) return true
   return false
 }
 /* ---------- 同名不同作品（番号撞车）防线 ----------
@@ -3328,7 +3806,7 @@ function scOffFilmSources(results, gotId) {
 }
 /* 图片落盘（MDC-NG 规则：不看文件名，按下载后的真实宽高定角色）
    poster.jpg 竖版海报（h>w） / fanart.jpg 横版主图（w>h） / sampleNN.jpg 剧照（不与主图重复） */
-async function scSaveImages(dir, parsed) {
+async function scSaveImages(dir, parsed, S = SCRAPE) {
   const imgDir = path.join(dir, 'images')
   fs.mkdirSync(imgDir, { recursive: true })
   const web = f => '/cache/movies/' + path.basename(dir) + '/images/' + f
@@ -3337,7 +3815,19 @@ async function scSaveImages(dir, parsed) {
   const PORTRAIT = (sz, b) => sz.h > sz.w * (b || 1.06)
   const LANDSCAPE = (sz, b) => sz.w > sz.h * (b || 1.06)
   const dl = async url => {
-    const b = await scFetch(url, { bin: true, hdrs: { referer: url } })
+    /* deadline 30s：图片体积小，45s 的默认墙钟对单张图太宽松，一张图慢会拖住整部。
+     * _dead：所属刮削任务已被判定卡死时要立刻放手，别继续占着图片闸。
+     * raw：要拿「跟完跳转后的最终地址」——DMM 图床 cid 不存在时是 302 到 now_printing/noimage，
+     * 光看下载到的字节认不出来，看最终地址一枪毙命（bpp 判据是第二道保险）。 */
+    const r = await scFetch(url, {
+      bin: true, raw: true, hdrs: { referer: url }, img: true, deadline: 30000,
+      _dead: () => !!(S && S.dead)
+    })
+    const finalUrl = String((r && r.url) || url)
+    let b = (r && r.buf) || Buffer.alloc(0)
+    /* raw 分支不解密，这里补上（JavDB 图片 CDN 的字节流是加密的；其它站点原样放行） */
+    try { if (IMG_HOST_OK.test(new URL(finalUrl).hostname)) b = imgMaybeDecrypt(b) } catch (_) {}
+    if (/(now_printing|noimage)/i.test(finalUrl)) throw new Error('是 DMM 的「无图」占位图（跳转后 ' + finalUrl.slice(-46) + '）')
     if (b.length < 2500) throw new Error('图片太小')
     const fp = path.join(imgDir, '.tmp' + (Math.random() * 1e9 | 0) + '.jpg')
     fs.writeFileSync(fp, b)
@@ -3365,28 +3855,35 @@ async function scSaveImages(dir, parsed) {
   // —— 候选择优：同一张图站点常给多个尺寸变体（含缩略图/占位图），靠前的不一定最清晰，
   //    所以试前几个候选取面积最大的那张，而不是碰到第一张符合朝向的就收工；
   //    local 传入本地现有图的尺寸作为初始基线，与其比面积
+  const IMG_CHUNK = 8   // 海报/主图候选并发下载（≤ IMG_HOST_MAX=12）——两批共 maxTry 12 条
   const pick = async (cands, want, good, maxTry, onOther, local) => {
     let best = local ? { fp: null, sz: local, u: null, local: true } : null, attempt = 0
     let loose = null   // 朝向不符但接近正方形的兜底：JavDB 的 FC2 封面常是 1:1，竖/横判定都过不了，
                        // 严格按朝向筛会把唯一能用的图丢掉 → 宁可用方图也比没图强（详情页可再手动裁竖版）
-    for (const u of cands) {
-      if (best && !best.local && good(best.sz)) break
+    for (let ci = 0; ci < cands.length && !(best && !best.local && good(best.sz)); ci += IMG_CHUNK) {
       if (attempt >= maxTry) break
-      attempt++
-      let got = null
-      try { got = await dl(u) } catch (_) { continue }
-      const { fp, sz } = got
-      if (want(sz)) {
-        if (!best || sz.w * sz.h > best.sz.w * best.sz.h) {
-          if (best) { try { fs.unlinkSync(best.fp) } catch (_) {} }
-          best = { fp, sz, u }
-        } else { try { fs.unlinkSync(fp) } catch (_) {} }
-      } else if (!(onOther && onOther({ fp, sz, u }))) {
-        const ratio = sz.w / sz.h
-        if (ratio >= 0.85 && ratio <= 1.18 && (!loose || sz.w * sz.h > loose.sz.w * loose.sz.h)) {
-          if (loose) { try { fs.unlinkSync(loose.fp) } catch (_) {} }
-          loose = { fp, sz, u }
-        } else { try { fs.unlinkSync(fp) } catch (_) {} }
+      const chunk = cands.slice(ci, ci + IMG_CHUNK)
+      const gotArr = await Promise.all(chunk.map(async u => {
+        if (attempt >= maxTry) return null
+        attempt++
+        try { const g = await dl(u); return { g, u } } catch (_) { return null }
+      }))
+      for (const item of gotArr) {
+        if (!item) continue
+        const { fp, sz } = item.g; const u = item.u
+        if (best && !best.local && good(best.sz)) { try { fs.unlinkSync(fp) } catch (_) {}; continue }
+        if (want(sz)) {
+          if (!best || sz.w * sz.h > best.sz.w * best.sz.h) {
+            if (best) { try { fs.unlinkSync(best.fp) } catch (_) {} }
+            best = { fp, sz, u }
+          } else { try { fs.unlinkSync(fp) } catch (_) {} }
+        } else if (!(onOther && onOther({ fp, sz, u }))) {
+          const ratio = sz.w / sz.h
+          if (ratio >= 0.85 && ratio <= 1.18 && (!loose || sz.w * sz.h > loose.sz.w * loose.sz.h)) {
+            if (loose) { try { fs.unlinkSync(loose.fp) } catch (_) {} }
+            loose = { fp, sz, u }
+          } else { try { fs.unlinkSync(fp) } catch (_) {} }
+        }
       }
     }
     return best || loose
@@ -3396,36 +3893,44 @@ async function scSaveImages(dir, parsed) {
   //    错片那张只要尺寸不输，照样会被选中。所以信任池挑不出来才轮到它。
   const landPool = (parsed.fanartCands || []).slice()
   const landPoolFB = (parsed.fanartFallback || []).slice()
-  const toLand = pool => ({ sz, u }) => { if (LANDSCAPE(sz) && !pool.includes(u)) pool.unshift(u); return false }
-  const bp = (await pick(parsed.posterCands || [], PORTRAIT, sz => sz.w >= 500, 8, toLand(landPool), locP))
+  /* 转投用 push（原来 unshift 会把它插到队首）——fanartCands 现在是「DMM 图床在前」，
+   * 从海报池转投来的站点横版图插队会把 DMM 的 2184×1467 挤到 maxTry 之外。 */
+  const toLand = pool => ({ sz, u }) => { if (LANDSCAPE(sz) && !pool.includes(u)) pool.push(u); return false }
+  const bp = (await pick(parsed.posterCands || [], PORTRAIT, sz => sz.w >= 500, 12, toLand(landPool), locP))
     || (await pick(parsed.posterFallback || [], PORTRAIT, sz => sz.w >= 500, 8, toLand(landPoolFB), locP))
   if (bp) {
-    if (bp.local) { out.poster = web('poster.jpg'); scLog('竖版海报：保留本地 ' + bp.sz.w + '×' + bp.sz.h + '（线上候选没有更大的）') }
-    else { out.poster = put(bp.fp, 'poster.jpg'); used.add(bp.u); out.posterUrl = bp.u; scLog('竖版海报：' + bp.sz.w + '×' + bp.sz.h + ' ← ' + bp.u.split('/').pop()) }
+    if (bp.local) { out.poster = web('poster.jpg'); scLog(S, '竖版海报：保留本地 ' + bp.sz.w + '×' + bp.sz.h + '（线上候选没有更大的）') }
+    else { out.poster = put(bp.fp, 'poster.jpg'); used.add(bp.u); out.posterUrl = bp.u; scLog(S, '竖版海报：' + bp.sz.w + '×' + bp.sz.h + ' ← ' + bp.u.split('/').pop()) }
   }
   // —— 横版主图：同样取面积最大的横版；顺手留一张竖版备用
   let posterAlt = null
   const onPort = ({ fp, sz, u }) => { if (PORTRAIT(sz) && !out.poster && !posterAlt) { posterAlt = { fp, sz, u }; return true } return false }
-  const bf = (await pick(landPool.filter(u => !used.has(u)), LANDSCAPE, sz => sz.w >= 1600, 8, onPort, locF))
+  const bf = (await pick(landPool.filter(u => !used.has(u)), LANDSCAPE, sz => sz.w >= 1600, 12, onPort, locF))
     || (await pick(landPoolFB.filter(u => !used.has(u)), LANDSCAPE, sz => sz.w >= 1600, 8, onPort, locF))
   if (bf) {
-    if (bf.local) { out.fanart = web('fanart.jpg'); scLog('横版主图：保留本地 ' + bf.sz.w + '×' + bf.sz.h + '（线上候选没有更大的）') }
-    else { out.fanart = put(bf.fp, 'fanart.jpg'); used.add(bf.u); out.fanartUrl = bf.u; scLog('横版主图：' + bf.sz.w + '×' + bf.sz.h + ' ← ' + bf.u.split('/').pop()) }
+    if (bf.local) { out.fanart = web('fanart.jpg'); scLog(S, '横版主图：保留本地 ' + bf.sz.w + '×' + bf.sz.h + '（线上候选没有更大的）') }
+    else { out.fanart = put(bf.fp, 'fanart.jpg'); used.add(bf.u); out.fanartUrl = bf.u; scLog(S, '横版主图：' + bf.sz.w + '×' + bf.sz.h + ' ← ' + bf.u.split('/').pop()) }
   }
   if (!out.poster && posterAlt) { out.poster = put(posterAlt.fp, 'poster.jpg'); used.add(posterAlt.u); out.posterUrl = posterAlt.u }
   // —— 剧照（跳过已用作主图的 URL；顺手记下第一张横版剧照作兜底）
-  let i = 1, firstLand = null, firstPort = null
-  for (const s of (parsed.samples || [])) {
-    if (used.has(s)) continue
-    try {
-      const { fp, sz } = await dl(s)
+  const SAMP_CHUNK = 12  // 剧照并发下载：与下面 12 张的上限对齐，一批齐发（配合 IMG_HOST_MAX=12）
+  let firstLand = null, firstPort = null
+  const sampEligible = []
+  for (const s of (parsed.samples || [])) { if (!used.has(s)) sampEligible.push(s); if (sampEligible.length >= 12) break }
+  for (let si = 0; si < sampEligible.length; si += SAMP_CHUNK) {
+    const chunk = sampEligible.slice(si, si + SAMP_CHUNK)
+    const gotArr = await Promise.all(chunk.map(async s => {
+      try { const g = await dl(s); return { g, s } } catch (_) { return null }
+    }))
+    for (let k = 0; k < gotArr.length; k++) {
+      const item = gotArr[k]; if (!item) continue
+      const { fp, sz } = item.g; const s = item.s
+      const i = si + k + 1
       const name = 'sample' + String(i).padStart(2, '0') + '.jpg'
       if (!firstLand && LANDSCAPE(sz)) firstLand = name
       if (!firstPort && PORTRAIT(sz)) firstPort = name
-      fs.renameSync(fp, path.join(imgDir, name))
-      out.samples.push(web(name)); used.add(s)
-      if (++i > 12) break
-    } catch (_) {}
+      try { fs.renameSync(fp, path.join(imgDir, name)); out.samples.push(web(name)); used.add(s) } catch (_) {}
+    }
   }
   // —— 兜底：竖版缺 → 用竖版剧照；横版缺 → 用横版剧照 → 退回竖版海报
   if (!out.poster && firstPort) { try { fs.copyFileSync(path.join(imgDir, firstPort), path.join(imgDir, 'poster.jpg')); out.poster = web('poster.jpg') } catch (_) {} }
@@ -3447,12 +3952,18 @@ async function scSaveImages(dir, parsed) {
   return out
 }
 /* 核心字段是否已集齐：标题/日期/演员/类别/竖图/横图都有值，且字段优先级里配置的站点都已试过 */
-function scCoreComplete(results, pri, candIds, tried) {
+function scCoreComplete(results, pri, candIds, tried, dbg) {
   for (const f of ['title', 'release', 'actors', 'genres', 'poster', 'fanart']) {
-    if (!scPickField(results, f, pri)) return false
+    if (!scPickField(results, f, pri)) { if (dbg) dbg.push('缺字段:' + f); return false }
   }
-  for (const id of (pri.by_fields ? Object.values(pri.by_fields).flat() : [])) {
-    if (candIds.has(id) && !tried.has(id)) return false
+  /* 「by_fields 优先源是否都试过」的检查：剧照、标签、封面这些**肉眼可见**的字段
+   * 不能为了快就跳过它们的优先源（试过跳过，结果剧照从 12 张掉到 1 张，不值）。
+   * 提速改由「一批并发跑完所有源」实现 —— 既不牺牲字段，又省掉分批的串行等待。 */
+  const bfd = pri.by_fields || {}
+  for (const key of Object.keys(bfd)) {
+    for (const id of (bfd[key] || [])) {
+      if (candIds.has(id) && !tried.has(id)) { if (dbg) dbg.push('未试优先源:' + id + '(' + key + ')'); return false }
+    }
   }
   return true
 }
@@ -3501,29 +4012,31 @@ async function scSaveOne(dir, cands, role) {
   fs.renameSync(best.fp, dst)
   let bytes = 0
   try { bytes = fs.statSync(dst).size } catch (_) {}
-  scLog(label + '换源：' + best.sz.w + '×' + best.sz.h + ' ← ' + best.u.split('/').pop())
+  scLog(SCRAPE, label + '换源：' + best.sz.w + '×' + best.sz.h + ' ← ' + best.u.split('/').pop())
   return { url: web(role + '.jpg'), w: best.sz.w, h: best.sz.h, bytes }
 }
 
 async function scrapeAsync(job) {
   const t0 = Date.now()
-  SCRAPE.running = true; SCRAPE.code = job.code; SCRAPE.phase = '准备'; SCRAPE.pct = 2
-  SCRAPE.error = ''; SCRAPE.log = []; SCRAPE.finishedAt = 0; SCRAPE.title = ''; SCRAPE.stop = false
+  const S = job._S || SCRAPE
+  S.running = true; S.code = job.code; S.phase = '准备'; S.pct = 2
+  S.error = ''; S.log = []; S.finishedAt = 0; S.title = ''; S.stop = false
+  S.via = String((job && job.via) || '手动')    // 来源（离线/订阅/手动），前端在任务行里显示
   const dir = path.join(cacheDir(), 'movies', job.code.replace(/[^\w.-]/g, '_'))
   const scTried = []      // 本次实际抓过的源：[{id, ok, reason}]，写进 meta 供详情页显示「数据源一览」
   let scSkipped = []      // 提前收工没来得及试的源 id
   try {
     if (job.nfo) {
-      scLog('收到 NFO（' + job.nfo.length + ' 字节），落盘备查')
+      scLog(S, '收到 NFO（' + job.nfo.length + ' 字节），落盘备查')
       try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'movie.nfo'), job.nfo) } catch (_) {}
     }
     let candidates
     if (job.url) {
       candidates = [{ id: 'custom', url: job.url, cookies: /mgstage\.com/i.test(job.url) ? 'adc=1' : '' }]
-      scLog('指定网址模式，所有数据只从该网址抓取：' + job.url)
+      scLog(S, '指定网址模式，所有数据只从该网址抓取：' + job.url)
     } else {
       candidates = scCandidates(job.code, job.sourceId)
-      scLog(`按数据源优先级排列 ${candidates.length} 个候选站点` + (job.sourceId ? '（指定：' + job.sourceId + '）' : ''))
+      scLog(S, `按数据源优先级排列 ${candidates.length} 个候选站点` + (job.sourceId ? '（指定：' + job.sourceId + '）' : ''))
     }
     if (!candidates.length) throw new Error('没有可用站点：请到 设置 → 数据源 启用带番号搜索模板的站点，或直接填该番号的详情页网址')
     let results = {}          // 每站解析结果（多源聚合，字段级择优）
@@ -3531,67 +4044,94 @@ async function scrapeAsync(job) {
     let single = !!(job.url || job.sourceId)
     if (single) {
       // 单源模式：指定网址 / 指定站点，所有字段只从这一处取
-      const r = await scTryCandidate(job.code, candidates[0])
+      const r = await scTryCandidate(job.code, candidates[0], S)
       if (r && (r.title || '').trim()) {
         r.sourceId = job.url ? '指定网址' : job.sourceId
         /* 键用真实源 id（指定站点模式）——下面字段合并 scPickField 按 results[源id] 取值，
          * 之前误存成 custom 导致指定站点刮到的字段全部对不上号，落盘成「有记录没内容」的空壳 */
         results = { [job.url ? 'custom' : job.sourceId]: r }; got = r
         scTried.push({ id: job.url ? 'custom' : job.sourceId, ok: true })
-        scLog(`✓ ${r.sourceId} 命中：《${got.title}》`)
+        scLog(S, `✓ ${r.sourceId} 命中：《${got.title}》`)
       } else {
         /* 指定来源抓不到内容（典型：DMM 站点是 JS 渲染 + 地域封锁）——不直接报错，
          * 改按番号走多源刮削；DMM 的封面/主图仍由图床直链兜底补上 */
-        scLog((job.url ? '指定网址' : job.sourceId) + '：这个页面抓不到可用信息（JS 渲染 / 反爬），改按番号「' + job.code + '」多源刮削')
+        scLog(S, (job.url ? '指定网址' : job.sourceId) + '：这个页面抓不到可用信息（JS 渲染 / 反爬），改按番号「' + job.code + '」多源刮削')
         scTried.push({ id: job.url ? 'custom' : job.sourceId, ok: false, reason: '该页面抓不到可用信息（JS 渲染 / 反爬）' })
         job.url = ''; job.sourceId = ''; single = false
       }
     }
+    /* JavDB 线上源提前起跑：它与下面的站点不同域名（主机闸按域名放行），
+     * 没必要排在最后串行等 —— 原来每部都要白等它一轮独立的网络往返。
+     * 这里只起跑不 await，等聚合循环结束后再收结果。 */
+    let pDb = null, dbDone = false
+    /* 收 javdb 的结果（幂等，只收一次）。
+     * 关键：javdb 是必跑的（指定网址模式除外），它的耗时跑不掉；而它常是**唯一能给演员表**的源
+     * —— HTML 站普遍拿不到 actors，于是「核心字段已齐」永远差它一个，早停一次都触发不了。
+     * 所以把它的结果**提前并入**，再判断能否收工：等待时间一分没多花，却能省掉后面整批。 */
+    const collectDb = async () => {
+      if (!pDb || dbDone) return
+      dbDone = true
+      try {
+        const o = await pDb
+        if (o.e) throw o.e
+        const r = o.r
+        if (r) { results.javdb = r; if (!got) { got = r; got.sourceId = 'javdb' }; scTried.push({ id: 'javdb', ok: true }); scLog(S, '✓ javdb 命中：《' + r.title + '》（线上 ' + (r.reviewsCount || 0) + ' 条评价）') }
+        else { scTried.push({ id: 'javdb', ok: false, reason: '线上搜不到这个番号' }); scLog(S, 'javdb：线上搜不到该番号') }
+      } catch (e) { scTried.push({ id: 'javdb', ok: false, reason: e.message }); scLog(S, 'javdb 失败：' + e.message) }
+    }
+    if (!job.url && !job.sourceId) {
+      try { S.phase = '抓取 javdb' } catch (_) {}
+      pDb = onlineScrapeSource(job.code).then(r => ({ r })).catch(e => ({ e }))
+    }
     if (!single) {
       // 多源聚合（MDC-NG 语义）：字段优先级站点先试，再按全局优先级补齐；核心字段齐了就提前收工
+      /* JavDB 线上源提前起跑：它与下面的站点不同域名，主机闸按域名放行，
+       * 没必要排在最后串行等（原来每部都要白等它一轮网络往返）。 */
       const pri = getSourcesData().priorities
       const preferred = new Set()
       for (const bf of Object.values(SC_FIELD_MAP)) for (const id of ((pri.by_fields || {})[bf] || [])) preferred.add(id)
       const candIds = new Set(candidates.map(c => c.id))
       const triedSet = new Set()
-      for (let i = 0; i < candidates.length; i++) {
-        const c = candidates[i]
-        scCheckStop()                       // 逐源检查：中止时把没试的源记进「已跳过」
-        triedSet.add(c.id)
-        SCRAPE.phase = '抓取 ' + c.id; SCRAPE.pct = 6 + Math.round(54 * i / candidates.length)
-        try {
-          const r = await scTryCandidate(job.code, c)
-          if (r) { results[c.id] = r; if (!got) { got = r; got.sourceId = c.id }; scLog(`✓ ${c.id} 命中：《${r.title}》`); scTried.push({ id: c.id, ok: true }) }
-          else {
-            /* DMM 特殊：站点内容由 JS 渲染 + 地域封锁，抓不到文字，但图床直链能用 ——
-             * 这里说明清楚，别让用户以为整个刮削失败（封面/主图会在下载阶段从 dmm 图床补） */
-            const dm = scDmmCdnCands(job.code)
-            const dmOk = dm.poster.length || dm.fanart.length
-            scLog(c.id + (dmOk && c.id === 'dmm' ? '：站点需 JS 渲染（抓不到文字），已改用图床直链补封面/主图' : '：页面不含该番号或没有可用信息'))
-            scTried.push({ id: c.id, ok: false, reason: dmOk && c.id === 'dmm'
-              ? '站点是 JS 渲染 + 地域封锁，抓不到文字信息；封面/主图已走 DMM 图床直链'
-              : '该站页面里没有这个番号的信息（未收录 / 被反爬挡了）' })
-          }
-        } catch (e) { scLog(c.id + ' 失败：' + e.message); scTried.push({ id: c.id, ok: false, reason: e.message }) }
-        if (got && !job.full && scCoreComplete(results, pri, candIds, triedSet)) {
-          scLog('核心字段已齐，提前收工（已聚合 ' + Object.keys(results).length + ' 个源）')
-          scSkipped = candidates.slice(i + 1).map(x => x.id)   // 没试的源：详情页「刮削内容」里可以按需补抓
-          break
+      /* 单部内多源并发批次。原来 6，8 个候选要拆成 6+2 两批 ——
+       * 第二批是**等第一批全跑完才启动**的，白白多一轮串行等待（实测多花 8~16 秒）。
+       * 各源是不同域名，主机闸按域名放行，跨源并发不受限，直接一批全开。 */
+      const SRC_BATCH = 8
+      for (let i = 0; i < candidates.length; i += SRC_BATCH) {
+      scCheckStop(S)                       // 逐源检查：中止时把没试的源记进「已跳过」
+      const batch = candidates.slice(i, i + SRC_BATCH)
+      for (const c of batch) triedSet.add(c.id)
+      S.phase = '抓取 ' + batch.map(c => c.id).join('/'); S.pct = 6 + Math.round(54 * Math.min(i + SRC_BATCH, candidates.length) / candidates.length)
+      const out = await Promise.all(batch.map(c => scTryCandidate(job.code, c, S).then(r => ({ c, r })).catch(e => ({ c, e }))))
+      for (const o of out) {
+        const c = o.c
+        if (o.e) { scLog(S, c.id + ' 失败：' + o.e.message); scTried.push({ id: c.id, ok: false, reason: o.e.message }); continue }
+        const r = o.r
+        if (r) { results[c.id] = r; if (!got) { got = r; got.sourceId = c.id }; scLog(S, `✓ ${c.id} 命中：《${r.title}》`); scTried.push({ id: c.id, ok: true }) }
+        else {
+          /* DMM 特殊：站点内容由 JS 渲染 + 地域封锁，抓不到文字，但图床直链能用 ——
+           * 这里说明清楚，别让用户以为整个刮削失败（封面/主图会在下载阶段从 dmm 图床补） */
+          const dm = scDmmCdnCands(job.code)
+          const dmOk = dm.poster.length || dm.fanart.length
+          scLog(S, c.id + (dmOk && c.id === 'dmm' ? '：站点需 JS 渲染（抓不到文字），已改用图床直链补封面/主图' : '：页面不含该番号或没有可用信息'))
+          scTried.push({ id: c.id, ok: false, reason: dmOk && c.id === 'dmm'
+            ? '站点是 JS 渲染 + 地域封锁，抓不到文字信息；封面/主图已走 DMM 图床直链'
+            : '该站页面里没有这个番号的信息（未收录 / 被反爬挡了）' })
         }
       }
-    }
+      await collectDb()   // 已并发跑完，这里通常瞬间返回；并入后 actors 才能齐，早停才有意义
+      const _dbg = []
+      if (got && !job.full && scCoreComplete(results, pri, candIds, triedSet, _dbg)) {
+        scLog(S, '核心字段已齐，提前收工（已聚合 ' + Object.keys(results).length + ' 个源）')
+        scSkipped = candidates.slice(i + batch.length).map(x => x.id)   // 没试的源：详情页「刮削内容」里可以按需补抓
+        break
+      }
+      /* 诊断日志已移除：一批跑完后它基本不触发，打在用户的「刮削日志」里只是噪音。 */
+    } }
     /* JavDB 线上源：HTML 站就算已命中也照跑一遍 —— 它常有独家封面/剧照（FC2、无码流出），
      * 而且元数据更全（评分、想看人数）。指定网址模式除外（用户明确只信那一个页面）。 */
-    if (!job.url && !job.sourceId) {
-      SCRAPE.phase = '抓取 javdb'
-      try {
-        const r = await onlineScrapeSource(job.code)
-        if (r) { results.javdb = r; if (!got) { got = r; got.sourceId = 'javdb' }; scTried.push({ id: 'javdb', ok: true }); scLog('✓ javdb 命中：《' + r.title + '》（线上 ' + (r.reviewsCount || 0) + ' 条评价）') }
-        else { scTried.push({ id: 'javdb', ok: false, reason: '线上搜不到这个番号' }); scLog('javdb：线上搜不到该番号') }
-      } catch (e) { scTried.push({ id: 'javdb', ok: false, reason: e.message }); scLog('javdb 失败：' + e.message) }
-    }
+    await collectDb()   // 循环内没收到的（如 single 模式、或循环一次都没进）在这里兜底
     if (!got) throw new Error('所有站点都未能获取到「' + job.code + '」的元数据（可能被站点反爬或番号不存在）。可尝试直接粘贴该番号的详情页网址。')
-    SCRAPE.phase = '合并字段'; SCRAPE.pct = 60
+    S.phase = '合并字段'; S.pct = 60
     const pri = getSourcesData().priorities
     /* 先判「同名不同作品」（番号撞车）：这些源的文字字段一律不进择优，否则会拼出一部不存在的片子 */
     const xf = scOffFilmSources(results, got && got.sourceId)
@@ -3599,7 +4139,7 @@ async function scrapeAsync(job) {
       ? Object.keys(results).reduce((o, id) => { if (!xf.off.has(id)) o[id] = results[id]; return o }, {})
       : results
     if (xf.off.size) {
-      scLog('⚠ 同名不同作品：' + xf.items.map(x => x.id + '《' + String(x.title || '').slice(0, 24) + '》' + x.year).join('、') +
+      scLog(S, '⚠ 同名不同作品：' + xf.items.map(x => x.id + '《' + String(x.title || '').slice(0, 24) + '》' + x.year).join('、') +
         ' 与主片（' + xf.anchorYear + ' 年）对不上 → 已排除其标题/演员/剧情等文字字段，图片只作最后兜底')
     }
     const pk = {}
@@ -3618,9 +4158,9 @@ async function scrapeAsync(job) {
       return f === 'actors' || f === 'genres' ? [] : f === 'runtime' ? 0 : ''
     }
     const fsr = f => pk[f] ? pk[f].src : ''
-    SCRAPE.title = fv('title')   // 供「添加影片」批量进度逐条回显标题
-    SCRAPE.phase = '下载图片'; SCRAPE.pct = 62
-    scCheckStop()                       // 图片是最容易卡住的阶段（几十张图逐个试站点）
+    S.title = fv('title')   // 供「添加影片」批量进度逐条回显标题
+    S.phase = '下载图片'; S.pct = 62
+    scCheckStop(S)                       // 图片是最容易卡住的阶段（几十张图逐个试站点）
     /* 图片候选：把所有源的候选按优先级串起来，而不是只取「第一个有图的源」那一份清单 ——
      * 只认一份清单时，万一那源只给了小图/横图就再无挑选余地（START-549 竖版海报卡在 147×200 就是这样）。
      * 撞车源的图排在最后，只在前面全挂时才轮到它兜底。 */
@@ -3666,25 +4206,44 @@ async function scrapeAsync(job) {
       const cid = scDmmCidOf(u)
       if (cid && knownCids.indexOf(cid) < 0) knownCids.push(cid)
     }
+    /* 站点没给出真实 cid（javdb 等只给自家 CDN 的图）→ 按前缀爆破探一次 DMM 图床：
+     * 探到的高清 cid 排在候选最前，DLDSS-537 这类「番号拼不出 cid」的片子全靠它拿到大图。
+     * 已经拿到站点真 cid 时不必爆（那才是 100% 准的）。 */
+    let probeCid = ''
+    if (!knownCids.length) {
+      try { S.phase = '探测 DMM 图床 cid' } catch (_) {}
+      probeCid = await scDmmResolveCid(job.code)
+      if (probeCid) scLog(S, 'DMM 图床 cid 修正：番号拼出的 cid 在图床上没有图，真身是 ' + probeCid)
+    }
+    const dmmP = probeCid ? scDmmCandsFromCids([probeCid]) : { poster: [], fanart: [], samples: [] }
     const dmmK = scDmmCandsFromCids(knownCids.slice(0, 3))
-    const dmmC = scDmmCdnCands(job.code)
+    const dmmC = probeCid ? { poster: [], fanart: [], samples: [] } : scDmmCdnCands(job.code)
     const builtUrls = new Set([].concat(dmmK.poster, dmmK.fanart, dmmK.samples, dmmC.poster, dmmC.fanart, dmmC.samples))
     const imgs = await scSaveImages(dir, {
-      posterCands: posterAll.concat(dmmK.poster, dmmC.poster),
-      fanartCands: fanartAll.concat(dmmK.fanart, dmmC.fanart),
+      /* DMM 图床候选排在站点候选**前面**：图床给的是 1032×1467 / 2184×1467 这类原图，
+       * 站点给的大多是 147×200 缩略图。放在队尾时会被 pick 的 maxTry 截断（SSIS-500：
+       * 站点候选 8 条用完，DMM 那条根本没轮到，海报就停在 147×200）——排前面反而更早收工。 */
+      posterCands: dmmP.poster.concat(dmmK.poster, dmmC.poster, posterAll),
+      fanartCands: dmmP.fanart.concat(dmmK.fanart, dmmC.fanart, fanartAll),
       posterFallback: posterFB, fanartFallback: fanartFB,
-      samples: samplesAll.length ? samplesAll : (pk.samples ? pk.samples.cands : []).concat(dmmK.samples, dmmC.samples)
-    })
-    /* 来源标注：只有命中「本地构造的 DMM 直链」才写 dmm 图床；其它按真正给出这条 URL 的站点。
-     * 旧写法只要 URL 里含 dmm 就写「dmm 图床」——jav321 给的正是 DMM 官方图，于是正常刮到的也白背
-     * 「没刮到、走图床兜底」的黑锅（这正是用户看到的「很多主图显示 dmm 图床」）。 */
-    const srcOf = (u, f) => (!u ? (pk[f] ? pk[f].src : '')
-      : (urlSrc[u] || (builtUrls.has(u) ? 'dmm 图床' : (pk[f] ? pk[f].src : ''))))
+      samples: samplesAll.length ? samplesAll : (pk.samples ? pk.samples.cands : []).concat(dmmP.samples, dmmK.samples, dmmC.samples)
+    }, S)
+    /* 来源标注：**按图片的真实 CDN 主机**归属，而不是「哪个站把这条 URL 给我的」。
+     * 旧写法只认「谁给的 URL」，于是 jav321 转手 DMM 官方图时会被标成 jav321 —— 用户看到
+     * MIRD285「图片来源是 jav321」，而图其实就在 DMM 图床上（meta 里明明写着 dmm 图床）。
+     * 现在只要图真的来自 DMM 图床就标 DMM；非 DMM 才回退到给 URL 的站 / 字段来源。 */
+    const DMM_IMG_HOST = /(^|\.)(awsimgsrc|pics)\.dmm\.(co\.jp|com)$/i
+    const imgHost = u => { try { return new URL(String(u)).hostname } catch (_) { return '' } }
+    const srcOf = (u, f) => {
+      if (!u) return pk[f] ? pk[f].src : ''
+      if (DMM_IMG_HOST.test(imgHost(u))) return 'DMM'
+      return urlSrc[u] || (builtUrls.has(u) ? 'DMM' : (pk[f] ? pk[f].src : ''))
+    }
     imgs.posterSrc = srcOf(imgs.posterUrl, 'poster')
     imgs.fanartSrc = srcOf(imgs.fanartUrl, 'fanart')
     imgs.samplesSrc = pk.samples ? pk.samples.src : ''
     delete imgs.posterUrl; delete imgs.fanartUrl
-    SCRAPE.phase = '抓取磁力'; SCRAPE.pct = 86
+    S.phase = '抓取磁力'; S.pct = 86
     let magnets = []
     const old = readMovieCache(job.code)
     if (old && Array.isArray(old.magnets) && old.magnets.length) magnets = old.magnets
@@ -3720,7 +4279,15 @@ async function scrapeAsync(job) {
         genres: { v: fv('genres'), src: fsr('genres') },
         year: { v: (fv('release') || '').slice(0, 4), src: fsr('release') }
       },
-      sourceData: {}
+    /* 评分 / 想看人数：javdb 独有字段，择优取（其它源没有 → 空） */
+    score: (results.javdb && results.javdb.score) || '',
+    wantWatch: (results.javdb && results.javdb.wantWatch) || 0,
+    /* 原番号：DMM/JavDB 用的无连字符形式（如 MIDE-775 → mide00775） */
+    origCode: (() => { try { const s = MDCNG.splitNumber(job.code); return s.serial_name && /^\d+$/.test(s.serial_number || '') ? s.serial_name.toLowerCase().replace(/[^a-z0-9]/g, '') + String(s.serial_number).padStart(5, '0') : '' } catch (_) { return '' } })(),
+    /* 本次刮削日志：以前只存在内存（S.log），任务一结束就丢 → 历史任务详情页的「刮削日志」列没数据。
+     * 落盘一份（含时间戳前缀的完整行），供详情页按时间线渲染。 */
+    scrapeLog: (S.log || []).slice(-200),
+    sourceData: {}
     }
     for (const [id, r] of Object.entries(results)) {
       meta.sourceData[id] = {
@@ -3737,20 +4304,26 @@ async function scrapeAsync(job) {
     fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2))
     mirrorMeta(job.code)   // 设置了封面/元数据目录 → 镜像一份（视频与封面分离）
     patchDataItem(job.code)   // 并回内存条目：本地影片详情/系列页立刻见新数据
-    SCRAPE.pct = 100; SCRAPE.phase = '完成'
-    scLog(`完成：《${got.title}》 竖版封面${imgs.poster ? '✓' : '✕'} 横版主图${imgs.fanart ? '✓' : '✕'} 剧照 ${imgs.samples.length} 张 磁力 ${magnets.length} 条`)
-    scrapeHistAdd({ code: job.code, ok: true, err: '', src: got.sourceId || '', via: job.via || '手动', at: t0, dur: Date.now() - t0 })
+    S.pct = 100; S.phase = '完成'
+    scLog(S, `完成：《${got.title}》 竖版封面${imgs.poster ? '✓' : '✕'} 横版主图${imgs.fanart ? '✓' : '✕'} 剧照 ${imgs.samples.length} 张 磁力 ${magnets.length} 条`)
+    /* 日志最后一行（完成/失败）是写盘之后才产生的 → 回填一次 scrapeLog 再落盘，
+     * 否则详情页的「刮削日志」永远少最后一条。 */
+    meta.scrapeLog = (S.log || []).slice(-200)
+    try { fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2)) } catch (_) {}
+    scrapeHistAdd({ code: job.code, ok: true, err: '', src: got.sourceId || '', imgSrc: imgs.posterSrc || imgs.fanartSrc || '', via: job.via || '手动', at: t0, dur: Date.now() - t0 })
   } catch (e) {
-    SCRAPE.error = e.message
-    scLog('失败：' + e.message)
+    S.error = e.message
+    scLog(S, '失败：' + e.message)
     scrapeHistAdd({ code: job.code, ok: false, err: String(e.message || '').slice(0, 120), src: '', via: job.via || '手动', at: t0, dur: Date.now() - t0 })
   } finally {
-    SCRAPE.running = false; SCRAPE.finishedAt = Date.now(); SCRAPE.stop = false
-    /* 手动单跑任务正常收尾 → 清掉落盘里的"进行中"，别下次启动又补一遍 */
-    if (AUTO_INGEST.current === job.code && !AUTO_INGEST.queue.includes(job.code)) {
-      AUTO_INGEST.current = ''; AUTO_INGEST.currentVia = ''; autoQSave()
+    S.running = false; S.finishedAt = Date.now(); S.stop = false
+    /* 无论手动单跑还是队列 worker，这部刮完都要从 active 摘掉：否则 firstActive() 下次被触发时
+     * 还会把这部早已结束的番号当成"当前在刮"，前端一直显示它在刮。worker 路径在自己的循环里也会再清一次（幂等）。 */
+    if (AUTO_INGEST.active && AUTO_INGEST.active[job.code]) {
+      delete AUTO_INGEST.active[job.code]
+      firstActive(); autoQSave()
     }
-    console.log('[scrape]', job.code, SCRAPE.error ? '失败: ' + SCRAPE.error : 'OK', Date.now() - t0 + 'ms')
+    console.log('[scrape]', job.code, S.error ? '失败: ' + S.error : 'OK', Date.now() - t0 + 'ms')
   }
 }
 /* 已刮削影片（无本地文件的虚拟条目，混进 data.json / 详情查找） */
@@ -3786,7 +4359,7 @@ function allItems() { return ((DATA && DATA.items) || []).concat(scrapedVirtualI
  * 其余字段取代表条目（已刮削的优先）；徽章取各文件并集（保序去重）；size 求和、mtime 取最大、pending/hidden/scraped 任一为真即为真。 */
 const fileOf = it => ({ relVideo: it.relVideo, size: it.size || 0, mtime: it.mtime || 0, tags: it.tags || [] })
 function mergeCodeGroup(list) {
-  if (list.length === 1) return Object.assign({}, list[0], { files: [fileOf(list[0])] })
+  if (list.length === 1) return Object.assign({}, list[0], { files: [fileOf(list[0])].filter(f => f && f.relVideo) })
   /* 主文件 = 已刮削的里面体积最大的（原版通常最大，-U/-C 转制版较小）；全未刮削则取最大 */
   const pool = list.filter(x => x.scraped)
   const g = Object.assign({}, (pool.length ? pool : list).slice().sort((a, b) => (b.size || 0) - (a.size || 0))[0] || list[0])
@@ -3802,7 +4375,10 @@ function mergeCodeGroup(list) {
   g.mtime = Math.max.apply(null, list.map(x => x.mtime || 0))
   for (const k of ['hidden', 'pending', 'scraped', 'scrapeFields']) g[k] = list.some(x => x[k])
   g.scrapedAt = list.map(x => x.scrapedAt || '').sort().pop() || ''
-  g.files = list.map(fileOf)
+  /* files 只留真有视频文件的：没本地视频的条目（离线入库的 virtual 条目就是 relVideo:''）
+   * 一旦和别的同番号条目并组，就会混进这个数组里充数 —— 详情页于是显示出「影片文件 2 个版本」，
+   * 点开却只有两行空名字、播放按钮指向空路径（2026-10-06 IPX-497 反馈）。 */
+  g.files = list.map(fileOf).filter(f => f && f.relVideo)
   return g
 }
 function groupByCode(items) {
@@ -3826,45 +4402,304 @@ let SUB_FEED = { at: 0, data: null }
 const SUB_FEED_TTL = 300000
 /* ---------- 订阅「自动入库」：开了开关的订阅，检查到线上新作后自动刮进离线数据 ----------
  * 默认关闭 —— 订阅只负责「发现」，要不要入媒体库由用户逐条决定；开关在订阅列表里改。 */
-const AUTO_INGEST = { running: false, queue: [], done: 0, total: 0, current: '', currentVia: '', ok: 0, fail: 0, paused: false }
-async function autoIngestRun() {
-  if (AUTO_INGEST.running) return
-  AUTO_INGEST.running = true
+const AUTO_INGEST = { running: false, workers: 0, queue: [], done: 0, total: 0, current: '', currentVia: '', ok: 0, fail: 0, paused: false, active: {} }
+/* 维护 AUTO_INGEST.current 显示「当前在刮的番号」：并发下有多部同时在刮，取 active 里第一条（先开始的）。
+ * 单部完成时 delete active[code] 再 firstActive() 即可把展示切到下一部。 */
+function firstActive() {
+  const A = AUTO_INGEST.active || {}
+  const keys = Object.keys(A)
+  if (!keys.length) { if (AUTO_INGEST.current) { AUTO_INGEST.current = ''; AUTO_INGEST.currentVia = '' } return }
+  const code = keys[0]
+  AUTO_INGEST.current = code
+  AUTO_INGEST.currentVia = (A[code] && A[code].via) || (AUTO_INGEST.queue.via || {})[code] || '订阅'
+}
+/* ---------- 单任务看门狗（2026-10-06） ----------
+ * scrapeAsync 是一条很长的链（多源逐个试 → 下载十来张图 → 抓磁力），任何一步 await 挂住，
+ * 整部任务就停在那儿不动 —— 而且没有谁会来叫醒它。2026-10-06 就出了这样的事：
+ * DV-1582 卡在「下载图片」62%，一直挂了近 9 小时，后面排队的 10 部一部都没开工，用户只看到
+ * 「队列不动了」。这里从外面套两层保险，放弃时写一条带原因的失败历史，队列照常往下跑：
+ *   ① 无推进：TASK_STALL_MS 内 phase / pct / 日志行数毫无变化 → 判定卡死；
+ *   ② 硬上限：一部最多刮 TASK_HARD_MS。
+ * 放弃只是「把 worker 让出来」（Promise.race），后台那次 scrapeAsync 会因为 S.dead 在下一个
+ * 网络请求处自行中断，不会留下僵尸任务。 */
+const TASK_HARD_MS = 12 * 60 * 1000      // 一部最多刮 12 分钟
+const TASK_STALL_MS = 5 * 60 * 1000      // 5 分钟毫无推进 = 卡死
+async function scrapeWithWatchdog(job, st) {
+  const sigOf = () => String(st.phase || '') + '|' + String(st.pct || 0) + '|' + ((st.log && st.log.length) || 0)
+  let lastSig = sigOf(), lastAt = Date.now(), reason = ''
+  const watcher = setInterval(() => {
+    const s = sigOf()
+    if (s !== lastSig) { lastSig = s; lastAt = Date.now(); return }
+    const stall = Date.now() - lastAt
+    if (stall > TASK_STALL_MS) reason = '刮削卡住：' + Math.round(stall / 1000) + ' 秒没有任何进展（停在「' + (st.phase || '未知阶段') + '」）'
+  }, 15000)
+  const hardAt = Date.now() + TASK_HARD_MS
+  let bailTimer = null
+  let bailPromise = null
+  await new Promise(res => {
+    let done = false
+    const fin = () => { if (done) return; done = true; res() }
+    bailTimer = setInterval(() => {
+      if (!reason && Date.now() <= hardAt) return
+      if (!reason) reason = '刮削超时：超过 ' + Math.round(TASK_HARD_MS / 60000) + ' 分钟未完成'
+      clearInterval(bailTimer); fin()
+    }, 10000)
+    bailPromise = fin
+    scrapeAsync(job).catch(e => { st.error = st.error || String((e && e.message) || e); fin() }).then(fin)
+  })
+  clearInterval(watcher); if (bailTimer) clearInterval(bailTimer)
+  if (reason) {
+    st.error = st.error || reason
+    st.running = false
+    st.dead = true                                   // 通知还在后台的那次 scrapeAsync 尽快收手
+    try { scLog(st, '✗ ' + reason) } catch (_) {}
+    try { scrapeHistAdd({ code: job.code, ok: false, err: String(reason).slice(0, 120), src: '', via: job.via || '手动', at: Date.now(), dur: Date.now() - (job.t0 || Date.now()) }) } catch (_) {}
+    console.log('[scrape] 看门狗放弃「' + job.code + '」：' + reason)
+  }
+}
+/* ---------- 自动入库 worker 池（2026-10-06 重写为「常驻」） ----------
+ * 旧写法：worker 一看队列空就 return，Promise.all 结束后 running 置 false。
+ * 问题是 4 个 worker 是**陆续**退出的：在只剩最后一个 worker 的那段窗口里入队的新任务，
+ * 只能由它一部一部串行处理（并发从 4 退化成 1）；它万一再卡住，整条队列就彻底停摆。
+ * 现在 worker 常驻（队列空就 2 秒轮询一次），ensureWorkers 幂等补员到 AUTO_CONCUR 个，
+ * 保证任何时候有新任务都有人接、且始终是满并发。 */
+const AUTO_CONCUR = 4   // 同时刮几部；单部内部的多源/图片并发由 scrapeAsync + scOnce 主机闸控制
+function ensureWorkers() {
+  while ((AUTO_INGEST.workers || 0) < AUTO_CONCUR) {
+    AUTO_INGEST.workers = (AUTO_INGEST.workers || 0) + 1
+    autoWorker().catch(() => {})
+  }
+}
+/* ⚠️ 必须返回 Promise：外面有 4 处写成 `autoIngestRun().catch(() => {})`
+ *   （入队 / 启动恢复 / resume / front）。返回 undefined 时 `undefined.catch` 直接 TypeError，
+ *   接口就以 500 收场——而队列其实已经入好了，前端却收到 ok:false，
+ *   用户看到「提交失败」再点一次 → 重复提交（2026-10-06 实测）。 */
+function autoIngestRun() { ensureWorkers(); return Promise.resolve() }
+async function autoWorker() {
   try {
-    while (AUTO_INGEST.queue.length) {
+    while (true) {
+      /* running 反映「是不是真的有活」：队列里还有号或还有部在刮。
+       * 以前这是个手置的布尔，锁在 autoIngestRun 上，一旦某条路径没解锁就永远 true/false。 */
+      AUTO_INGEST.running = AUTO_INGEST.queue.length > 0 || Object.keys(AUTO_INGEST.active || {}).length > 0
       if (AUTO_INGEST.paused) { await new Promise(s => setTimeout(s, 2000)); continue }   // 暂停：保留队列，只是不取新任务
+      if (!AUTO_INGEST.queue.length) { await new Promise(s => setTimeout(s, 2000)); continue }
       const via = (AUTO_INGEST.queue.via || {})[AUTO_INGEST.queue[0]] || '订阅'
+      const subId = (AUTO_INGEST.queue.sub || {})[AUTO_INGEST.queue[0]] || ''   // 这条番号若来自某条订阅，记下来 → 刮完按需推 115
       const code = AUTO_INGEST.queue.shift()
-      AUTO_INGEST.current = code
-      AUTO_INGEST.currentVia = via
-      autoQSave()                            // 刚落队就落盘：这会儿容器被杀，恢复时它还在队首
-      if (SCRAPE.running) { await new Promise(s => setTimeout(s, 3000)); AUTO_INGEST.queue.unshift(code); continue }   // 用户手动刮削优先
+      /* 已经有 worker 正在刮这部（用户重复提交 / 重试点太快）→ 这次让路：
+       * 那一路刮完照样会写历史、覆盖掉排队占位，这部等于是有结果的。
+       * 若这里照刮就是两路并发写同一个 cache/movies/<番号>/ 目录 —— writeFileSync 非原子、
+       * 图片还是同名覆盖，最终的 meta.json 可能变成两次结果的混合体。 */
+      if (Object.keys(AUTO_INGEST.active || {}).some(k => bare(k) === bare(code))) {
+        await new Promise(s => setTimeout(s, 1500))
+        continue
+      }
+      const st = scMakeState(); st.code = code; st.via = via
+      AUTO_INGEST.active[code] = st
+      firstActive(); autoQSave()
+      if (SCRAPE.running) { AUTO_INGEST.queue.unshift(code); delete AUTO_INGEST.active[code]; firstActive(); autoQSave(); await new Promise(s => setTimeout(s, 3000)); continue }
       let already = false
       try { const m = readMovieCache(code); already = !!(m && m.scraped) } catch (_) {}
-      if (already) { AUTO_INGEST.done++; AUTO_INGEST.ok++; AUTO_INGEST.current = ''; autoQSave(); continue }   // 已有离线数据就不重复刮
-      try { await scrapeAsync({ code, via }) } catch (_) {}
-      if (SCRAPE.error) AUTO_INGEST.fail++; else AUTO_INGEST.ok++
+      if (already) {
+        /* 已有离线数据 → 跳过重刮。但**必须把历史记录收尾**：
+         * 提交时（/api/scrape/start 入队那刻）会先写一条 state:'queued' 占位，若这里不覆盖，
+         * 那条占位会永远停在「排队中」（用户 2026-10-06 反馈：卡片一直卡住、历史里也只有排队中）。
+         * 补一条「已存在，跳过重刮」的成功记录，语义也如实。 */
+        AUTO_INGEST.done++; AUTO_INGEST.ok++
+        const _mm = (() => { try { return readMovieCache(code) } catch (_) { return null } })()
+        scrapeHistAdd({
+          code, ok: true, err: '', via,
+          src: ((_mm && _mm.images && _mm.images.posterSrc) || (_mm && String(_mm.source || '').split(' ')[0]) || '本地已有'),
+          imgSrc: (_mm && _mm.images && (_mm.images.posterSrc || _mm.images.fanartSrc)) || '',
+          at: Date.now(), dur: 0, skipped: true,
+          note: '本地已有离线数据，未重复刮削'
+        })
+        delete AUTO_INGEST.active[code]; firstActive(); autoQSave(); continue
+      }
+      try { await scrapeWithWatchdog({ code, via, _S: st, t0: Date.now() }, st) } catch (_) {}
+      if (st.error) AUTO_INGEST.fail++; else AUTO_INGEST.ok++
       AUTO_INGEST.done++
-      AUTO_INGEST.current = ''            // 这一部完成了（落盘时别再把它当"进行中"）
-      autoQSave()
+      delete AUTO_INGEST.active[code]
+      firstActive(); autoQSave()
+      if (subId) subAfterScrape(code, subId).catch(() => {})
     }
-  } finally { AUTO_INGEST.running = false; AUTO_INGEST.current = ''; AUTO_INGEST.currentVia = ''; AUTO_INGEST.queue.via = AUTO_INGEST.queue.via || {} }
+  } catch (e) {
+    /* worker 不该死：真有没料到的异常也不能让并发数永久减一（每少一个，队列就慢一分）。 */
+    console.log('[auto-ingest] worker 异常退出：' + ((e && e.message) || e) + '，稍后自动补员')
+  } finally {
+    AUTO_INGEST.workers = Math.max(0, (AUTO_INGEST.workers || 0) - 1)
+    setTimeout(() => { try { if (AUTO_INGEST.queue.length) autoIngestRun() } catch (_) {} }, 5000)
+  }
 }
 /* front = true → 插到队首（手动指定的番号优先于订阅批量）。
  * 返回该番号在队列里的位次（1 起），给前端显示「前面还有几部」。 */
-function autoIngestQueue(codes, via = '订阅', front = false) {
+function autoIngestQueue(codes, via = '订阅', front = false, subId = '') {
   const q = AUTO_INGEST.queue
   q.via = q.via || {}
+  q.sub = q.sub = q.sub || {}          // 番号 → 来源订阅 id（自动下载要据此判断这条订阅开没开）
+  let added = 0
   for (const c of codes) {
-    if (!c || q.includes(c)) continue
+    if (!c) continue
+    const at = q.indexOf(c)
+    if (at >= 0) {
+      /* 已在队列里：front 时把它提到队首（用户重复点「开始刮削」期望的是「马上刮我这部」），
+       * 否则原样留着。原来这里直接 continue，导致 autoIngestQueue 返回 0，
+       * 上层以为「没入队」而写下永远收不了尾的 queued 占位。 */
+      if (front && at > 0) { q.splice(at, 1); q.unshift(c) }
+      continue
+    }
     if (front) q.unshift(c); else q.push(c)
     q.via[c] = via
+    if (subId) q.sub[c] = subId
+    added++
   }
   if (!q.length) return 0
   AUTO_INGEST.total = q.length + AUTO_INGEST.done
   autoQSave()
+  /* ⚠️ 位次必须在**启动 worker 之前**算出来。
+   * autoIngestRun → ensureWorkers → autoWorker 的循环体在第一个 await 之前是同步执行的
+   * （含 `queue.shift()`），所以它会当场把刚 push 进去的这部取走 → 队列变空 →
+   * 后面再算 indexOf 就是 -1+1=0 → 上层当成「没能入队」走 dup 分支：不写排队占位、
+   * 返回 queued:false。前端因此既不显示排队、也等不到结果，最后判成超时失败
+   * （服务端其实正在刮、而且很快就成功了）。2026-10-06 实测：服务端空闲时提交单部必中。 */
+  const pos0 = q.indexOf(codes[0]) + 1
   autoIngestRun().catch(() => {})
-  return q.indexOf(codes[0]) + 1
+  /* 返回「第一部在队列里的位次」（1 起）。注意不能因为 added===0 就返回 0：
+   * 那样上层会误判「没入队」。已经在队列里的照样返回它的真实位次。 */
+  return pos0
+}
+
+/* ================== 订阅自动下载：刮削完成后自动把磁力推到 115 ==================
+ * 触发链：订阅检查 → 新作排进刮削队列 → 刮完拿到磁力 → 若这条订阅开了自动下载，
+ *         就把磁力列表第一条（按 seeders 降序，即种子最多的那条）推到 115 离线目录。
+ * 与「自动入库」是两件事：入库 = 抓元数据进本地库；自动下载 = 把文件拉回 115。
+ * 两个都开时先刮元数据（库里马上能看到条目），再把磁力推去 115 拉文件。
+ *
+ * 三道保险，缺一不可：
+ *   ① 全局开关 CFG.subAutoDl（默认关）—— 免得某条订阅误开就一路狂推；
+ *   ② 每条订阅单独的 autoDl（默认关）；
+ *   ③ 单次检查最多推 CFG.subAutoDlMax 部（默认 20）—— 订阅到多产女优时一次能冒出上百部，
+ *      不限量会瞬间灌爆 115 的离线配额（实测 2026-10 配额 1500 已被用满）。
+ * 另外用 SUB_DL.pushed 记住推过的番号，下次检查不会重复推同一部。 */
+const SUB_DL = { pushed: {}, round: { at: 0, n: 0, ok: 0, fail: 0, skipped: 0, last: [] } }
+const SUB_DL_FILE = () => { try { return path.join(cacheDir(), 'sub-autodl.json') } catch (_) { return '' } }
+function subDlSave() {
+  try { fs.writeFileSync(SUB_DL_FILE(), JSON.stringify({ pushed: SUB_DL.pushed, round: SUB_DL.round })) } catch (_) {}
+}
+function subDlLoad() {
+  try {
+    const d = JSON.parse(fs.readFileSync(SUB_DL_FILE(), 'utf8'))
+    if (d && d.pushed && typeof d.pushed === 'object') SUB_DL.pushed = d.pushed
+    if (d && d.round && typeof d.round === 'object') SUB_DL.round = Object.assign(SUB_DL.round, d.round)
+  } catch (_) {}
+}
+function subDlOn() { return CFG.subAutoDl === '1' }                  // 全局总开关：默认关
+function subDlMax() { const n = parseInt(CFG.subAutoDlMax, 10); return isNaN(n) ? 20 : Math.max(1, Math.min(200, n)) }
+/* ── 磁力质量识别（对标 Byte-Muse DEFAULT_FILTER / DEFAULT_SORT，作用在「同一步片子的多条磁力」上）──
+ * 磁力对象字段见刮削处（title / hash / size / date / seeders / leechers / magnet）。
+ * 这些标都藏在 title 里：中字 / 無修正(无码) / 4K·UHD / HEVC / VR / AI / 字幕 … */
+function magTitle(m) { return String((m && (m.title || (m.magnet || ''))) || '').toLowerCase() }
+function magIsChinese(t) { if (/(无|無)字幕|字幕なし|英字|no[-\s]?sub/i.test(t)) return false; return /中文字幕|字幕|chinese|\b(chs|cht|zh|sub|bilingual)\b|subtitle/i.test(t) }
+function magIsUC(t) { return /無修正|无码|无修正|uncensored|\buc\b/.test(t) }
+function magIsUHD(t) { return /(^|[\s._\-])(4k|2160p|uhd)/.test(t) }
+function magSizeMB(m) {
+  const s = String((m && m.size) || '')
+  const m1 = s.match(/([\d.]+)\s*(TiB|TB|GiB|GB|MiB|MB)/i); if (!m1) return 0
+  const v = parseFloat(m1[1]); const u = m1[2].toUpperCase()
+  if (u === 'TIB' || u === 'TB') return v * 1024 * 1024
+  if (u === 'GIB' || u === 'GB') return v * 1024
+  if (u === 'MIB' || u === 'MB') return v
+  return 0
+}
+/* 从一批磁力里挑「最佳」那一条（只推 1 条）。返回 null = 没挑到任何合格磁力。
+ * sub 可为空：仅用全局过滤；sub.requireSub / sub.requireUncensored 是订阅级「只要中字/只要无码」，
+ *   会作为额外 AND 条件叠加到全局 DEFAULT_FILTER 上（和 Byte-Muse 的 only_chinese/only_uc 同语义）。 */
+function subMagnetPick(magnets, sub) {
+  let list = (Array.isArray(magnets) ? magnets : []).filter(m => /^magnet:/i.test(String((m && (m.magnet || m.url)) || '').trim()))
+  if (!list.length) return null
+  const onlyChinese = (sub && sub.requireSub === true) || CFG.subDlOnlyChinese === '1'
+  const onlyUc = (sub && sub.requireUncensored === true) || CFG.subDlOnlyUc === '1'
+  // onlyX 优先于 excludeX：勾「只要无码 / 只要4K」时，不应再执行对应的「排除无码 / 排除4K」，
+  // 否则两开关互斥 → 任何磁力都过不了 → 自动下载静默跳过（不占额度、无报错，极难察觉）。
+  const excludeUc = onlyUc ? false : (CFG.subDlExcludeUc === '1')
+  const onlyUhd = CFG.subDlOnlyUhd === '1'
+  const excludeUhd = onlyUhd ? false : (CFG.subDlExcludeUhd !== '')   // 默认开（排除 4K/UHD，对标 Byte-Muse exclude_uhd:true）
+  const includeKw = String(CFG.subDlIncludeKw || '').toLowerCase().split(/[,，\s]+/).filter(Boolean)
+  const excludeKw = String(CFG.subDlExcludeKw || '').toLowerCase().split(/[,，\s]+/).filter(Boolean)
+  const minMB = parseFloat(CFG.subDlMinSize); const maxMB = parseFloat(CFG.subDlMaxSize)
+  list = list.filter(m => {
+    const t = magTitle(m)
+    if (onlyChinese && !magIsChinese(t)) return false
+    if (onlyUc && !magIsUC(t)) return false
+    if (excludeUc && magIsUC(t)) return false
+    if (onlyUhd && !magIsUHD(t)) return false
+    if (excludeUhd && magIsUHD(t)) return false
+    if (includeKw.length && !includeKw.some(k => t.includes(k))) return false
+    if (excludeKw.length && excludeKw.some(k => t.includes(k))) return false
+    const mb = magSizeMB(m); if (!isNaN(minMB) && mb && mb < minMB) return false
+    if (!isNaN(maxMB) && mb && mb > maxMB) return false
+    return true
+  })
+  if (!list.length) return null
+  /* DEFAULT_SORT 精神：中字 > 无码 > 种子数 > (默认非UHD / onlyUhd时UHD)。
+   * 原实现是纯 seeders 降序（等于把 Byte-Muse 里 seeders 之前的维度全丢了），这里补上。 */
+  list.sort((a, b) => {
+    const ta = magTitle(a), tb = magTitle(b)
+    const ca = magIsChinese(ta) ? 1 : 0, cb = magIsChinese(tb) ? 1 : 0; if (ca !== cb) return cb - ca
+    const ua = magIsUC(ta) ? 1 : 0, ub = magIsUC(tb) ? 1 : 0; if (ua !== ub) return ub - ua
+    const sa = a.seeders || 0, sb = b.seeders || 0; if (sb !== sa) return sb - sa
+    const va = magIsUHD(ta) ? 1 : 0, vb = magIsUHD(tb) ? 1 : 0
+    return onlyUhd ? (vb - va) : (va - vb)   // 默认非 UHD 优先；onlyUhd 时 UHD 优先
+  })
+  return list[0]
+}
+/* 新一轮订阅检查：重置本轮计数 —— 额度是「每次检查」的，不是「每天」的 */
+function subDlRoundStart() {
+  SUB_DL.round = { at: Date.now(), n: 0, ok: 0, fail: 0, skipped: 0, last: [] }
+  subDlSave()
+}
+/* 推一条磁力到 115：
+ * ⚠ pan115 那批函数（签名/重试/cookie）都定义在 handleActorApi() 内部，顶层作用域拿不到，
+ *   这里不复制一份（重复实现迟早走样），直接请求自己的 /api/115/push ——
+ *   顺带复用推完的 watch115Push 自动认领盯梢（115 下完自动入库就是靠那条链路）。 */
+async function subPush115(code, magnet) {
+  const r = await fetch('http://127.0.0.1:' + PORT + '/api/115/push', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, magnets: [magnet] }),
+    signal: AbortSignal.timeout(45000)
+  })
+  return await r.json()
+}
+/* 刮削完成后调用：符合条件就把这部片子的最佳磁力推到 115。返回 null = 没推（正常跳过）。 */
+async function subAfterScrape(code, subId) {
+  try {
+    if (!subId || !subDlOn()) return null
+    const subs = Array.isArray(data.subs) ? data.subs : []
+    const s = subs.find(x => x && x.id === subId)
+    if (!s || s.autoDl !== '1') return null
+    if (SUB_DL.pushed[code]) return null                        // 这部推过了
+    if (SUB_DL.round.n >= subDlMax()) { SUB_DL.round.skipped++; subDlSave(); return null }
+    let magnets = []
+    try { const m = readMovieCache(code); magnets = (m && Array.isArray(m.magnets)) ? m.magnets : [] } catch (_) { magnets = [] }
+    /* 选最佳磁力：先按质量过滤（对标 Byte-Muse DEFAULT_FILTER：中字/无码/UHD/关键词/体积），
+     * 再按质量优先排序（DEFAULT_SORT：中字 > 无码 > 种子数 > 非UHD），只推 1 条。
+     * 原实现是纯 seeders 降序，已改为质量优先。 */
+    const best = subMagnetPick(magnets, s)
+    const mg = String((best && (best.magnet || best.url)) || '').trim()
+    if (!/^magnet:/i.test(mg)) return null                      // 没挖到合格磁力：跳过，且不占额度
+    SUB_DL.round.n++
+    let d = null
+    try { d = await subPush115(code, mg) } catch (e) { d = { ok: false, error: e.message } }
+    const ok = !!(d && d.ok)
+    if (ok) { SUB_DL.round.ok++; SUB_DL.pushed[code] = { at: Date.now(), subId, subName: s.name || '' } }
+    else SUB_DL.round.fail++
+    SUB_DL.round.last.unshift({ code, at: Date.now(), ok, error: ok ? '' : String((d && d.error) || '推送失败') })
+    SUB_DL.round.last = SUB_DL.round.last.slice(0, 30)
+    subDlSave()
+    console.log('[sub-autodl] ' + code + ' → 115 ' + (ok ? '✓ 已推送' : '✗ ' + String((d && d.error) || '失败')))
+    return { code, ok }
+  } catch (_) { return null }
 }
 /* 队列落盘：几百部的批量入库要跑好几个小时，容器中途重启（部署/断电）不能把没跑的番号全丢了。
  * ⚠️ 「正在刮的那一部」在 autoIngestRun 里已经 shift 出队了，**只存 queue 会把它弄丢** ——
@@ -3899,19 +4734,121 @@ function autoQLoad() {
   } catch (_) {}
 }
 
-/* ---------- 刮削历史（服务端常驻）：手动 / 订阅 / 扫描的每一次刮削成败都记一条，落盘重启不丢 ---------- */
+/* 启动时收拾「孤儿排队记录」：state:'queued' 的占位是提交任务那一刻写的，
+ * 正常会被刮完时的 scrapeHistAdd 覆盖。但只要 worker 没跑到那一步（容器在排队期间重启、
+ * 队列被清空、already 短路等），这条占位就会永远停在「排队中」—— 用户看到的就是
+ * 「历史里一直排队中 / 卡片卡住」（2026-10-06 反馈）。
+ * 这里在启动时按「当前队列 + 当前在刮」核对一遍：对不上的占位按实际落地情况收尾
+ * （有离线数据 = 成功跳过，没有 = 失败中断），不留下永久假状态。 */
+function reconcileQueuedHist() {
+  try {
+    scrapeHistLoad()
+    if (!SCRAPE_HIST.list.some(x => x && x.state === 'queued')) return
+    const inQ = new Set(AUTO_INGEST.queue.map(c => bare(c)))
+    if (SCRAPE.code) inQ.add(bare(SCRAPE.code))
+    for (const k of Object.keys(AUTO_INGEST.active || {})) inQ.add(bare(k))
+    let fixed = 0
+    for (const r of SCRAPE_HIST.list) {
+      if (!r || r.state !== 'queued') continue
+      if (inQ.has(bare(r.code))) continue          // 真的还在队列里 → 保留
+      let m = null
+      try { m = readMovieCache(r.code) } catch (_) {}
+      if (m && m.scraped) {
+        r.ok = true; r.skipped = true; r.note = '本地已有离线数据，未重复刮削'
+        r.src = String(m.source || '').split(' ')[0] || '本地已有'
+        r.imgSrc = (m.images && (m.images.posterSrc || m.images.fanartSrc)) || ''
+      } else {
+        r.ok = false; r.err = r.err || '排队期间被中断（容器重启或队列清空），未刮成'
+      }
+      delete r.state                            // 收尾后不再是排队态
+      r.dur = 0
+      fixed++
+    }
+    if (fixed) {
+      try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+      console.log('[scrape-hist] 收拾了 ' + fixed + ' 条中断的「排队中」记录')
+    }
+  } catch (_) {}
+}
 const SCRAPE_HIST = { loaded: false, list: [] }
+/* 媒体库「脏了」的自增序号：任何一部刮削入库（成功或失败写完历史）都会 +1。
+ * 前端全站常驻的 aqPoll 本来就每 2s 拉一次 /api/scrape/queue，把这个号捎带回去，
+ * 它就拿到了一个「零额外请求」的信号 —— 号变了就把媒体库补一次，
+ * 于是在首页/影片库/演员页待着也能立刻看到刚入的部（以前只有添加页会补，
+ * 而且靠的是队列 done 计数，手动单跑那一部时计数根本不动 → 库里永远不出现）。 */
+const LIB_SEQ = { n: Date.now() % 1000000 }
+function libSeq() { return LIB_SEQ.n }
+function libSeqTouch() { LIB_SEQ.n = (LIB_SEQ.n + 1) % 100000000 }
 const SCRAPE_HIST_FILE = () => { try { return path.join(cacheDir(), 'scrape-history.json') } catch (_) { return '' } }
+function dedupeHist() {
+  // 一个番号只保留一条记录（取最后出现的，即最新状态），避免历史里反复出现重复番号
+  const map = new Map()
+  for (const x of SCRAPE_HIST.list) { if (x && x.code != null) map.set(bare(x.code), x) }
+  SCRAPE_HIST.list = Array.from(map.values())
+}
 function scrapeHistLoad() {
   if (SCRAPE_HIST.loaded) return
   SCRAPE_HIST.loaded = true
   try { const a = JSON.parse(fs.readFileSync(SCRAPE_HIST_FILE(), 'utf8')); if (Array.isArray(a)) SCRAPE_HIST.list = a } catch (_) {}
+  dedupeHist()   // 读入即去重：旧文件里已有的重复番号立刻合并成一条
+  scrapeHistBackfillImgSrc()
+}
+/* 补 imgSrc：imgSrc 是 2026-10-05 才加进历史记录的字段，之前刮过的成功条目没有它，
+ * 前端就会回退显示「元数据来源」（MIRD285 因此显示 jav321，而它的图其实来自 DMM 图床）。
+ * 这里在读入历史时按番号回查各自 meta.json 的 images.posterSrc/fanartSrc 补齐 —— meta 里
+ * 一直存着真实图源，所以不必重新刮。补完写回文件，只做一次（补过就不再扫）。 */
+function scrapeHistBackfillImgSrc() {
+  let changed = false
+  for (const r of SCRAPE_HIST.list) {
+    if (!r || !r.ok || r.imgSrc) continue
+    try {
+      const m = readMovieCache(r.code)
+      const s = m && m.images && (m.images.posterSrc || m.images.fanartSrc)
+      if (s) { r.imgSrc = s; changed = true }
+    } catch (_) {}
+  }
+  if (changed) { try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {} }
 }
 function scrapeHistAdd(rec) {
   scrapeHistLoad()
-  SCRAPE_HIST.list.push(rec)
-  if (SCRAPE_HIST.list.length > 600) SCRAPE_HIST.list = SCRAPE_HIST.list.slice(-600)
+  const k = bare(rec.code)
+  const idx = SCRAPE_HIST.list.findIndex(x => x && bare(x.code) === k)
+  if (idx >= 0) {
+    /* 迟到的旧结果不许盖掉新结果：看门狗放弃某部之后，后台那次 scrapeAsync 可能还活着，
+     * 它最终完成/报错时写的记录 at（任务开始时间）比现在的新状态更早，
+     * 无条件覆盖会把「用户重试后已成功」打回失败、meta 也可能被旧数据覆盖。 */
+    const old = SCRAPE_HIST.list[idx]
+    if (old && old.state !== 'queued' && rec.state !== 'queued' &&
+        (Number(rec.at) || 0) < (Number(old.at) || 0)) return
+    SCRAPE_HIST.list[idx] = rec   // 同番号已存在 → 直接覆盖（更新最新状态），不再追加
+  } else SCRAPE_HIST.list.push(rec)
+  /* 历史不再设上限：哪怕刮了上千部也全部保留（去重仍按番号，不会重复行）。 */
   try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+  /* 通知前端「媒体库变了，去补一次」。排队占位那次不算 —— 那时候还什么都没入进来，
+   * 只有任务真正有结果（成功/失败/skipped）才值得让前端重拉 data.json。 */
+  if (rec.state !== 'queued') libSeqTouch()
+}
+/* 把一批番号的历史「排队中」占位就地收尾。
+ * 用在「用户把番号从待跑队列里清掉/移掉」的时候：这些占位本来是等 worker 刮完覆盖的，
+ * 可番号已经不在队列里了，永远不会有 worker 来覆盖它 → 历史里会一直挂着「排队中」。
+ * （启动时的 reconcileQueuedHist 能兜底，但那要等下次重启，本次会话内看着就是卡住了。） */
+function histFinishQueued(codes, msg) {
+  try {
+    scrapeHistLoad()
+    const ds = new Set((codes || []).map(c => bare(c)))
+    if (!ds.size) return
+    let fixed = 0
+    for (const r of SCRAPE_HIST.list) {
+      if (!r || r.state !== 'queued' || !ds.has(bare(r.code))) continue
+      r.ok = false; r.err = String(msg || '已从队列移除，未刮成'); delete r.state; r.dur = 0
+      fixed++
+    }
+    if (fixed) {
+      try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+      libSeqTouch()
+      console.log('[scrape-hist] 收尾了 ' + fixed + ' 条被移出队列的「排队中」记录')
+    }
+  } catch (_) {}
 }
 
 /* ---------- 订阅女优「全量作品自动入库」 ----------
@@ -4253,7 +5190,92 @@ async function subsFullRun(sub, { dry = false } = {}) {
   finally { SUB_FULL.running = false }
 }
 
-async function subsFeed(force) {
+/* ---------- 订阅自动检查调度（P1a） ----------
+ * 之前订阅检查完全靠前端「重新检查线上」按钮手动触发，没有服务端定时、也没有进度可视化。
+ * 现在：服务端按 CFG.subCheckInterval（分钟，默认 60）定时跑 subsFeed(true)，并把
+ * 上次/下次检查时间、进度（done/total/current）通过 feed 接口暴露给前端订阅页。 */
+function subCheckEnabled() { return CFG.subCheckEnabled !== false }
+function subCheckIntervalMin() { const m = parseInt(CFG.subCheckInterval, 10); return isNaN(m) ? 60 : Math.max(5, Math.min(1440, m)) }
+const SUB_CHECK = { running: false, lastAt: 0, nextAt: 0, done: 0, total: 0, current: '', startAt: 0 }
+async function subCheckRun() {
+  if (SUB_CHECK.running) return { ok: false, running: true }
+  try { await subsFeed(true, true); return { ok: true, at: SUB_CHECK.lastAt, nextAt: SUB_CHECK.nextAt } }
+  catch (e) { return { ok: false, error: e.message } }
+}
+function subCheckTick() {
+  if (subCheckEnabled() === false) return
+  if (SUB_CHECK.running) return
+  const now = Date.now()
+  if (!SUB_CHECK.nextAt) { SUB_CHECK.nextAt = now + 2 * 60 * 1000; return }  // 启动后首次检查延后 2 分钟，避免重启风暴
+  if (now < SUB_CHECK.nextAt) return
+  subCheckRun().catch(() => {})
+}
+setInterval(subCheckTick, 60 * 1000)
+setTimeout(subCheckTick, 60 * 1000)
+
+/* ---------- 订阅规则过滤（对标 Byte-Muse 的 limit_date + DEFAULT_FILTER）----------
+ * 之前 requireSub / requireUncensored / min-maxSizeMb 这些字段在 add / update 里存了下来，
+ * 却**从没在判定新作时用过** —— 等于死字段，订阅实际表现就是「抓到啥算啥」。
+ * 现在统一在这里接上，并补齐 Byte-Muse 最有价值的一条：limitDate（起始日期门槛），
+ * 让「订阅多产女优时被几百部历史作品淹没」这件事有解。
+ *
+ * 设计：规则没配 = 全放行（向后兼容老订阅），配了才筛。
+ * 能筛什么取决于线上影片对象 onlineMovie 实际给了什么：
+ *   date(发行日) ✓ / sub(中字) ✓ / magnets(磁力数) ✓ / code+title+maker(关键词) ✓
+ *   ✗ 没有体积 —— 所以 min/maxSizeMb 在订阅判定阶段**无法生效**（线上影片不给体积，只有种子才有）。
+ */
+const UNCENSORED_HINT = /^(fc2|heydouga|heyzo|carib|caribbeancom|1pondo|pacopacomama|10musume|kirari|gachinco|tokyo[-_]?hot|muramura|天然むすめ|パコパコ)/i
+function subFilterOk(s, m) {
+  if (!s || !m) return true
+  /* ① 起始日期门槛：只追这一天之后发行的作品（对应 Byte-Muse 的 limit_date）。
+   *    YYYY-MM-DD 字符串比较，字典序 == 日期序。作品没给日期时放行，不误杀。 */
+  const ld = String(s.limitDate || '').trim().slice(0, 10)
+  if (ld && /^\d{4}-\d{2}-\d{2}$/.test(ld)) {
+    const md = String(m.date || '').trim().slice(0, 10)
+    if (md && /^\d{4}-\d{2}-\d{2}$/.test(md) && md < ld) return false
+  }
+  const hay = (String(m.title || '') + ' ' + String(m.code || '') + ' ' + String(m.maker || '')).toLowerCase()
+  /* ② 关键词白名单：逗号分隔，命中其一才留 */
+  const inc = String(s.include || '').trim()
+  if (inc) {
+    const ks = inc.split(/[,，]/).map(x => x.trim().toLowerCase()).filter(Boolean)
+    if (ks.length && !ks.some(k => hay.indexOf(k) >= 0)) return false
+  }
+  /* ③ 关键词黑名单：命中任一就丢 */
+  const exc = String(s.exclude || '').trim()
+  if (exc) {
+    const ks = exc.split(/[,，]/).map(x => x.trim().toLowerCase()).filter(Boolean)
+    if (ks.some(k => hay.indexOf(k) >= 0)) return false
+  }
+  /* ④ 只要中字 */
+  if (s.requireSub === true && !m.sub) return false
+  /* ⑤ 只要无码：线上影片对象没有 uncensored 字段，用番号前缀 / 片商名做启发式判断 */
+  if (s.requireUncensored === true) {
+    if (!UNCENSORED_HINT.test(String(m.code || '')) && !UNCENSORED_HINT.test(String(m.maker || ''))) return false
+  }
+  /* ⑥ 至少要有 N 个磁力（线上只给计数不给链接；0 = 不限）—— 零磁力的大多下不到，提前滤掉省事 */
+  const mm = Number(s.minMagnets || 0)
+  if (mm > 0 && Number(m.magnets || 0) < mm) return false
+  return true
+}
+
+/* ---------- 榜单订阅（kind='rank'）----------
+ * 对标 Byte-Muse 的 RANK_TYPE / RANK_PAGE：它订阅的是 PT 站榜单（种子），我们订阅的是本机
+ * 每天自动更新的**女优排行榜**（rankings.json：日/周/月各 100 人）。
+ * 语义是「一组女优的合订订阅」——取榜前 N 名，逐个去线上搜她的新作；榜单每天变，覆盖的人跟着变。
+ * 数据（rankings.json）和管道（autoIngestQueue 刮削队列）都是现成的，这里只负责把它们接起来。 */
+const RANK_LB = { day: '日榜', week: '周榜', month: '月榜' }
+function rankBoard(key) {
+  try {
+    const d = JSON.parse(fs.readFileSync(RANK_FILE, 'utf8'))
+    const a = Array.isArray(d[key]) ? d[key] : []
+    return a.filter(x => x && x.name).sort((x, y) => (Number(x.rank) || 999) - (Number(y.rank) || 999))
+  } catch (_) { return [] }
+}
+function rankTopN(v) { return Math.max(1, Math.min(30, Number(v) || 10)) }   // 上限 30：每人一次搜索，别把线上配额打爆
+function rankSubName(board, topN) { return (RANK_LB[board] || '日榜') + ' Top' + rankTopN(topN) }
+
+async function subsFeed(force, auto) {
   if (!force && SUB_FEED.data && Date.now() - SUB_FEED.at < SUB_FEED_TTL) return SUB_FEED.data
   const subs = Array.isArray(CFG.subscriptions) ? CFG.subscriptions : []
   const local = new Set()
@@ -4261,9 +5283,24 @@ async function subsFeed(force) {
   for (const it of scrapedVirtualItems()) if (it.code) local.add(bare(it.code))
   const all = [], subOut = []
   let firstErr = ''
+  if (auto) { SUB_CHECK.running = true; SUB_CHECK.total = subs.length; SUB_CHECK.done = 0; SUB_CHECK.current = ''; subDlRoundStart() }   // 新一轮订阅检查：重置本轮 115 推送额度计数
+  /* ⚠ 从这里到 return 的整段必须在 try/finally 里：中途任何异常（旧订阅 name 为空、线上请求抛错、
+   * 写盘失败…）若没把 running 复位，SUB_CHECK.running 会永远停在 true —— subCheckTick 与
+   * subCheckRun 首行都有 running 判断，于是之后所有定时检查和「立即检查」全被挡死，只能重启进程。
+   * 但 data 必须声明在 try 之外：finally 之后还要往它上面挂 subCheck 并 return（写在 try 里会因
+   * 块级作用域变成 ReferenceError: data is not defined —— 2026-10-04 实测踩过）。 */
+  let data = null
+  try {
   for (const s of subs) {
-    const rec = { id: s.id, kind: s.kind, name: s.name, query: s.query || s.name, active: s.active !== false, matched: 0, fresh: 0, onlineId: '', note: '' }
-    if (!rec.active) { subOut.push(rec); continue }
+    if (auto) SUB_CHECK.current = s.name
+    /* 规则字段一并回传，前端才能在订阅明细上把「这条订阅设了什么条件」显示出来 */
+    const rec = { id: s.id, kind: s.kind, name: s.name, query: s.query || s.name, active: s.active !== false, matched: 0, fresh: 0, filtered: 0, onlineId: '', note: '',
+      limitDate: s.limitDate || '', include: s.include || '', exclude: s.exclude || '',
+      requireSub: !!s.requireSub, requireUncensored: !!s.requireUncensored, minMagnets: Number(s.minMagnets) || 0,
+      autoIngest: !!s.autoIngest,   // 明细行的「自动入库」徽章原先取不到这个字段，等于从不显示
+      autoDl: s.autoDl === '1',     // 明细行的「自动下载115」徽章：这条订阅开了自动下载才显示
+      board: s.board || '', topN: s.kind === 'rank' ? rankTopN(s.topN) : 0 }
+    if (!rec.active) { subOut.push(rec); if (auto) SUB_CHECK.done++; continue }
     let movies = []
     try {
       if (s.kind === 'actor') {
@@ -4280,13 +5317,29 @@ async function subsFeed(force) {
         }
         if (!a && !acc.length) rec.note = '线上搜不到这位女优'
         movies = acc.map(onlineMovie)
+      } else if (s.kind === 'rank') {
+        /* 榜单：读本机榜单 → 取前 N 名 → 每人一次搜索（limit=50 一页拿满，比翻 2 页省一半请求）
+         * 记下 _actress，前端才能在列表里显示「这是谁的作品」（榜名只能说明来源）。 */
+        const board = rankBoard(s.board || 'day')
+        const topN = rankTopN(s.topN)
+        const names = board.slice(0, topN).map(x => String(x.name || '').trim()).filter(Boolean)
+        rec.checked = names.length
+        if (!board.length) rec.note = '本机还没有榜单数据（排行榜每天自动更新，也可去「排行榜」页手动刷新）'
+        else if (!names.length) rec.note = '榜单数据异常（没有人名）'
+        const acc = []
+        for (const nm of names) {
+          const j = await onlineGet('v2/search?q=' + encodeURIComponent(nm) + '&type=movie&page=1&limit=50')
+          const mv = (((j || {}).data || {}).movies || []).map(onlineMovie)
+          for (const x of mv) acc.push(Object.assign(x, { _actress: nm }))
+        }
+        movies = acc
       } else {
         const j = await onlineGet('v2/search?q=' + encodeURIComponent(rec.query) + '&type=movie&page=1')
         movies = (((j || {}).data || {}).movies || []).map(onlineMovie)
       }
     } catch (e) {
       rec.note = e.message; firstErr = firstErr || e.message
-      subOut.push(rec); continue
+      subOut.push(rec); if (auto) SUB_CHECK.done++; continue
     }
     rec.matched = movies.length
     const seen = new Set()
@@ -4295,11 +5348,15 @@ async function subsFeed(force) {
       if (!b || seen.has(b)) continue
       seen.add(b)
       if (local.has(b) || m.inLibrary) continue
+      /* 订阅规则过滤：不满足「起始日期 / 关键词 / 中字 / 无码 / 最少磁力」的不算新作、也不进列表。
+       * 注意只作用于日常检查；「⇄ 补全全部作品」是主动补历史，不受 limitDate 限制。 */
+      if (!subFilterOk(s, m)) { rec.filtered++; continue }
       rec.fresh++
-      all.push(Object.assign({}, m, { subId: s.id, subKind: s.kind, subName: s.name }))
+      /* 榜单订阅多带一个女优名：列表里显示「订阅 日榜Top10 · 凪沢ひかる」，否则看不出是谁的作品 */
+      all.push(Object.assign({}, m, { subId: s.id, subKind: s.kind, subName: m._actress ? s.name + ' · ' + m._actress : s.name }))
     }
     s.lastCheckedAt = new Date().toISOString()
-    subOut.push(rec)
+    subOut.push(rec); if (auto) SUB_CHECK.done++
   }
   const uniq = new Map()
   for (const x of all) {
@@ -4309,20 +5366,47 @@ async function subsFeed(force) {
   }
   const items = [...uniq.values()].sort((a, b) => String(b.date).localeCompare(String(a.date)))
   /* 自动入库：开了开关的订阅 → 把这批新作的番号排进后台刮削队列（默认一条都不会自动入） */
-  const autoCodes = []
+  /* 自动入库 / 自动下载（115）：开了其中任一个开关的订阅，把它的新作番号排进后台刮削队列。
+   * 自动入库 = 刮完把元数据落进本地库；自动下载 = 刮完拿到磁力再推 115（需全局总开关 + 这条订阅开 autoDl）。
+   * 两个都靠「先刮削」：不刮就拿不到磁力，所以开了 autoDl 也得进队列刮一遍（元数据顺带落库，符合「下载到自己库」的预期）。
+   * 来源订阅 id 一并带进队列（q.sub[code]=subId），刮完后据此判断要不要推 115。 */
   for (const s of subs) {
-    if (s.autoIngest !== true || s.active === false) continue
-    for (const x of items) if (x.subId === s.id && x.code) autoCodes.push(x.code)
+    if (s.active === false) continue
+    if (s.autoIngest !== true && s.autoDl !== '1') continue
+    const codes = items.filter(x => x.subId === s.id && x.code).map(x => x.code)
+    if (codes.length) autoIngestQueue(codes, '订阅', false, s.id)
   }
-  if (autoCodes.length) autoIngestQueue(autoCodes)
   const oc = onlineCfg()
-  const data = {
+  data = {
     ok: true, at: Date.now(), items, subs: subOut, error: firstErr,
-    online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK },
+    online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK,
+      reachable: JDB_PROBE.at ? JDB_PROBE.reachable : !!JDB_LINE_OK,
+      probe: JDB_PROBE.probe || [], at: JDB_PROBE.at || 0 },
     stats: { subs: subs.length, active: subs.filter(x => x.active !== false).length, fresh: items.length, local: local.size },
     autoIngest: { running: AUTO_INGEST.running, pending: AUTO_INGEST.queue.length, done: AUTO_INGEST.done, total: AUTO_INGEST.total, current: AUTO_INGEST.current, ok: AUTO_INGEST.ok, fail: AUTO_INGEST.fail },
+    /* 订阅自动下载（115）实时状态：开关是否生效、单次检查额度、本轮已推/成功/失败/超额度跳过、最近 30 条明细。
+     * 前端订阅页调度面板读这个展示「本轮推了多少、有没有超额度」。 */
+    subAutoDl: { on: subDlOn(), max: subDlMax(), round: SUB_DL.round, pushed: Object.keys(SUB_DL.pushed).length,
+      filter: { excludeUhd: CFG.subDlExcludeUhd !== '', onlyUhd: CFG.subDlOnlyUhd === '1', onlyChinese: CFG.subDlOnlyChinese === '1', onlyUc: CFG.subDlOnlyUc === '1', excludeUc: CFG.subDlExcludeUc === '1', includeKw: CFG.subDlIncludeKw || '', excludeKw: CFG.subDlExcludeKw || '', minSize: CFG.subDlMinSize || '', maxSize: CFG.subDlMaxSize || '' } },
     subFull: Object.assign({ on: subsFullOn() }, SUB_FULL)
   }
+  /* P1a：自动检查结束 → 先落定 SUB_CHECK 终态（lastAt/nextAt/running），再快照进 feed，
+   * 否则缓存的 feed 会停留在「running=true、lastAt/nextAt=0」的中间态，前端永远显示「检查中」。 */
+  } finally {
+    /* 无论上面是正常跑完还是抛异常，都要落定终态并复位 running（异常时也要把 nextAt 推后，
+     * 否则异常会被定时器一分钟内反复触发）。 */
+    try {
+      if (auto) {
+        SUB_CHECK.lastAt = Date.now()
+        SUB_CHECK.nextAt = Date.now() + subCheckIntervalMin() * 60000
+        SUB_CHECK.running = false
+        SUB_CHECK.current = ''
+      }
+    } catch (_) {}
+  }
+  data.subCheck = { enabled: subCheckEnabled(), intervalMin: subCheckIntervalMin(), running: SUB_CHECK.running, lastAt: SUB_CHECK.lastAt, nextAt: SUB_CHECK.nextAt, done: SUB_CHECK.done, total: SUB_CHECK.total, current: SUB_CHECK.current,
+    subAutoDl: CFG.subAutoDl === '1', subAutoDlMax: subDlMax(),
+    subAutoDlFilter: { excludeUhd: CFG.subDlExcludeUhd !== '', onlyUhd: CFG.subDlOnlyUhd === '1', onlyChinese: CFG.subDlOnlyChinese === '1', onlyUc: CFG.subDlOnlyUc === '1', excludeUc: CFG.subDlExcludeUc === '1', includeKw: CFG.subDlIncludeKw || '', excludeKw: CFG.subDlExcludeKw || '', minSize: CFG.subDlMinSize || '', maxSize: CFG.subDlMaxSize || '' } }   // 全局总开关 + 单次额度上限 + 质量过滤：调度面板读这个
   SUB_FEED = { at: Date.now(), data }
   try { writeCfg() } catch (_) {}
   return data
@@ -4342,6 +5426,12 @@ async function handleActorApi(req, res, p) {
       autoAvatarRunning: AVA_BACKFILL_RUNNING, autoAvatarStats: AVA_BACKFILL_STATS,
       /* 默认开：设置里「媒体库每日自动重扫」开关默认开启，只有显式 false 才算关 */
       autoRescan: CFG.autoRescan !== false, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
+      subCheckEnabled: CFG.subCheckEnabled !== false, subCheckInterval: subCheckIntervalMin(), subCheckRunning: SUB_CHECK.running, subCheckLast: SUB_CHECK.lastAt, subCheckNext: SUB_CHECK.nextAt,
+      subAutoDl: CFG.subAutoDl === '1', subAutoDlMax: subDlMax(),
+      subDlExcludeUhd: CFG.subDlExcludeUhd !== '', subDlOnlyUhd: CFG.subDlOnlyUhd === '1',
+      subDlOnlyChinese: CFG.subDlOnlyChinese === '1', subDlOnlyUc: CFG.subDlOnlyUc === '1', subDlExcludeUc: CFG.subDlExcludeUc === '1',
+      subDlIncludeKw: CFG.subDlIncludeKw || '', subDlExcludeKw: CFG.subDlExcludeKw || '',
+      subDlMinSize: CFG.subDlMinSize || '', subDlMaxSize: CFG.subDlMaxSize || '',
       accessOn: !!ACCESS_CODE(),
       mounts: containerMounts(), mediaRoot: MEDIA_ROOT
     })
@@ -4356,6 +5446,20 @@ async function handleActorApi(req, res, p) {
     if ('autoRescanHour' in body) CFG.autoRescanHour = Math.max(0, Math.min(23, parseInt(body.autoRescanHour, 10) || 0))
     if ('rankAuto' in body) CFG.rankAuto = !!body.rankAuto
     if ('rankHour' in body) CFG.rankHour = Math.max(0, Math.min(23, parseInt(body.rankHour, 10) || 0))
+    if ('subCheckEnabled' in body) CFG.subCheckEnabled = !!body.subCheckEnabled
+    if ('subCheckInterval' in body) CFG.subCheckInterval = Math.max(5, Math.min(1440, parseInt(body.subCheckInterval, 10) || 60))
+    if ('subAutoDl' in body) CFG.subAutoDl = body.subAutoDl ? '1' : ''   // 全局总开关：默认关（字符串 '1' 表示开）。关着时所有订阅的自动下载都不生效
+    if ('subAutoDlMax' in body) CFG.subAutoDlMax = Math.max(1, Math.min(200, parseInt(body.subAutoDlMax, 10) || 20))   // 单次订阅检查最多推多少部（防灌爆 115 离线配额）
+    /* 订阅自动下载（115）的质量过滤：对标 Byte-Muse DEFAULT_FILTER，作用在「同一步片子的多条磁力」上 */
+    if ('subDlExcludeUhd' in body) CFG.subDlExcludeUhd = body.subDlExcludeUhd ? '1' : ''   // 排除 4K/UHD（默认开，和 Byte-Muse exclude_uhd:true 一致）
+    if ('subDlOnlyUhd' in body) CFG.subDlOnlyUhd = body.subDlOnlyUhd ? '1' : ''
+    if ('subDlOnlyChinese' in body) CFG.subDlOnlyChinese = body.subDlOnlyChinese ? '1' : ''
+    if ('subDlOnlyUc' in body) CFG.subDlOnlyUc = body.subDlOnlyUc ? '1' : ''
+    if ('subDlExcludeUc' in body) CFG.subDlExcludeUc = body.subDlExcludeUc ? '1' : ''
+    if ('subDlIncludeKw' in body) CFG.subDlIncludeKw = String(body.subDlIncludeKw || '').slice(0, 200)
+    if ('subDlExcludeKw' in body) CFG.subDlExcludeKw = String(body.subDlExcludeKw || '').slice(0, 200)
+    if ('subDlMinSize' in body) CFG.subDlMinSize = String(body.subDlMinSize || '').trim()
+    if ('subDlMaxSize' in body) CFG.subDlMaxSize = String(body.subDlMaxSize || '').trim()
     if ('proxy' in body) {
       const pv = String(body.proxy || '').trim()
       if (pv && !/^https?:\/\/[\w.-]+(:\d+)?\/?$/.test(pv)) return json(res, { ok: false, error: '代理格式应为 http://host:port，留空表示直连' })
@@ -4393,7 +5497,13 @@ async function handleActorApi(req, res, p) {
       autoScrapeNew: CFG.autoScrapeNew !== false,
       autoRescan: CFG.autoRescan !== false, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
       rankAuto: CFG.rankAuto !== false, rankHour: rankHour(),
-      rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running
+      rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running,
+      subCheckEnabled: CFG.subCheckEnabled !== false, subCheckInterval: subCheckIntervalMin(), subCheckRunning: SUB_CHECK.running, subCheckLast: SUB_CHECK.lastAt, subCheckNext: SUB_CHECK.nextAt,
+      subAutoDl: CFG.subAutoDl === '1', subAutoDlMax: subDlMax(),
+      subDlExcludeUhd: CFG.subDlExcludeUhd !== '', subDlOnlyUhd: CFG.subDlOnlyUhd === '1',
+      subDlOnlyChinese: CFG.subDlOnlyChinese === '1', subDlOnlyUc: CFG.subDlOnlyUc === '1', subDlExcludeUc: CFG.subDlExcludeUc === '1',
+      subDlIncludeKw: CFG.subDlIncludeKw || '', subDlExcludeKw: CFG.subDlExcludeKw || '',
+      subDlMinSize: CFG.subDlMinSize || '', subDlMaxSize: CFG.subDlMaxSize || ''
     })
   }
   /* ---------- UI 偏好（项目内置配置）：存 server-config.json 的 uiPrefs ----------
@@ -4529,16 +5639,28 @@ async function handleActorApi(req, res, p) {
         })
       } catch (_) {}
       return json(res, {
-        ok: true, subs: subsOut, online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK },
-        full: Object.assign({ on: subsFullOn() }, SUB_FULL)      // 全量入库开关 + 当前进度（前端订阅页展示）
+        /* online 必须带 reachable / probe：订阅页页头那个「JavDB 通不通」的小方块只读这里，
+         * 少了这两个字段它会永远显示「不通」。探测不在这里发（太慢），读 JDB_PROBE 缓存；
+         * 一次都没探过时退化为「JDB_LINE_OK 非空 = 至少有一条线路成功过」。 */
+        ok: true, subs: subsOut,
+        online: { enabled: oc.enabled, lines: oc.lines, active: JDB_LINE_OK,
+          reachable: JDB_PROBE.at ? JDB_PROBE.reachable : !!JDB_LINE_OK,
+          probe: JDB_PROBE.probe || [], at: JDB_PROBE.at || 0, error: JDB_PROBE.error || '' },
+        full: Object.assign({ on: subsFullOn() }, SUB_FULL),     // 全量入库开关 + 当前进度（前端订阅页展示）
+        blacklist: Array.isArray(CFG.subBlacklist) ? CFG.subBlacklist : []   // P1b：取消订阅后自动进这里，避免被重新订阅
       })
     }
     const action = String(body.action || '')
     const list = subs().slice()
     if (action === 'add') {
       /* maker = 片商：没有专属作品端点，和 series 一样走 v2/search 关键词匹配 */
-      const kind = ['actor', 'series', 'maker', 'code'].includes(body.kind) ? body.kind : 'actor'
+      const kind = ['actor', 'series', 'maker', 'code', 'rank'].includes(body.kind) ? body.kind : 'actor'
+      /* 榜单订阅：对象不是「名字」而是「哪个榜 + 前几名」，名字自动生成（如「日榜 Top10」）。
+       * 用户仍可自己填名字覆盖（比如「想追的周榜前五」）。 */
+      const board = kind === 'rank' ? (['day', 'week', 'month'].includes(body.board) ? body.board : 'day') : ''
+      const topN = kind === 'rank' ? rankTopN(body.topN) : 0
       let name = String(body.name || '').trim()
+      if (kind === 'rank' && !name) name = rankSubName(board, topN)
       const query = String(body.query || name).trim()
       if (!name) return json(res, { ok: false, error: '请填写订阅对象' })
       /* 女优订阅锁人三级跳（onlineActorSmartResolve）：
@@ -4552,13 +5674,30 @@ async function handleActorApi(req, res, p) {
         if (hit) { actorId = hit.code; name = hit.actor.name; viaCode = true }
       }
       if (list.some(x => (actorId && x.actorId === actorId) || (x.kind === kind && String(x.name) === name))) return json(res, { ok: true, subs: list, dup: true })
+      /* P1b：被「取消订阅」时会进黑名单，避免重复订阅同一条（例如未来支持父订阅/分享码导入后，删了又回来） */
+      const bl0 = Array.isArray(CFG.subBlacklist) ? CFG.subBlacklist : []
+      const bk1 = actorId ? 'actor:' + actorId : null
+      /* 榜单用「rank:{榜}」做 key 而不是名字：名字里带 TopN，改了人数就会被当成另一条订阅 */
+      const bk2 = kind === 'rank' ? 'rank:' + board : kind + ':' + name.trim().toLowerCase()
+      if (bl0.some(b => (bk1 && b.key === bk1) || b.key === bk2)) {
+        return json(res, { ok: false, blacklisted: true, error: '这条在「不再订阅」名单里，无法重复添加（去「我的订阅」底部移出名单即可）' })
+      }
       const rec = {
         id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         kind, name, query: viaCode ? name : query, actorId,
+        board: kind === 'rank' ? board : '', topN,
         videosCount: viaCode ? (Number(((hit || {}).actor || {}).videos_count) || 0) : 0,
         quality: String(body.quality || ''), requireSub: !!body.requireSub, requireUncensored: !!body.requireUncensored,
         minSizeMb: Number(body.minSizeMb) || 0, maxSizeMb: Number(body.maxSizeMb) || 0,
+        /* 订阅规则（对标 Byte-Muse 的 limit_date + DEFAULT_FILTER）：
+         *   limitDate 只追该日期之后发行的；include/exclude 关键词（逗号分隔）；minMagnets 最少磁力数。
+         *   注：requireSub / requireUncensored 是早就有的字段，这次才真正接上过滤（见 subFilterOk）。 */
+        limitDate: String(body.limitDate || '').trim().slice(0, 10),
+        include: String(body.include || '').trim().slice(0, 200),
+        exclude: String(body.exclude || '').trim().slice(0, 200),
+        minMagnets: Number(body.minMagnets) || 0,
         autoIngest: !!body.autoIngest,      // 自动入库：默认关。开了才会把该订阅的线上新作自动刮进离线数据
+        autoDl: body.autoDl ? '1' : '',     // 订阅自动下载到 115：默认关。开了且该订阅下确有新作刮完，会把最佳磁力推到 115 离线下载（还需全局总开关）
         note: String(body.note || '').slice(0, 300),
         active: true, createdAt: new Date().toISOString(), lastCheckedAt: ''
       }
@@ -4570,9 +5709,35 @@ async function handleActorApi(req, res, p) {
     }
     if (action === 'remove') {
       const id = String(body.id || '')
+      const target = list.find(x => x.id === id)
+      if (!target) return json(res, { ok: true, subs: CFG.subscriptions })
+      /* P1b：取消订阅同时进黑名单，避免被（未来的）父订阅 / 导入重新拉回来 */
+      const bl = Array.isArray(CFG.subBlacklist) ? CFG.subBlacklist.slice() : []
+      const bk = (target.kind === 'actor' && target.actorId) ? 'actor:' + target.actorId
+        : (target.kind === 'rank' && target.board) ? 'rank:' + target.board
+          : target.kind + ':' + String(target.name || '').trim().toLowerCase()
+      if (!bl.some(b => b.key === bk)) bl.push({ key: bk, kind: target.kind, name: target.name, actorId: target.actorId || '', at: new Date().toISOString() })
+      CFG.subBlacklist = bl
       CFG.subscriptions = list.filter(x => x.id !== id)
       writeCfg(); SUB_FEED = { at: 0, data: null }
-      return json(res, { ok: true, subs: CFG.subscriptions })
+      return json(res, { ok: true, subs: CFG.subscriptions, blacklisted: target.name })
+    }
+    /* P1b：黑名单管理 */
+    if (action === 'blacklist-remove') {
+      const key = String(body.key || '')
+      CFG.subBlacklist = (Array.isArray(CFG.subBlacklist) ? CFG.subBlacklist : []).filter(b => b.key !== key)
+      writeCfg()
+      return json(res, { ok: true, blacklist: CFG.subBlacklist })
+    }
+    if (action === 'blacklist-clear') {
+      CFG.subBlacklist = []
+      writeCfg()
+      return json(res, { ok: true, blacklist: [] })
+    }
+    /* P1a：立即触发一次订阅检查（计入自动调度，会重置下次检查时间） */
+    if (action === 'check-now') {
+      const r = await subCheckRun()
+      return json(res, r)
     }
     if (action === 'toggle') {
       const id = String(body.id || '')
@@ -4583,7 +5748,17 @@ async function handleActorApi(req, res, p) {
     if (action === 'update') {
       const id = String(body.id || '')
       const patch = {}
-      if (body.kind !== undefined && ['actor', 'series', 'maker', 'code'].includes(body.kind)) patch.kind = body.kind
+      if (body.kind !== undefined && ['actor', 'series', 'maker', 'code', 'rank'].includes(body.kind)) patch.kind = body.kind
+      /* 榜单订阅改「哪个榜 / 前几名」：没同时给新名字 → 名字跟着重新生成（如 日榜 Top10 → 周榜 Top5） */
+      const curRec = list.find(x => x.id === id) || {}
+      if ((patch.kind || curRec.kind) === 'rank') {
+        if (body.board !== undefined && ['day', 'week', 'month'].includes(body.board)) patch.board = body.board
+        if (body.topN !== undefined) patch.topN = rankTopN(body.topN)
+        if ((patch.board || patch.topN) && body.name === undefined) {
+          patch.name = rankSubName(patch.board || curRec.board || 'day', patch.topN || curRec.topN || 10)
+          patch.query = patch.name
+        }
+      }
       ;['name', 'query', 'quality', 'note'].forEach(k => { if (body[k] !== undefined) patch[k] = String(body[k]) })
       /* 编辑女优订阅时把名字换成 JavDB 代号/链接（或库内已回填过代号的名字）→ 按 id 锁人。
        * ⚠ 名字改成非代号时必须**清空** actorId —— 残留旧代号会让全量抓取按旧人锁定，
@@ -4601,7 +5776,12 @@ async function handleActorApi(req, res, p) {
         }
       }
       ;['requireSub', 'requireUncensored', 'autoIngest'].forEach(k => { if (body[k] !== undefined) patch[k] = !!body[k] })
+      if (body.autoDl !== undefined) patch.autoDl = body.autoDl ? '1' : ''   // 订阅自动下载到 115 的开关（字符串 '1' / 空）
       ;['minSizeMb', 'maxSizeMb'].forEach(k => { if (body[k] !== undefined) patch[k] = Number(body[k]) || 0 })
+      /* 订阅规则（起始日期 / 关键词 / 最少磁力）—— 全部留空即恢复「全放行」 */
+      ;['include', 'exclude'].forEach(k => { if (body[k] !== undefined) patch[k] = String(body[k]).trim().slice(0, 200) })
+      if (body.limitDate !== undefined) patch.limitDate = String(body.limitDate).trim().slice(0, 10)
+      if (body.minMagnets !== undefined) patch.minMagnets = Number(body.minMagnets) || 0
       CFG.subscriptions = list.map(x => x.id === id ? Object.assign({}, x, patch) : x)
       writeCfg(); SUB_FEED = { at: 0, data: null }
       return json(res, { ok: true, subs: CFG.subscriptions })
@@ -4645,6 +5825,84 @@ async function handleActorApi(req, res, p) {
     }
     return json(res, { ok: false, error: '未知操作：' + act })
   }
+  /* ---------- 女优「有码 / 无码」判定（JavDB 作品番号，2026-10-07） ----------
+   * 背景：minnano 名册的 type 字段不可靠 —— 24959 位里只有 5 位标 uncensored，
+   * 而那 5 位在 minnano 上又都是普通 actress 页（疑似分类标错）。演员页要按
+   * 「有码/无码」分 tab，靠名册字段只会分出个几乎空的页。
+   * 判据：JavDB 上这位女优的作品里有没有 **n 前缀的无码番号**（n1011/n1448…）。
+   * 纯有码演员（葵司/白石茉莉奈…）各页都是 0，混合演员（桜井怜奈）能扫出 n 番号。
+   * 只判「影片库里出现过的女优」——全量 2.5 万人打 JavDB 成本太高，不值当。
+   * 结果落 cache/jdb-uncensored.json：{ 名字: {uc:bool, actor:id, n:番号样本[], at} }。 */
+  const JDB_UC_FILE = () => path.join(cacheDir(), 'jdb-uncensored.json')
+  const JDB_UC_RE = /^n\d+$/i
+  let JDB_UC = null, JDB_UC_RUN = { on: false, stop: false, done: 0, total: 0, phase: '' }
+  function jdbUcMap() {
+    if (JDB_UC) return JDB_UC
+    try { JDB_UC = JSON.parse(fs.readFileSync(JDB_UC_FILE(), 'utf8')) || {} } catch (_) { JDB_UC = {} }
+    return JDB_UC
+  }
+  function jdbUcSave() { try { fs.writeFileSync(JDB_UC_FILE(), JSON.stringify(JDB_UC || {})) } catch (_) {} }
+  /* 判一位女优是否拍过无码：搜她名字 → 作品列表里找 n 番号（翻 3 页，够了；
+   * 476 部的葵司实测三页全 0，混合演员第一页就能扫出来）。 */
+  async function jdbUncensoredOf(name) {
+    const n = onNorm(name)
+    if (!n) return null
+    const hits = []
+    for (let page = 1; page <= 3; page++) {
+      const j = await onlineGetPaced('v2/search?q=' + encodeURIComponent(name) + '&type=movie&page=' + page + '&limit=50').catch(() => null)
+      const list = ((j || {}).data || {}).movies || []
+      if (!list.length) break
+      for (const m of list) {
+        const num = String(m.number || m.code || '')
+        if (JDB_UC_RE.test(num) && hits.indexOf(num) < 0) hits.push(num)
+      }
+      if (hits.length >= 12) break              // 够判定了，不用继续翻
+    }
+    return hits
+  }
+  async function jdbUcBackfill() {
+    if (JDB_UC_RUN.on) return
+    const targets = jdbCodeTargets().filter(jdbNamePlausible)
+    const M = jdbUcMap()
+    JDB_UC_RUN = { on: true, stop: false, done: 0, total: targets.length, phase: '查 JavDB 作品番号' }
+    RATE.on = true
+    try {
+      for (const name of targets) {
+        if (JDB_UC_RUN.stop) { JDB_UC_RUN.phase = '已停止'; break }
+        JDB_UC_RUN.phase = '查 ' + name
+        try {
+          const hits = await jdbUncensoredOf(name)
+          if (hits) M[name] = { uc: hits.length > 0, n: hits.slice(0, 8), at: Date.now() }
+        } catch (e) {}
+        jdbUcSave()
+        JDB_UC_RUN.done++
+      }
+    } finally { RATE.on = false; JDB_UC_RUN.on = false; JDB_UC_RUN.phase = JDB_UC_RUN.phase === '已停止' ? '已停止' : '完成' }
+  }
+  if (p === '/api/jdbcuncensored') {
+    if (req.method === 'GET') {
+      const M = jdbUcMap()
+      const known = Object.keys(M).length
+      const uc = Object.keys(M).filter(k => M[k] && M[k].uc).length
+      return json(res, { ok: true, map: M, status: { ...JDB_UC_RUN, known, uncensored: uc } })
+    }
+    const act = String(body.action || '')
+    if (act === 'start') { jdbUcBackfill().catch(() => {}); return json(res, { ok: true, started: true }) }
+    if (act === 'stop') { JDB_UC_RUN.stop = true; RATE.on = false; return json(res, { ok: true }) }
+    if (act === 'clear') { JDB_UC = {}; jdbUcSave(); return json(res, { ok: true }) }
+    if (act === 'one') {
+      const name = String(body.name || '').trim()
+      if (!name) return json(res, { ok: false, error: '缺少 name' })
+      try {
+        const hits = await jdbUncensoredOf(name)
+        const M = jdbUcMap()
+        M[name] = { uc: !!(hits && hits.length), n: (hits || []).slice(0, 8), at: Date.now() }
+        jdbUcSave()
+        return json(res, { ok: true, ...M[name] })
+      } catch (e) { return json(res, { ok: false, error: e.message }) }
+    }
+    return json(res, { ok: false, error: '未知操作：' + act })
+  }
   /* 订阅 → 线上新作（线上有、本机没有的） */
   if (p === '/api/subscriptions/feed') {
     const force = new URL(req.url, 'http://x').searchParams.get('refresh') === '1'
@@ -4652,12 +5910,11 @@ async function handleActorApi(req, res, p) {
     catch (e) { return json(res, { ok: false, error: e.message, items: [], subs: [], stats: { subs: 0, active: 0, fresh: 0, local: 0 } }) }
   }
   /* ---------- 线上数据源（JavDB 国内直连）只读代理 ---------- */
-  if (p === '/api/online/status') {
-    const c = onlineCfg()
-    const out = { ok: true, enabled: c.enabled, lines: c.lines, img: c.img, active: JDB_LINE_OK }
-    if (!c.enabled) return json(res, out)
-    out.probe = []
-    for (const base of c.lines) {
+  /* 逐条线路探一次「最新入库」，成功即记 JDB_LINE_OK（后续请求优先复用）。
+   * 结果缓存进 JDB_PROBE：订阅页的 GET /api/subscriptions 不发探测（慢），直接读这份缓存回答「通不通」。 */
+  async function jdbProbeLines(lines) {
+    const probe = []
+    for (const base of (lines || [])) {
       const t0 = Date.now()
       try {
         const r = await fetch(base + '/api/v1/movies/latest?filter_by=magnets&limit=1&page=1&sort_by=update&type=all', {
@@ -4665,13 +5922,24 @@ async function handleActorApi(req, res, p) {
           headers: { jdsignature: jdbSign(), 'User-Agent': 'Dart/3.5 (dart:io)', 'Accept-Language': 'zh-TW', Accept: 'application/json' }
         })
         const j = await r.json().catch(() => null)
-        out.probe.push({ base, ok: r.ok && !!(j && j.success), status: r.status, ms: Date.now() - t0 })
+        probe.push({ base, ok: r.ok && !!(j && j.success), status: r.status, ms: Date.now() - t0 })
         if (r.ok && j && j.success) JDB_LINE_OK = base
-      } catch (e) { out.probe.push({ base, ok: false, error: e.message, ms: Date.now() - t0 }) }
+      } catch (e) { probe.push({ base, ok: false, error: e.message, ms: Date.now() - t0 }) }
     }
-    out.reachable = out.probe.some(x => x.ok)
+    const reachable = probe.some(x => x.ok)
+    const error = reachable ? '' : ((probe[0] && (probe[0].error || ('HTTP ' + probe[0].status))) || '线路均不可用')
+    JDB_PROBE = { at: Date.now(), probe: probe.slice(), reachable, error }
+    return JDB_PROBE
+  }
+  if (p === '/api/online/status') {
+    const c = onlineCfg()
+    const out = { ok: true, enabled: c.enabled, lines: c.lines, img: c.img, active: JDB_LINE_OK }
+    if (!c.enabled) return json(res, out)
+    const pr = await jdbProbeLines(c.lines)
+    out.probe = pr.probe
+    out.reachable = pr.reachable
+    out.error = pr.error
     if (out.reachable) { try { out.stats = (((await onlineGet('v1/movies/latest?filter_by=magnets&limit=24&page=1&sort_by=update&type=all')) || {}).data || {}).pagination || null } catch (_) {} }
-    out.error = out.reachable ? '' : ((out.probe[0] && (out.probe[0].error || ('HTTP ' + out.probe[0].status))) || '线路均不可用')
     return json(res, out)
   }
   /* 前端用的路径词汇 → JavDB 端点：
@@ -4767,6 +6035,22 @@ async function handleActorApi(req, res, p) {
     delete o.base; delete o.key                      // 旧版 db_online 配置残留，清掉
     CFG.online = o; writeCfg(); SUB_FEED = { at: 0, data: null }
     return json(res, view(onlineCfg()))
+  }
+  if (p === '/api/online/playlines') {
+    if (req.method === 'GET') return json(res, { ok: true, lines: playLinesCfg() })
+    const arr = Array.isArray(body && body.lines) ? body.lines : []
+    const out = []
+    for (const x of arr) {
+      const n = String(x.n || '').trim(), u = String(x.u || '').trim(), act = String(x.act || '').trim()
+      if (!n && !u && !act) continue
+      if (u) {
+        if (!/^https?:\/\//i.test(u)) return json(res, { ok: false, error: 'URL 必须以 http(s):// 开头：' + u })
+        if (!/\{CODE\}|\{LCODE\}|\{code\}|\{lcode\}/.test(u)) return json(res, { ok: false, error: 'URL 必须含 {CODE} 占位符（或用 act 走应用内播放）：' + u })
+      }
+      out.push({ n, u, d: String(x.d || '').trim(), act, on: x.on !== false })
+    }
+    CFG.playlines = out; writeCfg()
+    return json(res, { ok: true, lines: out })
   }
   /* ---------- JavDB 线上搜索（独立搜索模块用）：v2/search 逐页代理 ----------
    * 完整对齐 JavDB app 搜索参数：movie_type（all/0有码/1无码/2欧美/3FC2/4动漫）、
@@ -5024,18 +6308,22 @@ async function handleActorApi(req, res, p) {
     return { uid: u, sign: sha1hex(u + sha1hex(userkey + sha1hex('115' + time))) }
   }
   async function pan115GetId() {
+    const cfg = pan115Cfg()
+    const ukOf = j => j && (j.userkey || (j.data && j.data.userkey) || (j.info && j.info.userkey) || (j.result && j.result.userkey)) || ''
+    const uidOf = j => { const u = j && (j.user_id || (j.data && j.data.user_id) || (j.info && j.info.user_id)); if (u) return String(u); return (cfg.cookie.match(/UID=(\d+)/i) || [])[1] || '' }
+    const dcOf = j => String((j && (j.dest_cid || (j.data && j.data.dest_cid))) || '')
     const r = await pan115Request('https://115.com/web/lixian/?ct=lixian&ac=get_id')
     const j = r.json
-    if (!j || !j.userkey) {
+    const uk = ukOf(j)
+    if (!uk) {
       /* 115 改版（2026-09 实测）：get_id 现在只返回 {cid, dest_cid}，不再下发 userkey ——
        * 而实测 add_task_url 不带 sign 也能成功提交（cookie 对就行），所以缺 userkey 不再算失败，
        * 只有请求本身出错（非 200 / JSON 解析失败）才报 cookie 问题 */
-      const uid = (pan115Cfg().cookie.match(/UID=(\d+)/i) || [])[1] || ''
-      if (r.status === 200 && j) return { userkey: '', uid, destCid: String(j.dest_cid || '') }
-      const reason = (j && (j.error || j.errorMsg)) || (r.status !== 200 ? 'HTTP ' + r.status : '返回里没有 userkey')
+      if (r.status === 200 && j) return { userkey: '', uid: uidOf(j), destCid: dcOf(j) }
+      const reason = (j && (j.error || j.errorMsg || j.error_msg)) || (r.status !== 200 ? 'HTTP ' + r.status : '返回里没有 userkey')
       throw new Error('验证 115 失败（' + reason + '）—— 大概率 cookie 失效，去 115 网页版重新复制')
     }
-    return { userkey: String(j.userkey), uid: String(j.user_id != null ? j.user_id : ((pan115Cfg().cookie.match(/UID=(\d+)/i) || [])[1] || '')), destCid: String(j.dest_cid || '') }
+    return { userkey: String(uk), uid: uidOf(j), destCid: dcOf(j) }
   }
   async function pan115AddOne(magnet) {
     /* 目标目录用 wp_path_id（目录 cid，与网页版行为一致：落在所选目录 + 按任务建子文件夹）。
@@ -5052,18 +6340,11 @@ async function handleActorApi(req, res, p) {
     if (id && id.userkey) form.sign = pan115Sign(id.userkey, time, uid).sign
     const r = await pan115Request('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', { method: 'POST', form })
     const j = r.json
-    if (j && j.state === true) return { ok: true, name: (j.info && (j.info.name || j.info.url)) || '' }
+    const okState = j && (j.state === true || j.state === 1 || j.errno === 0 || (j.info && j.info.name))
+    if (okState) return { ok: true, name: (j.info && (j.info.name || j.info.url)) || '' }
     const msg = (j && (j.error || j.errorMsg || j.error_msg)) || r.text || ('HTTP ' + r.status)
-    // 签名相关失败自动降级：不带 sign 再试一次（部分端点仍接受无签名提交）
-    if (/sign|签名|验证/i.test(String(msg))) {
-      const form2 = { url: magnet, time: String(time) }
-      if (cid) form2.wp_path_id = cid
-      if (uid) form2.uid = uid
-      const r2 = await pan115Request('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', { method: 'POST', form: form2 })
-      const j2 = r2.json
-      if (j2 && j2.state === true) return { ok: true, name: (j2.info && (j2.info.name || j2.info.url)) || '' }
-      return { ok: false, error: String((j2 && (j2.error || j2.errorMsg)) || r2.text || '签名提交失败').slice(0, 200) }
-    }
+    /* 记录原始响应，便于定位签名/字段变化（115 接口常改） */
+    console.log('[115-push] 提交失败 raw=' + (r.text || '').slice(0, 300) + ' | status=' + r.status)
     return { ok: false, error: String(msg).slice(0, 200) }
   }
   if (p === '/api/115/config') {
@@ -5768,6 +7049,19 @@ async function handleActorApi(req, res, p) {
   }
   /* ---------- 在线刮削（添加本地库没有的影片） ---------- */
   if (p === '/api/scrape/start') {
+    /* 批量：一次把整批番号全部塞进服务端持久队列（ingest-queue.json 落盘）。
+     * 这样「关掉软件 / 重启 docker」后队列还在、自动续跑，不会丢未提交的任务。 */
+    if (Array.isArray(body.codes) && body.codes.length) {
+      const via = String(body.via || '手动')
+      const seen = new Set(), resolved = []
+      for (const raw of body.codes) {
+        const c = parseName(String(raw || '').trim().toUpperCase() + '.mp4').code
+        if (c && !seen.has(c)) { seen.add(c); resolved.push(c) }
+      }
+      if (!resolved.length) return json(res, { ok: false, error: '没有可识别的番号' })
+      autoIngestQueue(resolved, via, false)
+      return json(res, { ok: true, queued: true, count: resolved.length, pending: AUTO_INGEST.queue.length })
+    }
     const wantQueue = body.queue === true || body.queue === 'front'
     let code = String(body.code || '').trim().toUpperCase()
     const fromUrl = scCodeFromUrl(body.code) || scCodeFromUrl(body.url)   // 直接粘详情页网址也认
@@ -5784,21 +7078,83 @@ async function handleActorApi(req, res, p) {
     code = code ? parseName(code + '.mp4').code : ''
     /* 日期式无码番号（082926-001 / 100323_01）是纯数字，不能按「必须含字母」拒掉 */
     if (!code || !(/^\d{6}-\d{2,4}$/.test(code) || (/[A-Z]/.test(code) && /\d/.test(code)))) return json(res, { ok: false, error: '无法识别番号：请填形如 STARS-238 或 092126-001 的番号、含 <num> 的 NFO，或详情页网址' })
-    /* 服务端一次只跑一部。默认仍直接拒（老调用方靠这个错误判断"没启动"）；
-       带 queue 的手动添加改成排进服务端持久队列 —— 订阅全量动辄几百部，
-       否则批量没跑完时点「加入离线数据」只会拿到一句"正在刮削 X，请等它完成"。 */
-    if (SCRAPE.running) {
-      if (!wantQueue) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
+    /* 带 queue 的请求一律进持久队列（订阅全量 / 批量 / 添加页都走这），
+     * 不再「服务端空闲就直接 scrapeAsync」——否则队列里同一部会被重复刮。 */
+    if (wantQueue) {
       const pos = autoIngestQueue([code], '手动', body.queue === 'front')
+      /* pos===0 = 这部**没能进队列**（autoIngestQueue 的 `q.includes(c) continue` 命中重复，
+       * 或入队瞬间队列已被 worker 取空）。这时绝不能写 queued 占位 —— 没有 worker 会来收尾，
+       * 占位会永远停在「排队中」（用户 2026-10-06 第二次遇到）。
+       * 这种情况按「本地已有就直接算成功」处理：先看缓存，再看历史里有同番号的成功记录就复用。 */
+      if (!pos) {
+        let m = null
+        try { m = readMovieCache(code) } catch (_) {}
+        if (m && m.scraped) {
+          scrapeHistAdd({
+            code, ok: true, err: '', via: '手动',
+            src: String(m.source || '').split(' ')[0] || '本地已有',
+            imgSrc: (m.images && (m.images.posterSrc || m.images.fanartSrc)) || '',
+            at: Date.now(), dur: 0, skipped: true, note: '本地已有离线数据，未重复刮削'
+          })
+        }
+        return json(res, { ok: true, code, queued: false, dup: true, pos: 0, pending: AUTO_INGEST.queue.length })
+      }
+      /* 立刻记一条「排队中」：否则从提交到刮完这几十秒里，历史记录是空的、
+       * 卡片看着像卡住（用户 2026-10-06 反馈）。刮完时 scrapeHistAdd 会按番号覆盖它。 */
+      scrapeHistAdd({ code, ok: false, state: 'queued', err: '', src: '', via: '手动', at: Date.now(), dur: 0 })
       return json(res, { ok: true, code, queued: true, pos, pending: AUTO_INGEST.queue.length })
     }
+    if (SCRAPE.running) return json(res, { ok: false, error: '正在刮削「' + SCRAPE.code + '」，请等它完成' })
     const job = { code, url: String(body.url || '').trim(), sourceId: String(body.sourceId || '').trim(), nfo, full: !!body.full, via: '手动' }
     /* 单跑任务也记进落盘：中途重启/崩溃时 autoQLoad 会把它补回队首接着刮（不记就丢了） */
-    AUTO_INGEST.current = code; AUTO_INGEST.currentVia = '手动'; autoQSave()
-    scrapeAsync(job).catch(() => {})
+    AUTO_INGEST.current = code; AUTO_INGEST.currentVia = '手动'
+    AUTO_INGEST.active = AUTO_INGEST.active || {}
+    AUTO_INGEST.active[code] = SCRAPE   // 手动单跑复用全局 SCRAPE 作为它的状态，firstActive 也能带出它
+    autoQSave()
+    /* 单跑也**必须**走看门狗。这条路径用的是全局 SCRAPE，而 4 个队列 worker 一见
+     * SCRAPE.running 就把取出的任务塞回队列、睡 3 秒再来 —— 单跑一旦卡死（典型：卡在图片下载），
+     * 整条队列就跟着永久停摆；而 stop 只在两个检查点生效，卡在 await 里根本救不回来
+     * （2026-10-06 的 DV-1582 就是这样把队列堵了 9 小时）。 */
+    scrapeWithWatchdog(Object.assign({}, job, { t0: Date.now() }), SCRAPE).catch(() => {})
     return json(res, { ok: true, code })
   }
+  /* ---- 重新刮削（成功/失败都能重来）：清掉旧离线数据 → 排队 → 立刻回填历史记录 ----
+   * 放在任务详情面板用。成功过的也要能重刮（比如换了想让它抓的网址、或数据源坏了想重来），
+   * 所以这里不区分成败；wipe 会先抹掉该番号的 cache/movies 目录，否则 scrapeAsync 的
+   * 「已有离线数据就跳过」快路径会让重刮形同虚设。 */
+  if (p === '/api/scrape/redo') {
+    if (req.method !== 'POST') return json(res, { ok: false, error: '请用 POST' })
+    const rawCode = String((body || {}).code || '').trim()
+    const url = String((body || {}).url || '').trim()
+    if (!rawCode && !url) return json(res, { ok: false, error: '请填番号或详情页网址' })
+    let code = rawCode
+    if (!code && url) {
+      try { code = (scCodeFromUrl(url) || scCodeFromUrl(rawCode) || scText(rawCode)).toUpperCase() } catch (_) {}
+    }
+    if (code) code = (parseName(code + '.mp4').code || code)
+    if (!code) return json(res, { ok: false, error: url ? ('这个网址里认不出番号，请直接填番号（形如 STARS-238）') : '无法识别番号' })
+    const b = bare(code)
+    /* 抹掉旧数据 + 旧历史记录（成功/失败都清），让面板立刻反映「正在重刮」 */
+    try {
+      const root = path.join(cacheDir(), 'movies')
+      const d = offlineCodeDir(code, null)
+      if (d && d.startsWith(root + path.sep) && fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true })
+    } catch (_) {}
+    const _before = SCRAPE_HIST.list.length
+    SCRAPE_HIST.list = SCRAPE_HIST.list.filter(x => !(x && bare(x.code) === b))
+    if (SCRAPE_HIST.list.length !== _before) {
+      try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+    }
+    patchDataItem(code)
+    const pos = autoIngestQueue([code], '手动·重刮', true)
+    /* 立刻插一条「排队中」记录：面板马上能看到状态，不用等 2.5s 轮询。
+     * 用 state:'queued' 而不是 ok:null —— ok 只有 true/false 两义，null 会被前端当失败渲染。 */
+    scrapeHistAdd({ code, ok: false, state: 'queued', err: '', src: '', via: '手动·重刮', at: Date.now(), dur: 0, url })
+    return json(res, { ok: true, code, url, pos: pos || 1, pending: AUTO_INGEST.queue.length })
+  }
   if (p === '/api/scrape/status') return json(res, Object.assign({ ok: true }, SCRAPE, {
+    /* 同 /api/scrape/queue：把媒体库版本号给前端当「有片子入库了」的信号（见 LIB_SEQ 注释） */
+    libSeq: libSeq(),
     /* 入库队列进度：前端的「排队中」要显示真实位次/剩余量，否则整批计时器会被误读成单条耗时 */
     queue: {
       pending: AUTO_INGEST.queue.length, current: AUTO_INGEST.current,
@@ -5815,19 +7171,44 @@ async function handleActorApi(req, res, p) {
    *   remove  把某一部从队列里去掉
    *   front   把某一部提到队首（手动优先于订阅批量） */
   if (p === '/api/scrape/stop') {
-    if (!SCRAPE.running) return json(res, { ok: true, already: true })
+    if (!SCRAPE.running && !(AUTO_INGEST.active && Object.keys(AUTO_INGEST.active).length)) return json(res, { ok: true, already: true })
     SCRAPE.stop = true; SCRAPE.phase = '正在停止'
-    scLog('收到手动停止指令，正在收尾…')
+    if (AUTO_INGEST.active) for (const k of Object.keys(AUTO_INGEST.active)) AUTO_INGEST.active[k].stop = true
+    scLog(SCRAPE, '收到手动停止指令，正在收尾…')
     return json(res, { ok: true, stopping: true, code: SCRAPE.code })
   }
   if (p === '/api/scrape/queue') {
     if (req.method === 'GET') {
+      /* 完整任务清单：排队中的每条都带 via（来源），前端才能在单个任务里显示是「离线」还是「订阅」。
+       * 2026-10-03 之前只回 head 前 20 个且不带 via，前端只能显示番号、无法区分来源。 */
+      const items = AUTO_INGEST.queue.map(c => ({ code: c, via: (AUTO_INGEST.queue.via || {})[c] || '订阅' }))
       return json(res, {
         ok: true, pending: AUTO_INGEST.queue.length, current: AUTO_INGEST.current,
+        currentVia: AUTO_INGEST.currentVia || '',
+        /* 媒体库版本号：前端全站轮询靠它判断「是不是有新片入库了」，变了就补一次 LIB（见 LIB_SEQ 注释） */
+        libSeq: libSeq(),
         done: AUTO_INGEST.done, okN: AUTO_INGEST.ok, fail: AUTO_INGEST.fail,
-        total: AUTO_INGEST.total, running: AUTO_INGEST.running, paused: !!AUTO_INGEST.paused,
+        total: AUTO_INGEST.total,
+        /* running 现在按「事实」算：队列里还有号、或还有部在刮 → 忙。
+         * 不再用一个手置的布尔，免得某条路径没解锁就永远停在 true（前端因此一直以为服务端在忙）。 */
+        running: AUTO_INGEST.queue.length > 0 || Object.keys(AUTO_INGEST.active || {}).length > 0,
+        paused: !!AUTO_INGEST.paused,
         head: AUTO_INGEST.queue.slice(0, 20),
-        scraping: SCRAPE.running ? { code: SCRAPE.code, phase: SCRAPE.phase, pct: SCRAPE.pct } : null
+        items: items,
+        /* 正在刮的每一部（不止一部：autoIngestRun 是 CONCUR=4 的 worker 池）。
+         * ⚠️ 必须给 active 而不是只给全局 SCRAPE —— 队列刮削时 scrapeAsync 走的是**每任务独立状态**
+         *   （job._S = scMakeState()），全局 SCRAPE.running 永远是 false，光看它「刮削中」列会一直是空的
+         *   （用户反馈：失败任务点重试后不显示刮削中）。runningTasks 才带真实的 phase/pct。 */
+        runningTasks: Object.keys(AUTO_INGEST.active || {}).map(k => {
+          const a = AUTO_INGEST.active[k] || {}
+          return {
+            code: a.code || k, via: a.via || (AUTO_INGEST.queue.via || {})[k] || '手动',
+            phase: a.phase || '', pct: a.pct || 0, title: a.title || '', log: a.log || []
+          }
+        }),
+        scraping: SCRAPE.running
+          ? { code: SCRAPE.code, phase: SCRAPE.phase, pct: SCRAPE.pct, via: SCRAPE.via || '' }
+          : null
       })
     }
     const act = String(body.action || '')
@@ -5840,14 +7221,25 @@ async function handleActorApi(req, res, p) {
     }
     if (act === 'clear') {
       const n = q.length
-      q.length = 0; AUTO_INGEST.paused = false; autoQSave()
+      const dropped = q.slice()
+      q.length = 0; AUTO_INGEST.paused = false
+      histFinishQueued(dropped, '已手动清空待跑队列，这部没刮')
+      /* 计数一并归零：点「清空待跑」的语义就是「这批到此为止 / 重新来」，
+       * 再让状态条继续显示「已完成 13（失败 4）」（那是好几个小时前的累计战绩）会让人以为
+       * 刚才这批也是这个结果。刮削历史本身不受影响，照旧能在历史表里查到。 */
+      AUTO_INGEST.done = 0; AUTO_INGEST.ok = 0; AUTO_INGEST.fail = 0; AUTO_INGEST.total = 0
+      autoQSave()
       console.log('[auto-ingest] 手动清空队列：' + n + ' 个番号')
       return json(res, { ok: true, cleared: n, pending: 0 })
     }
     const code = String(body.code || '').trim().toUpperCase()
     if (act === 'remove' && code) {
       const i = q.indexOf(code)
-      if (i >= 0) { q.splice(i, 1); autoQSave(); return json(res, { ok: true, removed: code, pending: q.length }) }
+      if (i >= 0) {
+        q.splice(i, 1)
+        histFinishQueued([code], '已从待跑队列移除，这部没刮')
+        autoQSave(); return json(res, { ok: true, removed: code, pending: q.length })
+      }
       return json(res, { ok: true, removed: '', pending: q.length })
     }
     if (act === 'front' && code) {
@@ -5863,11 +7255,77 @@ async function handleActorApi(req, res, p) {
   if (p === '/api/scrape/history') {
     scrapeHistLoad()
     if (req.method === 'POST') {
-      if ((body || {}).action === 'clear') { SCRAPE_HIST.list = []; try { fs.writeFileSync(SCRAPE_HIST_FILE(), '[]') } catch (_) {} }
-      return json(res, { ok: true, total: SCRAPE_HIST.list.length })
+      const ha = String((body || {}).action || '')
+      if (ha === 'clear') {
+        SCRAPE_HIST.list = []
+        try { fs.writeFileSync(SCRAPE_HIST_FILE(), '[]') } catch (_) {}
+        return json(res, { ok: true, total: 0 })
+      }
+      /* ---- 单条重试：把这条重新插到服务端队列队首（不重复排队，已有则返回原位次） ---- */
+      if (ha === 'retry') {
+        const code = String((body || {}).code || '').trim().toUpperCase()
+        if (!code) return json(res, { ok: false, error: '缺少番号' })
+        const via = String((body || {}).via || '手动')
+        const _b = bare(code)
+        /* 重试意味着旧的失败记录要消失：先把该番号从失败历史里移除，
+         * 否则用户点了重试、任务也跑起来了，失败栏里它还在、历史里也还在（用户反馈的 bug） */
+        const _before = SCRAPE_HIST.list.length
+        SCRAPE_HIST.list = SCRAPE_HIST.list.filter(x => !(x && bare(x.code) === _b))
+        if (SCRAPE_HIST.list.length !== _before) {
+          try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+        }
+        /* 重试前先把该番号已有的缓存抹掉，否则「已有离线数据就跳过」会让重试无效 */
+        if (body.wipe !== false) {
+          try {
+            const d = offlineCodeDir(code, null)
+            const root = path.join(cacheDir(), 'movies')
+            if (d && d.startsWith(root + path.sep) && fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true })
+          } catch (_) {}
+        }
+        const pos = autoIngestQueue([code], via, true)   // 返回该番号在队列里的位次（1 起），0 = 队列空
+        return json(res, { ok: true, code: code, via: via, pos: pos || 1, pending: AUTO_INGEST.queue.length })
+      }
+      /* ---- 单条删除：可选连带删掉这条任务线产生的离线数据（meta.json + images/ + 磁力缓存） ---- */
+      if (ha === 'remove') {
+        const code = String((body || {}).code || '').trim().toUpperCase()
+        const at = Number((body || {}).at) || 0
+        const wipe = body.wipe !== false
+        if (!code && !at) return json(res, { ok: false, error: '缺少番号或时间戳' })
+        const _b = bare(code)
+        /* 旧版本 bug 可能给同一番号留下多条重复记录，这里把所有匹配的都找出来一并删，
+         * 否则删一条剩几条，失败栏看着像"点了没反应" */
+        const matches = SCRAPE_HIST.list.filter(x => (_b && bare(x.code) === _b) || (at && Number(x && x.at) === at))
+        let rec = matches.length ? matches[0] : null
+        let files = null
+        if (wipe && rec) {
+          try {
+            const d = offlineCodeDir(rec.code, null)
+            const root = path.join(cacheDir(), 'movies')
+            /* 只删这个番号自己的文件夹，绝不越出 cache/movies */
+            if (d && d.startsWith(root + path.sep) && fs.existsSync(d)) {
+              const st = fs.statSync(d)
+              if (st.isDirectory()) { fs.rmSync(d, { recursive: true, force: true }); files = d }
+            }
+          } catch (e) { files = null }
+          /* 顺便隐藏库里的条目（视频文件不动，只是不再展示） */
+          try { setHidden(rec.code, true) } catch (_) {}
+        }
+        if (matches.length) SCRAPE_HIST.list = SCRAPE_HIST.list.filter(x => matches.indexOf(x) < 0)
+        try { fs.writeFileSync(SCRAPE_HIST_FILE(), JSON.stringify(SCRAPE_HIST.list)) } catch (_) {}
+        return json(res, {
+          ok: true, removed: rec ? rec.code : code, files: files,
+          left: SCRAPE_HIST.list.length
+        })
+      }
+      return json(res, { ok: false, error: '未知操作：' + ha })
     }
-    const lim = Math.min(600, Math.max(1, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 120))
-    return json(res, { ok: true, total: SCRAPE_HIST.list.length, list: SCRAPE_HIST.list.slice(-lim).reverse() })
+    const lim = Math.max(1, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 120)   // 不再封顶 600：历史/队列本就不该有上限
+    /* 必须按时间排序后再倒序取：scrapeHistAdd 对「同番号已有记录」是**原地覆盖**（位置不变），
+     * 于是「一年前第一次刮、今天重刮」的那部会留在数组的旧位置上 —— 只读最后 lim 条再 reverse
+     * 会得到一张乱序的表（实测 09:16 / 09:15 / 09:18 / 08:30 / 06:38 / 08:32 交错），
+     * 而且重刮过的旧条目会被挤出窗口。这里按 at 升序排一次再取尾部，保证「新的在前」。 */
+    const ordered = SCRAPE_HIST.list.slice().sort((a, b) => (Number(a && a.at) || 0) - (Number(b && b.at) || 0))
+    return json(res, { ok: true, total: ordered.length, list: ordered.slice(-lim).reverse() })
   }
   /* ---- 离线数据导入（添加影片页）：把按番号命名的缓存文件夹（meta.json + images/ + movie.nfo）拷回 cache/movies ---- */
   if (p === '/api/offline/scan') {
@@ -6138,9 +7596,20 @@ function localSourceForCode(code) {
     /* 本地数据（影片文件夹自带的 NFO / 海报）+ 各文件绝对路径（设置偏好里可开关显示） */
     const loc = localSourceForCode(code)
     const imgDirAbs = path.join(cacheDir(), 'movies', code.replace(/[^\w.-]/g, '_'), 'images')
+    /* 「改版」标签（有码/无码/破解/流出/中字/分辨率）：番号本身就能判大部分，不依赖本地视频文件。
+     * meta.tags 是刮削当时写好的（3913 行），没有就现算一份。 */
+    const edTags = Array.isArray(m.tags) && m.tags.length ? m.tags : videoTagsOf('', 0, 0, (m.title || '') + ' ' + ((m.genres || []) || []).join(' '))
     return json(res, {
       ok: true, code, fields: m.fields, images: imgs, sources, sourceData: srcVals,
       offFilm: m.offFilm || null,
+      /* MDC-NG 式详情页要的额外字段：原番号 / 评分 / 想看人数 / 刮削日志 / 改版 */
+      origCode: m.origCode || '', score: m.score || '', wantWatch: Number(m.wantWatch) || 0,
+      scrapeLog: Array.isArray(m.scrapeLog) ? m.scrapeLog : [],
+      /* 逐源尝试记录（每部都持久化，含成功/失败与原因）：老任务没有 scrapeLog 时，
+       * 前端靠它合成出「每个源试了什么、为什么失败」的详细日志，不至于只显示一句「没有日志」。 */
+      scrapeTried: (m.scrapeTried || {}).tried || [],
+      scrapeSkipped: (m.scrapeTried || {}).skipped || [],
+      edition: edTags,
       sourcesAll: scrapeSourcesOverview(code, m),
       local: loc ? { values: loc.values, hasPoster: !!loc.posterPath, hasFanart: !!loc.fanartPath } : null,
       paths: {
@@ -6249,6 +7718,35 @@ function localSourceForCode(code) {
     const src = String(body.src || '').trim()
     const m = readMovieCache(code)
     if (!m || !m.fields) return json(res, { ok: false, error: '没有刮削数据（请先刮削一次）' })
+    /* ---- 批量手动编辑（详情面板的「编辑元数据」）：一次改多个文本字段，全标来源「手动」 ---- */
+    if (field === '__bulk__') {
+      const vals = (body && body.values) || {}
+      const changed = []
+      for (const [k, raw] of Object.entries(vals)) {
+        if (!SC_TEXT_FIELDS.concat(['actors', 'genres']).includes(k)) continue
+        let v = Array.isArray(raw) ? raw : String(raw == null ? '' : raw)
+        if (k === 'runtime') v = Number(v) || 0
+        if (k === 'actors' || k === 'genres') v = String(raw || '').split(/[、,，\s]+/).map(x => x.trim()).filter(Boolean)
+        m.fields[k] = { v, src: '手动' }
+        changed.push(k)
+        if (k === 'title') m.title = Array.isArray(v) ? v.join('、') : v
+        if (k === 'plot') m.plot = v
+        if (k === 'release') { m.release = v; m.year = String(v || '').slice(0, 4) }
+        if (k === 'runtime') m.runtime = Number(v) || 0
+        if (k === 'studio') m.studio = v
+        if (k === 'publisher') m.publisher = v
+        if (k === 'series') m.series = v
+        if (k === 'director') m.director = v
+        if (k === 'actors') m.actors = v
+        if (k === 'genres') m.genres = v
+      }
+      if (!changed.length) return json(res, { ok: false, error: '没有可保存的字段' })
+      m.manualEditedAt = new Date().toISOString()
+      m.scrapedAt = new Date().toISOString()
+      try { fs.writeFileSync(movieCacheFile(code), JSON.stringify(m, null, 2)) } catch (e) { return json(res, { ok: false, error: '写入失败：' + e.message }) }
+      mirrorMeta(code); patchDataItem(code)
+      return json(res, { ok: true, code, changed })
+    }
     const manual = body.value !== undefined
     const isLocal = src === '__local'          // 「使用本地数据」：影片文件夹自带的 NFO / 海报
     const loc = isLocal ? localSourceForCode(code) : null
@@ -6391,7 +7889,11 @@ function localSourceForCode(code) {
     if (body.code !== undefined) {
       const nc = norm(String(body.code).trim())
       if (!nc) return json(res, { ok: false, error: '番号不能为空' })
-      if (nc !== it.code) { saveManualCode(relVideo, nc); it.code = nc }
+      if (nc !== it.code) {
+        saveManualCode(relVideo, nc); it.code = nc
+        /* 番号变了 → 缓存目录名跟着变，新番号下还没有 pv6.mp4，立刻补排一次悬停预览生成 */
+        try { enqueuePreview(nc) } catch (_) {}
+      }
     }
     if (!it.code) return json(res, { ok: false, error: '请先填一个番号（如 STARS-238），否则无法保存标题或刮削' })
     if (body.title !== undefined && String(body.title).trim()) {
@@ -6545,6 +8047,7 @@ async function w115Claim(job, files) {
   job.status = 'rescanning'; job.note = ''; w115Save()
   rescan()                                   // 入库：manualCode 生效 + enrichFromCache / autoScrapeNew
   await waitScanDone()
+  enqueuePreview(code)   // 115 下载完成认领入库后，立刻给这部生成悬停预览
   job.status = 'done'
   job.finishedAt = Date.now()
   job.found = files.length; job.bound = bound
@@ -6605,8 +8108,8 @@ function parseRankRows(html) {
     if (!/class="rnkno"/.test(chunk)) continue
     const rank = +((chunk.match(/rnkcnt">(\d+)/) || [])[1] || 0)
     const id = (chunk.match(/actress(\d+)\.html/) || [])[1]
-    const name = mnStrip((chunk.match(/<h2 class="ttl"><a[^>]*>([\s\S]*?)<\/a>/) || [])[1])
-    const works = +((chunk.match(/<td>\s*(\d{1,6})\s*<\/td>/) || [])[1] || 0)
+    const name = mnStrip((chunk.match(/<h[23] class="ttl"><a[^>]*>([\s\S]*?)<\/a>/) || [])[1])
+    const works = +((chunk.match(/<td[^>]*>\s*(\d{1,6})\s*<\/td>/) || [])[1] || 0)
     if (rank && id && name) rows.push({ rank, id, name, works })
   }
   return rows
@@ -7166,6 +8669,14 @@ const server = http.createServer((req, res) => {
     }
     /* 女优头像候选缩略图：外部图床多半防盗链，统一由服务端代取（GET，供 <img src> 直接用） */
     if (p === '/api/actor/thumb') return actorThumb(res, u.searchParams.get('u') || '')
+    /* 海报悬停预览动图（B方案）：返回「已生成预览的番号清单」+ 文件名（前端照 file 拼 URL，
+     * 抽帧参数改版时只需改服务端 PREV_FILE，前端不用跟着改） */
+    if (p === '/api/previews') {
+      if (!previewEnabled()) return json(res, { ok: true, on: false, codes: [], file: PREV_FILE })
+      const codes = previewScanCodes()
+      for (const c of PREV_SET) if (codes.indexOf(c) < 0) codes.push(c)
+      return json(res, { ok: true, on: true, codes, file: PREV_FILE })
+    }
     /* ---------- MissAV 在线播放：解析（GET）+ HLS 中转（GET） ---------- */
     if (p === '/api/missav/play') return handleMissavPlay(req, res, u)
     if (p.startsWith('/api/missav/hls/')) return missavHlsReq(res, p, u)
@@ -7185,7 +8696,8 @@ const server = http.createServer((req, res) => {
         p === '/api/movie/delete' ||
         p === '/api/backup' || p === '/api/login' ||
         p === '/api/favorites' || p === '/api/subscriptions' || p === '/api/subscriptions/feed' || p === '/api/jdbcodes' ||
-        p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/direct' || p === '/api/online/image' || p === '/api/online/config' ||
+        p === '/api/jdbcuncensored' ||
+        p === '/api/online/status' || p === '/api/online/proxy' || p === '/api/online/direct' || p === '/api/online/image' || p === '/api/online/config' || p === '/api/online/playlines' ||
         p === '/api/online/detail' || p === '/api/online/reviews' || p === '/api/online/board' || p === '/api/online/search' || p === '/api/online/actor' ||
         p === '/api/online/actor_movies' ||
         p === '/api/online/dirs' || p === '/api/online/entity' ||
@@ -7202,6 +8714,7 @@ const server = http.createServer((req, res) => {
         !(p === '/api/subscriptions' && req.method === 'GET') &&
         !(p === '/api/subscriptions/feed' && req.method === 'GET') &&
         !(p === '/api/jdbcodes' && req.method === 'GET') &&
+        !(p === '/api/jdbcuncensored' && req.method === 'GET') &&
         !(p.startsWith('/api/online/') && req.method === 'GET') &&
         !(p === '/api/115/config' && req.method === 'GET') &&
         !(p === '/api/115/dirs' && req.method === 'GET') &&
@@ -7316,6 +8829,9 @@ const server = http.createServer((req, res) => {
       }).catch(() => { try { res.writeHead(404); res.end('Not Found') } catch (_) {} })
       return
     }
+    /* 男优数据（roster_male.json / avatars_male/）走 /cache/male/… —— 已由下面的 /cache/ 分支覆盖：
+     * 容器 bind mount 是逐文件挂的，只有 /vol4/1000/pako 整个目录进了 /app/cache，
+     * 放 UI_ROOT 下容器读不到（新增目录不会自动进挂载点）。 */
     if (/^\/(covers\/|actresses\/|favicon\.ico|manifest\.webmanifest|sw\.js|hls\.light\.min\.js|icon-192\.png|icon-512\.png|apple-touch-icon\.png)/.test(p) ||
         ['/actresses.json', '/name-map.json', '/name-alias.json', '/rankings.json', '/tags-zh.json'].includes(p)) {
       /* 白名单只是前缀，还得挡住 ../ 目录穿越（/covers/../server-config.json 之类） */
@@ -7376,9 +8892,16 @@ server.listen(PORT, '0.0.0.0', () => {
   setInterval(() => avatarBackfillOnce('timer').catch(() => {}), 12 * 3600 * 1000).unref()
   /* 115 推送自动认领：恢复上次没盯完的任务（服务重启不丢） */
   w115Load()
+  /* 悬停预览：清单版本对不上（旧版单段 5s）→ 先清旧文件，再让 schedulePreviews 整批重排 */
+  if (previewLoad()) { try { previewCleanupOld() } catch (e) { console.log('[preview] 旧版清理出错：' + e.message) } }
+  schedulePreviews()   // 重排必须走 schedulePreviews（enqueuePreview 单独调只覆盖首次入库的场景）
   if (W115.jobs.some(j => j.status === 'watching')) setTimeout(w115Pump, 30000)
   /* 订阅/扫描自动入库队列：恢复上次没跑完的（服务重启不丢） */
   autoQLoad()
+  /* 收拾上次没跑完的「排队中」占位记录（重启后队列已空、worker 不会再收尾的那些） */
+  setTimeout(reconcileQueuedHist, 1500)
+  /* 订阅自动下载（115）已推送记录：恢复上次记的「哪些番号推过」，避免重启后重复推 */
+  subDlLoad()
   /* 女优 JavDB 代号回填：断点续跑 —— 接着上次跑的模式（名册全量 / 仅影片库）继续 */
   setTimeout(() => {
     const fn = JDB_RUN.mode === 'roster' ? jdbCodeRunAll() : jdbCodeBackfill({ mode: 'lib', phase: 2 })
