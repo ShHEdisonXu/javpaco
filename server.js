@@ -1212,6 +1212,14 @@ async function scanAsync() {
     await yieldLoop()
     const items = []
     const dataRoot = readMediaPathFile() || MEDIA_ROOT   // 渐进落盘用的 root（与扫描结束时的最终值一致）
+    /* 重扫期间保留旧条目：scanAsync 从空 items[] 开始逐步 push，每 16 部直接挂进 DATA，
+     * 导致重扫头几秒 DATA.items 只含新扫到的几十部 → 前端 LIB 被覆写为部分列表，旧影片全消失。
+     * 现在先快照旧条目，渐进落盘时新条目按番号覆盖旧条目、没扫到的旧条目保留，
+     * 用户重扫期间切页面回来看到的 LIB 始终包含原来已有的影片。 */
+    const _priorMap = new Map()
+    if (DATA && Array.isArray(DATA.items)) {
+      for (const it of DATA.items) _priorMap.set(bare(it.code), it)
+    }
     // 目录 → 图片索引（异步：网盘上 readdir 不能阻塞主线程）
     const dirImgs = {}
     async function indexImgs(dir) {
@@ -1298,8 +1306,14 @@ async function scanAsync() {
       items.push(it)
       SCAN.scanned = ++i
       /* 渐进落盘：每 16 部把已扫到的条目挂进 DATA → /data.json 立即可见，
-       * 前端边扫边把海报墙铺出来，不用等整个目录走完（网盘挂载的 walk 可能要几十分钟）。 */
-      if ((i & 15) === 0) DATA = { root: dataRoot, generated: Date.now(), items }
+       * 前端边扫边把海报墙铺出来，不用等整个目录走完（网盘挂载的 walk 可能要几十分钟）。
+       * 新扫到的条目按番号覆盖旧快照里的同名条目，没扫到的旧条目保留 →
+       * 重扫期间 LIB 始终包含原有影片，切页面回来不会看到空列表。 */
+      if ((i & 15) === 0) {
+        const merged = new Map(_priorMap)
+        for (const it of items) merged.set(bare(it.code), it)
+        DATA = { root: dataRoot, generated: Date.now(), items: [...merged.values()] }
+      }
       if ((i & 15) === 0) await yieldLoop()   // 让出事件循环，/api/scan 才能实时响应
     }
     items.sort((a, b) => b.mtime - a.mtime)
