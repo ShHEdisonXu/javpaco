@@ -3565,7 +3565,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
         <h2>关于</h2>
         <div class="sp-card">
           <div class="sp-row"><div class="l">JAVぱこ</div></div>
-          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.3.6 · 本地媒体库 + 多源刮削</small></div></div>
+          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.3.7 · 本地媒体库 + 多源刮削</small></div></div>
         </div>
         <div class="sp-card" style="margin-top:14px">
           <div class="sp-row"><div class="l">备份与恢复<small>把配置（媒体库 / 数据源 / 隐藏列表 / 偏好）+ 播放记录 + 评分备注标签打包成一个 JSON 文件下载；换机或清库前先导出，恢复后自动重扫</small></div></div>
@@ -13547,7 +13547,7 @@ async function libRender() {
     const d = await (await fetch('/api/library', { cache: 'no-store' })).json()
     if (!d || !d.ok) return
     LIB_ROOT = d.root || ''
-    const rh = document.getElementById('libRootHint'); if (rh && d.root) rh.textContent = d.root
+    const rh = document.getElementById('libRootHint'); if (rh) rh.textContent = d.native ? '' : (d.root || '')
     LIB_STATS = {}
     ;(d.libs || []).forEach(x => { LIB_STATS[x.path] = x })
     const libs = d.libraries || []
@@ -13588,7 +13588,9 @@ async function libRender() {
         </div>
         <div class="acts"><button class="del" data-p="${libEsc(p)}" onclick="libRemove(this)" title="把这个文件夹移出媒体库（主页随即不再显示它的海报）">删除</button></div>
       </div>`
-    }).join('') || '<div class="lib-none">还没有媒体文件夹：在上面填一个容器内的子文件夹路径（或点「浏览」逐级挑），点「＋ 添加并扫描」即可。可以加多个。</div>'
+    }).join('') || (d.native
+      ? '<div class="lib-none">还没有媒体文件夹：点「浏览」用访达选任意文件夹，选完自动加进媒体库并扫描。本机任意位置都可以加，可加多个。</div>'
+      : '<div class="lib-none">还没有媒体文件夹：在上面填一个容器内的子文件夹路径（或点「浏览」逐级挑），点「＋ 添加并扫描」即可。可以加多个。</div>')
     if (impBlock) box.innerHTML += impBlock
   } catch (_) {}
 }
@@ -14863,6 +14865,10 @@ window.setAutoDlMax = async function () {
   try { document.documentElement.setAttribute('data-is-app', IS_APP ? '1' : '0') } catch (_) {}
   if (!IS_APP) { window.__pickOrBrowse = function () { if (typeof window.libBrowse === 'function') window.libBrowse() }; return }
 
+  /* 原生端（Mac/将来的 Win）：标记全文件系统模式，并把「视频目录」输入框的措辞从「容器内」改成「任意文件夹」 */
+  window.__nativeFs = true
+  var _libInput = document.getElementById('libPathInput')
+  if (_libInput) _libInput.placeholder = '选择任意文件夹（点「浏览」用访达挑选，可加多个）'
   function toast(msg, ok) {
     var d = document.createElement('div');
     d.className = 'jp-toast' + (ok ? ' ok' : '');
@@ -14893,6 +14899,10 @@ window.setAutoDlMax = async function () {
       if (el) {
         el.value = p;
         try { el.dispatchEvent(new Event('input', { bubbles: true })) } catch (_) {}
+      }
+      /* 原生端「视频目录」：访达选完直接加进媒体库并扫描，不用再点一次「添加」 */
+      if (inputId === 'libPathInput') {
+        if (typeof window.libAdd === 'function') { window.libAdd(); return }
       }
       toast('已选择：' + p, true);
     });

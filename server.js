@@ -44,7 +44,7 @@ function resolveMediaRoot() {
   if (fs.existsSync(homeMovies)) return homeMovies
   return path.join(__dirname, 'media')
 }
-const MEDIA_ROOT = resolveMediaRoot()
+let MEDIA_ROOT = resolveMediaRoot()
 const PORT = parseInt(process.argv[3] || process.env.PORT || '8090', 10)
 const UI_ROOT = __dirname
 
@@ -62,7 +62,24 @@ function containerMounts() {
   } catch (_) {}
   return out.length ? out : [MEDIA_ROOT]
 }
-const mountTip = () => '只能整理已挂载进容器的目录（当前可见：' + containerMounts().join('、') +
+/* 原生模式（Mac 版 / 将来的 Win 版）：跑在宿主机上、拥有完整文件系统权限，没有容器挂载边界。
+ * 由启动器注入环境变量识别：Mac 版设 JP_MAC=1，Win 版设 JP_NATIVE=1；
+ * 兜底：非 Linux 平台且没有 /proc/self/mountinfo 也按原生处理（NAS/Docker 是 Linux 且有 /proc，不会误判）。 */
+const NATIVE = process.env.JP_MAC === '1' || process.env.JP_NATIVE === '1' ||
+  (process.platform !== 'linux' && !fs.existsSync('/proc/self/mountinfo'))
+/* 原生模式下媒体根 = 当前已配置媒体库的共同祖先（无容器根限制）；加跨分支目录时再扩张。
+ * 这样已存在的单库用户升级后媒体根不变，已有 relVideo 不需重建。 */
+function commonAncestor(paths) {
+  const ps = (paths || []).map(p => path.resolve(String(p)).split(path.sep).filter(Boolean))
+  if (!ps.length) return null
+  let i = 0
+  while (i < ps[0].length && ps.every(pp => pp[i] === ps[0][i])) i++
+  if (i === 0) return process.platform === 'win32' ? (process.env.SystemDrive || 'C:') + '\\' : path.sep
+  return path.sep + ps[0].slice(0, i).join(path.sep)
+}
+const mountTip = () => NATIVE
+  ? '只能操作媒体库内的文件'
+  : '只能整理已挂载进容器的目录（当前可见：' + containerMounts().join('、') +
   '）内的文件夹。容器看不见本机路径，要整理别处的文件夹，请在 docker-compose.yml 里加一行映射到 ' +
   MEDIA_ROOT + '/子目录（如 ' + MEDIA_ROOT + '/测试），然后重建容器'
 
@@ -94,6 +111,13 @@ let CFG = (() => {
   try { return JSON.parse(txt) } catch (_) { return {} }
 })()
 let LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
+/* 原生模式：媒体根改成已配置媒体库的共同祖先（无容器挂载边界）。Mac/Win 启动器都不设容器，
+ * 这条路径在 NAS/Docker 上完全不走（NATIVE=false，MEDIA_ROOT 保持挂载根）。 */
+if (NATIVE) {
+  const ca = LIBS.length ? commonAncestor(LIBS)
+    : (process.env.JP_MEDIA_ROOT || (process.platform === 'win32' ? 'C:\\' : '/'))
+  if (ca) MEDIA_ROOT = ca
+}
 function writeCfg() {
   const out = Object.assign({}, CFG, { libraries: LIBS })
   const t = CFG_FILE + '.tmp'
@@ -6829,7 +6853,7 @@ async function handleActorApi(req, res, p) {
   /* ---------- Emby 式媒体库管理：挂载点只作权限边界，媒体库 = 设置里选的子文件夹 ---------- */
   if (p === '/api/library') {
     return json(res, {
-      ok: true, root: MEDIA_ROOT, hostPath: readMediaPathFile() || '',
+      ok: true, root: MEDIA_ROOT, hostPath: readMediaPathFile() || '', native: NATIVE,
       libraries: LIBS, libs: libStats(), scanning: SCAN.running,
       /* 「添加 → 导入视频整理」用过的目录：设置 → 媒体库里展示，可一键收进媒体库 */
       importDirs: Array.isArray(CFG.importDirs) ? CFG.importDirs : [],
@@ -6896,14 +6920,20 @@ async function handleActorApi(req, res, p) {
     if (!raw) return json(res, { ok: false, error: '请填写文件夹路径' })
     if (raw === '~' || raw.startsWith('~/')) raw = path.join(MEDIA_ROOT, raw.slice(1))
     const rp = path.resolve(raw)
-    if (!(rp === MEDIA_ROOT || rp.startsWith(MEDIA_ROOT + path.sep)))
-      return json(res, { ok: false, error: `只能添加挂载进来的目录（${MEDIA_ROOT}）里的文件夹。宿主机的路径在容器里不存在——要挂别的目录请先在 docker-compose.yml 里加一行映射，再重建容器` })
+    if (!NATIVE) {
+      if (!(rp === MEDIA_ROOT || rp.startsWith(MEDIA_ROOT + path.sep)))
+        return json(res, { ok: false, error: `只能添加挂载进来的目录（${MEDIA_ROOT}）里的文件夹。宿主机的路径在容器里不存在——要挂别的目录请先在 docker-compose.yml 里加一行映射，再重建容器` })
+    }
     if (p === '/api/library/add') {
       let st = null
       try { st = fs.statSync(rp) } catch (_) {}
       if (!st || !st.isDirectory())
-        return json(res, { ok: false, error: `路径不存在或不可读：${rp}（检查容器是否已挂载该目录、云盘是否在线）` })
-      if (!LIBS.includes(rp)) LIBS.push(rp)
+        return json(res, { ok: false, error: `路径不存在或不可读：${rp}` + (NATIVE ? '' : '（检查容器是否已挂载该目录、云盘是否在线）') })
+      if (!LIBS.includes(rp)) {
+        LIBS.push(rp)
+        /* 原生模式：加进跨共同祖先的目录时把媒体根扩张到新的共同祖先，保证 relVideo 不含 `..` */
+        if (NATIVE) { const ca = commonAncestor(LIBS); if (ca) MEDIA_ROOT = ca }
+      }
       /* 转正成媒体库了 → 从「导入整理用过目录」记录里移除，避免两处重复展示 */
       if (Array.isArray(CFG.importDirs)) {
         CFG.importDirs = CFG.importDirs.filter(x => path.resolve(String(x)) !== rp)
@@ -6917,7 +6947,7 @@ async function handleActorApi(req, res, p) {
     rescan()
     return json(res, {
       ok: true, libraries: LIBS, libs: libStats(), scanning: SCAN.running,
-      warn: rp === MEDIA_ROOT ? '加的是挂载根目录（整根扫描）。挂载点只是权限范围，通常建议改加它下面的子文件夹，例如 ' + MEDIA_ROOT + '/某个子目录' : ''
+      warn: (!NATIVE && rp === MEDIA_ROOT) ? '加的是挂载根目录（整根扫描）。挂载点只是权限范围，通常建议改加它下面的子文件夹，例如 ' + MEDIA_ROOT + '/某个子目录' : ''
     })
   }
   /* ---------- 备份 / 恢复：配置 + 播放记录 + 个人数据打成一个 JSON ----------
@@ -7374,7 +7404,7 @@ async function handleActorApi(req, res, p) {
   }
   function importScan(dir) {
     const root = path.resolve(String(dir || '').trim())
-    if (!(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) throw new Error(mountTip())
+    if (!NATIVE && !(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) throw new Error(mountTip())
     let st; try { st = fs.statSync(root) } catch (_) { throw new Error('目录不存在或不可读：' + root + '（检查是否已挂载、云盘是否在线）') }
     if (!st.isDirectory()) throw new Error('不是目录：' + root)
     const files = []
@@ -7452,7 +7482,7 @@ async function handleActorApi(req, res, p) {
   if (p === '/api/import/run') {
     try {
       const root = path.resolve(String(body.dir || '').trim())
-      if (!(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) return json(res, { ok: false, error: mountTip() })
+      if (!NATIVE && !(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) return json(res, { ok: false, error: mountTip() })
       const rootName = path.basename(root)
       const list = Array.isArray(body.items) ? body.items.slice(0, 2000) : []
       if (!list.length) return json(res, { ok: false, error: '没有勾选任何文件' })
@@ -7967,7 +7997,7 @@ function libraryBrowse(q) {
   let raw = String(q || '').trim()
   if (raw.startsWith('~/')) raw = path.join(MEDIA_ROOT, raw.slice(1))
   const dir = raw ? path.resolve(raw) : MEDIA_ROOT
-  if (!(dir === MEDIA_ROOT || dir.startsWith(MEDIA_ROOT + path.sep)))
+  if (!NATIVE && !(dir === MEDIA_ROOT || dir.startsWith(MEDIA_ROOT + path.sep)))
     return { ok: false, error: '只能浏览挂载目录以内' }
   let dirs = []
   try {
