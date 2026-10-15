@@ -44,7 +44,7 @@ function resolveMediaRoot() {
   if (fs.existsSync(homeMovies)) return homeMovies
   return path.join(__dirname, 'media')
 }
-const MEDIA_ROOT = resolveMediaRoot()
+let MEDIA_ROOT = resolveMediaRoot()
 const PORT = parseInt(process.argv[3] || process.env.PORT || '8090', 10)
 const UI_ROOT = __dirname
 
@@ -62,7 +62,71 @@ function containerMounts() {
   } catch (_) {}
   return out.length ? out : [MEDIA_ROOT]
 }
-const mountTip = () => '只能整理已挂载进容器的目录（当前可见：' + containerMounts().join('、') +
+/* 原生模式（Mac 版 / 将来的 Win 版）：跑在宿主机上、拥有完整文件系统权限，没有容器挂载边界。
+ * 由启动器注入环境变量识别：Mac 版设 JP_MAC=1，Win 版设 JP_NATIVE=1；
+ * 兜底：非 Linux 平台且没有 /proc/self/mountinfo 也按原生处理（NAS/Docker 是 Linux 且有 /proc，不会误判）。 */
+const NATIVE = process.env.JP_MAC === '1' || process.env.JP_NATIVE === '1' ||
+  (process.platform !== 'linux' && !fs.existsSync('/proc/self/mountinfo'))
+/* 原生模式下媒体根 = 当前已配置媒体库的共同祖先（无容器根限制）；加跨分支目录时再扩张。
+ * 这样已存在的单库用户升级后媒体根不变，已有 relVideo 不需重建。 */
+function commonAncestor(paths) {
+  const ps = (paths || []).map(p => path.resolve(String(p)).split(path.sep).filter(Boolean))
+  if (!ps.length) return null
+  let i = 0
+  while (i < ps[0].length && ps.every(pp => pp[i] === ps[0][i])) i++
+  if (i === 0) return process.platform === 'win32' ? (process.env.SystemDrive || 'C:') + path.sep : path.sep
+  const head = ps[0].slice(0, i).join(path.sep)
+  /* ⚠ Windows 盘符（2026-10-13 修）：'C:\' resolve 后拆出来只有 ['C:']，join 回去是 'C:'，
+   * 前面再无条件补 path.sep 就得到 '\C:' —— 丢了盘符、「当前盘」语义，而且这个路径根本不存在。
+   * 危害不只是少一层：MEDIA_ROOT 一旦被污染，path.relative(MEDIA_ROOT, <库内文件>) 全错位，
+   * 扫描出的 relVideo/relPoster 解不回来 → 本地媒体的封面和视频全部打不开。
+   * 判据：首段形如 'X:' 说明盘符已经带冒号，不能再补前导分隔符；
+   * 共同祖先正好停在盘符（i===1，如 C:\A 与 C:\B）时要补回尾部 path.sep，否则 'C:' 不是合法根。 */
+  if (/^[A-Za-z]:$/.test(ps[0][0])) return i === 1 ? head + path.sep : head
+  return path.sep + head
+}
+/* 媒体根「提示值」的形态校验 —— 只用于判断**存下来的**路径（scan-result.json 的 root）能不能采信，
+ * 不用于校验用户输入（用户在设置页选的真目录由 fs 存在性负责）。
+ * 起因（2026-10-13 用户报「启动失败」）：老版本 commonAncestor 的盘符 bug 曾产出 '\C:' 这种畸形值，
+ * 它被写进缓存后又当基准反哺回来，在 D 盘工作目录下 resolve 成 'D:\C:' →
+ * 启动存在性校验失败、又没有可回退的库 → process.exit(1) → 用户只看到「启动失败」一个弹窗，零线索。
+ * 合法形态：Windows = 'X:\…' 或 'X:' 或 '\\server\share\…'；POSIX = '/…'。别的一律判否。 */
+function saneRoot(v) {
+  const s = String(v == null ? '' : v).trim()
+  if (!s || s.length > 400) return ''
+  if (process.platform === 'win32') {
+    if (/^[A-Za-z]:([\\/]|$)/.test(s)) return /[:*?"<>|]/.test(s.slice(2)) ? '' : s
+    if (/^\\\\[^\\/]+[\\/][^\\/]+/.test(s)) return s
+    return ''
+  }
+  return s.charAt(0) === '/' ? s : ''
+}
+
+/* 历史媒体根提示「能不能采信」的第二个条件：它必须真的**包住所有已配置库**。
+ * 成立时说明它就是历史 relVideo 的基准（比库更浅一层），采信能让老条目不用重扫也能解析；
+ * 不成立时必须丢掉 —— 反例（2026-10-13 实测推演）：0 个媒体库时 MEDIA_ROOT 是占位根 'C:\'，
+ * 用户随后加了 D 盘的库，commonAncestor(['D:\AV','C:\']) 会跨盘回退到 'C:\'（SystemDrive），
+ * 于是库内文件的 relVideo 变成跨盘绝对路径 'D:\AV\x.mp4'，被 `fp.startsWith(MEDIA_ROOT + sep)` 挡下
+ * → 封面、视频、整理全部失效，且重启也修不好（缓存里存的还是 'C:\'）。丢了提示后
+ * commonAncestor 退回只算真实库，MEDIA_ROOT = 库本身，路径立刻正常。
+ * 0 个库时判真（空集 every 为真）—— 保留它才能让「删光库再重加同一层」不丢历史基准。 */
+function hintFits(hint, libs) {
+  if (!hint) return false
+  /* 斜杠方向与大小写都要归一（Windows）：历史数据里 'D:/x' 与配置里的 'D:\x' 是同一个目录，
+   * 不归一就会把合法基准误判成「不包含库」而丢掉（2026-10-13 测试实测踩中）。
+   * ⚠ 内层函数别起名成 norm —— 回归测试按这个标识符当锚点切源码，切到这行会让片段残缺。 */
+  const normKey = s => {
+    const t = String(s).replace(/[\\/]+$/, '').replace(/\\/g, '/')
+    return process.platform === 'win32' ? t.toLowerCase() : t
+  }
+  const h = normKey(hint)
+  if (!h) return false
+  return (libs || []).every(l => { const s = normKey(l); return s === h || s.startsWith(h + '/') })
+}
+
+const mountTip = () => NATIVE
+  ? '只能操作媒体库内的文件'
+  : '只能整理已挂载进容器的目录（当前可见：' + containerMounts().join('、') +
   '）内的文件夹。容器看不见本机路径，要整理别处的文件夹，请在 docker-compose.yml 里加一行映射到 ' +
   MEDIA_ROOT + '/子目录（如 ' + MEDIA_ROOT + '/测试），然后重建容器'
 
@@ -94,11 +158,42 @@ let CFG = (() => {
   try { return JSON.parse(txt) } catch (_) { return {} }
 })()
 let LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
+/* 上次扫描结果里记的媒体根（已过形态校验，可能不存在）—— 仅用于启动/运行时的基准推导与回退候选 */
+let HINT_ROOT = ''
+/* 原生模式：媒体根改成已配置媒体库的共同祖先（无容器挂载边界）。Mac/Win 启动器都不设容器，
+ * 这条路径在 NAS/Docker 上完全不走（NATIVE=false，MEDIA_ROOT 保持挂载根）。
+ * ⚠ 必须把「上次扫描结果的 root」也纳入共同祖先计算（v0.3.10 修复）：
+ * 只有一个深层库（如 …/刮削完毕/无码破解）时，仅对 LIBS 求共同祖先会得到该深层目录本身，
+ * 但磁盘上历史 relVideo 的基准是上一次扫描时的 MEDIA_ROOT（更浅，如 …/刮削完毕）——
+ * 于是 MEDIA_ROOT 错位一层：存在性校验直接失败导致启动退出，历史条目的封面/视频路径也全部打不开。
+ * 把 saved.root 一并纳入后，共同祖先回到正确的上一级，校验通过、旧条目也能正确解析。
+ * ⚠ 但「纳入」是有条件的：这个值必须先过 saneRoot + hintFits 两道闸（见下），
+ *   否则一个脏值/跨盘占位根就能反过来绑架 MEDIA_ROOT，把 App 卡死在启动阶段。 */
+if (NATIVE) {
+  const roots = LIBS.slice()
+  try {
+    /* 读上次扫描结果里的真实媒体根（不引依赖，直接 fs 读）。
+     * ⚠ 这个提示必须过**两道闸**：形态合法（saneRoot）+ 目录真实存在。
+     * 只过一道都不行 —— 见 saneRoot 注释：脏值会绑架整个 MEDIA_ROOT，最终把 App 卡死在启动阶段。 */
+    const saved = JSON.parse(fs.readFileSync(path.join(cacheDir(), 'scan-result.json'), 'utf8'))
+    HINT_ROOT = saneRoot(saved && saved.root)
+    if (HINT_ROOT && fs.existsSync(HINT_ROOT) && hintFits(HINT_ROOT, LIBS)) roots.push(HINT_ROOT)
+    else if (saved && saved.root) console.log('[media] 忽略不可用的媒体根提示 ' + JSON.stringify(String(saved.root)) +
+      (!HINT_ROOT ? '（路径形态非法）' : (!fs.existsSync(HINT_ROOT) ? '（目录当前不存在）' : '（不包含已配置的媒体库，会带偏媒体根）')))
+  } catch (_) {}
+  const ca = roots.length ? commonAncestor(roots)
+    : (process.env.JP_MEDIA_ROOT || (process.platform === 'win32' ? 'C:\\' : '/'))
+  if (ca) MEDIA_ROOT = ca
+}
 function writeCfg() {
   const out = Object.assign({}, CFG, { libraries: LIBS })
   const t = CFG_FILE + '.tmp'
   fs.writeFileSync(t, JSON.stringify(out, null, 2))
   fs.renameSync(t, CFG_FILE)
+  /* 配置一变，来源卡片 / 统计的 60 秒缓存立刻作废（2026-10-15）。
+     不这么做的话「刚新建的第二个账号」要等最多 1 分钟才出现在媒体源页，用户以为没加上。
+     try 包住：本函数在模块加载期也可能被调用，而 SRC_CACHE 是后面才声明的 let（TDZ）。 */
+  try { SRC_CACHE = { at: 0, data: null } } catch (_) {}
   /* 同步备份到持久化目录（失败不影响主流程） */
   try {
     const bk = cfgBackupFile()
@@ -118,50 +213,443 @@ function cacheDir() {
     || path.join(UI_ROOT, 'cache'))
 }
 
-/* ================= 海报悬停预览动图（B方案） =================
- * 实体影片（relVideo 本地文件）加入后，自动抽 **6 段 × 各 2 秒**（合计约 12s）的静音 480p mp4，
- * 6 段取自影片不同时间点，串成一条短片循环播放，存进 cache/movies/<番号>/pv6.mp4。
- * 低负担原则：单 worker 串行、任务间留 2s 间隔、扫描进行中让路、ffmpeg 走 nice -n 15。
+/* ================= 海报悬停预览动图 =================
+ * 两条来源，前端择优（2026-10-13 用户明确：只要视频切片，剧照轮播那路已删除）：
+ *   ① 真实抽帧短片：实体影片（relVideo 本地文件）加入后，用 ffmpeg 抽 **6 段 × 各 1 秒**（合计 6s）
+ *      的静音 480p mp4，6 段取自影片不同时间点，串成一条短片循环播放，存进 cache/movies/<番号>/pv7.mp4。
+ *   ② 线上动图：JavDB 官方预览片（HLS 真视频），见下面的 previewOnlineClip() —— 115 网盘片源
+ *      没有本地文件、① 走不通时靠它；一样是 6 个切片 × 各 1 秒。
+ * 低负担原则：单 worker 串行、任务间留 2s 间隔、扫描进行中让路、macOS 下 ffmpeg 走 nice -n 15。
  * 纯在线条目（relVideo 以 web:// 开头、无本地文件）不生成。
+ * ffmpeg 二进制定位见 ffBin()（Windows 上一般不在 PATH，可用 JP_FFMPEG 或程序目录下的 ffmpeg\）。
  * ⚠ 本块必须在模块顶层（不能放进 handleActorApi 等函数体内）——函数声明提升只在同作用域生效，
  *   放进函数里会导致启动时顶层调用 schedulePreviews 报 not defined。
- * ⚠ 文件名带版本（pv6 而非 preview）：抽帧参数一改就换名，旧文件自动失效、整批重生成，
+ * ⚠ 文件名带版本（pv7 而非 preview）：抽帧参数一改就换名，旧文件自动失效、整批重生成，
  *   不需要写迁移逻辑。PREV_VER 同步 bump，previews.json 里版本不匹配时触发一次性清理+重排。 */
-const PREV_FILE = 'pv6.mp4'
-const PREV_OLD_FILE = 'preview.mp4'   // v1（旧）：单段 5s，只为清理用
-const PREV_VER = 2                    // v1=单段5s / v2=6段×2s
-const PREV_SEG = 2                    // 每段秒数
-const PREV_SEGS = 6                   // 段数
+const PREV_FILE = 'pv7.mp4'
+const PREV_VER = 3                    // v1=单段5s / v2=6段×2s / v3=6段×1s
+const PREV_SEG = 1                    // 每段秒数（2026-10-13 由 2 改 1：用户要「每个切片1秒」）
+const PREV_SEGS = 6                   // 段数：一个番号 6 个切片
+/* 历史版本产物，升级时清掉（否则旧文件一直占地方、还会被 previewHas 误判成「已有预览」） */
+const PREV_STALE_FILES = ['preview.mp4', 'pv6.mp4']
 const PREV_TMP = '.pvseg'
 let PREV_QUEUE = [], PREV_RUN = false
 const PREV_SET = new Set()
-const PREV_PATH = path.join(cacheDir(), 'previews.json')
+/* ⚠ 这几个路径写成函数而不是常量：设置里的「离线数据迁移」会把 cacheDir 换掉，
+ *   常量在模块加载时就固化了 —— 迁移后还往旧目录写（旧目录已被清空 → 数据凭空多出一份）。 */
+const PREV_PATH = () => path.join(cacheDir(), 'previews.json')
 function previewHas(code) { try { return fs.existsSync(path.join(cacheDir(), 'movies', code, PREV_FILE)) } catch (_) { return false } }
 function previewLoad() {
   try {
-    const v = JSON.parse(fs.readFileSync(PREV_PATH, 'utf8'))
+    const v = JSON.parse(fs.readFileSync(PREV_PATH(), 'utf8'))
     if (v && v.v === PREV_VER && Array.isArray(v.codes)) { v.codes.forEach(c => PREV_SET.add(c)); return false }
   } catch (_) {}
   return true   // 版本不匹配 / 文件损坏 → 需要整批重做
 }
-function previewSave() { try { fs.mkdirSync(cacheDir(), { recursive: true }); fs.writeFileSync(PREV_PATH, JSON.stringify({ v: PREV_VER, codes: [...PREV_SET] })) } catch (_) {} }
-/* 版本升级的一次性清理：删掉旧版单段 preview.mp4，让这些番号重新排队 */
+function previewSave() { try { fs.mkdirSync(cacheDir(), { recursive: true }); fs.writeFileSync(PREV_PATH(), JSON.stringify({ v: PREV_VER, codes: [...PREV_SET] })) } catch (_) {} }
+/* 版本升级的一次性清理：删掉历史版本的预览文件（preview.mp4 / pv6.mp4），让这些番号重新排队 */
 function previewCleanupOld() {
   try {
     const root = path.join(cacheDir(), 'movies'); let n = 0
     for (const d of fs.readdirSync(root)) {
-      const op = path.join(root, d, PREV_OLD_FILE)
-      try { if (fs.existsSync(op)) { fs.unlinkSync(op); n++ } } catch (_) {}
+      for (const name of PREV_STALE_FILES) {
+        const op = path.join(root, d, name)
+        try { if (fs.existsSync(op)) { fs.unlinkSync(op); n++ } } catch (_) {}
+      }
     }
-    if (n) { console.log('[preview] 旧版预览已清理 ' + n + ' 个，将按 6 段×2s 重新生成'); previewSave() }
+    if (n) { console.log('[preview] 历史版本预览已清理 ' + n + ' 个，将按 6 段×1s 重新生成'); previewSave() }
   } catch (_) {}
 }
 function previewScanCodes() { const root = path.join(cacheDir(), 'movies'); const out = []; try { for (const d of fs.readdirSync(root)) { if (previewHas(d)) out.push(d) } } catch (_) {} return out }
+/* ---------- 悬停预览的可用来源与「在库番号」清单 ----------
+ * ⚠ 曾经这里有一条「剧照轮播」兜底（Windows 无 ffmpeg 时拿 cache/movies/<番号>/images/sampleNN.jpg
+ *   轮播出 6 张 × 1 秒）—— 2026-10-13 用户明确要求**不要剧照预览**，那条路已整路删除，
+ *   预览只认真视频切片：本地 ffmpeg 抽帧短片（装有 ffmpeg 时）或线上官方预览片。
+ * previewScanCodes 只回「已有本地抽帧短片 pv7.mp4」的番号；
+ * 线上那条路的地址清单见上面的预热器（PV_ONLINE / PVWARM）。
+ * 只回「当前在库」的番号，避免几千条时把 /api/previews 响应撑大。 */
+/* ---------- 悬停预览的「线上动图」来源：JavDB 官方预览片 ----------
+ * 为什么需要它：用户库里可能全是 115 网盘片源（磁盘上没有文件），这时本地 ffmpeg 抽帧那条路
+ *   一部都生不出来（genPreview 找不到本地文件就直接 return）。
+ *   （2026-10-13 用户明确：预览只要视频切片、不要剧照轮播 —— 原「剧照兜底」已整路删除。）
+ * 好在 JavDB 每部片都有官方预览片：v2/movies/<id>.preview_video_url，是 HLS + AES-128 加密，
+ *   实测 m3u8 / TS 分片 / 密钥三者都带 `Access-Control-Allow-Origin: *` —— 浏览器端 hls.js
+ *   可以直连拉流，**不需要服务端中转**（应用本来就内置 hls.light.min.js，含 AES 解密与 mpegts transmux）。
+ * 服务端只做两件事：① 按番号解析出预览片地址（签名约 3 小时有效，缓存 15 分钟）；
+ *                  ② 把 28 段 × 4 秒（整条 109 秒）的播放列表裁成「6 个切片」——
+ *                     整条太长、太费流量，裁完约 24 秒，鼠标移开前端就 destroy，实际只下载播到的部分。 */
+const PV_ONLINE = new Map()             // code(bare) -> { url, id, at, miss? }
+const PV_ONLINE_TTL = 15 * 60 * 1000
+/* 查不到的也缓存（15 分钟），否则每次鼠标划过同一张卡都要重新搜一次线上，纯浪费限频额度 */
+const PV_ONLINE_MISS_TTL = 15 * 60 * 1000
+const PV_ONLINE_ERR_TTL = 3 * 60 * 1000
+const PV_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+function pvOnlineCached(code) {
+  const key = bare(code)
+  if (!key) return null
+  const hit = PV_ONLINE.get(key)
+  if (!hit) return null
+  const ttl = hit.url ? PV_ONLINE_TTL : (hit.miss === 'err' ? PV_ONLINE_ERR_TTL : PV_ONLINE_MISS_TTL)
+  return (Date.now() - hit.at < ttl) ? hit : null
+}
+
+/* ================= 悬停预览·线上地址「预热」 =================
+ * 为什么必须有这一层（2026-10-13 实测定位）：
+ *   服务端解析一个番号的预览片要走两步线上请求（v2/search 找 id → v2/movies 取 preview_video_url），
+ *   且都过 onlineGetPaced 节流 —— 实测平均 **1.8s/个**（19 个抽样共 34s）。
+ *   而用户 hover 一张海报只停一两秒：等 hover 才开始查，画面根本来不及出来，
+ *   表现就是「库里有视频的番号悬停预览没生效」。缓存虽有 15 分钟 TTL，但用户不会去 hover 第二次。
+ * 做法：后台把「有片源的番号」的预览地址一个个查好塞进 PV_ONLINE。用户真 hover 时
+ *   /api/preview/online 命中缓存 → 毫秒级返回 → hls 立刻拉分片开播。
+ * 只查地址（m3u8 头部），**不下载任何分片** —— 分片是浏览器发现场需要的那一个才拉。
+ * 低负担：单任务串行、两task间 700ms、扫描进行中让路、开关关掉即停；结果落盘，重启后读回。
+ * 纯在线资料（relVideo 为空 / web://）不进队列 —— 那类番号没有片子，本来就不该有预览。 */
+const PV_ONLINE_WARM_FILE = () => path.join(cacheDir(), 'previews-online.json')
+/* JavDB 直链带签名，实测约 3 小时有效；落盘只收 45 分钟内的（保守），读回后按「刚查的」算 TTL */
+const PV_WARM_KEEP_MS = 45 * 60 * 1000
+let PVWARM = { on: false, timer: null, queue: [], done: 0, miss: 0, fail: 0 }
+function pvWarmSave() {
+  try {
+    const map = {}, now = Date.now()
+    for (const [k, v] of PV_ONLINE) { if (v && v.url && now - v.at < PV_WARM_KEEP_MS) map[k] = { url: v.url, id: v.id || '' } }
+    if (!Object.keys(map).length) return
+    fs.mkdirSync(cacheDir(), { recursive: true })
+    fs.writeFileSync(PV_ONLINE_WARM_FILE(), JSON.stringify({ v: 1, at: now, map }))
+  } catch (_) {}
+}
+function pvWarmLoad() {
+  try {
+    const j = JSON.parse(fs.readFileSync(PV_ONLINE_WARM_FILE(), 'utf8'))
+    if (!j || Date.now() - (j.at || 0) > PV_WARM_KEEP_MS) return 0
+    let n = 0
+    for (const k of Object.keys(j.map || {})) {
+      const r = j.map[k]
+      /* at 记成「现在」：对 pvOnlineCached 而言就是刚查回来的，15 分钟 TTL 正常生效 */
+      if (r && r.url) { PV_ONLINE.set(k, { url: r.url, id: r.id || '', at: Date.now() }); n++ }
+    }
+    if (n) console.log('[preview] 线上预览地址缓存读回 ' + n + ' 条（上次预热的结果，省一轮线上查询）')
+    return n
+  } catch (_) { return 0 }
+}
+/* 待预热的番号：有片源 + 没有新鲜缓存。按入库时间倒序 —— 用户最近在看的片子先热 */
+function pvWarmCodes() {
+  const items = (DATA && DATA.items) || []
+  const out = []
+  for (const it of items) {
+    if (!it || !it.code) continue
+    if (it.virtual) continue
+    if (!it.relVideo || /^web:\/\//i.test(it.relVideo)) continue
+    const k = bare(it.code); if (!k) continue
+    if (pvOnlineCached(k)) continue
+    out.push({ k, code: it.code, mtime: it.mtime || 0 })
+  }
+  out.sort((a, b) => b.mtime - a.mtime)
+  return out.map(x => x.code)
+}
+/* 启动/续跑预热。priorityCodes = 前端报来的「当前这一屏」，插到队首。 */
+function pvWarmStart(priorityCodes) {
+  if (!previewEnabled()) return
+  const pri = (Array.isArray(priorityCodes) ? priorityCodes : []).map(c => String(c || '').trim()).filter(Boolean)
+  if (PVWARM.on) {
+    /* 已在跑：把优先番号插到队首，别重开一轮（重开会丢掉已排的进度） */
+    if (pri.length) {
+      const have = new Set(PVWARM.queue.map(c => bare(c)))
+      const head = pri.filter(c => !have.has(bare(c)))
+      if (head.length) PVWARM.queue = head.concat(PVWARM.queue)
+    }
+    return
+  }
+  const q = pvWarmCodes()
+  if (pri.length) {
+    const seen = new Set(q.map(c => bare(c)))
+    PVWARM.queue = pri.filter(c => !seen.has(bare(c))).concat(q)
+  } else PVWARM.queue = q
+  if (!PVWARM.queue.length) return
+  PVWARM.on = true; PVWARM.done = 0; PVWARM.miss = 0; PVWARM.fail = 0
+  console.log('[preview] 线上预览地址预热开始：' + PVWARM.queue.length + ' 个番号（后台串行，不占用户操作）')
+  pvWarmPump()
+}
+function pvWarmPump() {
+  const step = () => {
+    if (!previewEnabled()) { PVWARM.on = false; PVWARM.queue = []; pvWarmSave(); console.log('[preview] 预热停止（总开关已关）'); return }
+    /* 扫描在跑就让路：扫描本身就要打线上接口刮削，两路一起打会被限频 */
+    if (SCAN.running) { PVWARM.timer = setTimeout(step, 10000); return }
+    const code = PVWARM.queue.shift()
+    if (!code) {
+      PVWARM.on = false; pvWarmSave()
+      console.log('[preview] 线上预览地址预热完成：可用 ' + PVWARM.done + '，线上无预览片 ' + PVWARM.miss + '，失败 ' + PVWARM.fail)
+      return
+    }
+    const k = bare(code)
+    if (pvOnlineCached(k)) { PVWARM.timer = setTimeout(step, 50); return }
+    previewOnlineClip(code).then(rec => {
+      if (rec && rec.url) PVWARM.done++
+      else PVWARM.miss++            // 线上确实没有这部片 / 没有预览片（已写进 PV_ONLINE 的 miss 缓存，不会再问）
+    }).catch(() => { PVWARM.fail++ })
+      .then(() => {
+        const n = PVWARM.done + PVWARM.miss + PVWARM.fail
+        /* 每 25 条落一次盘 + 每 50 条打一行进度：整库 1000+ 部要跑将近一小时，
+         * 用户中途关程序是常态 —— 不落盘的话刚查好的几十条全白费。
+         *（⚠ Windows 上 main.js 的 serverProc.kill() 走 TerminateProcess，进程收不到 SIGTERM，
+         *  所以「退出时保存」这条路不可靠，只能靠这里的定期落盘。） */
+        if (n % 25 === 0) pvWarmSave()
+        if (n % 50 === 0) {
+          console.log('[preview] 预热进度 ' + n + '/' + (n + PVWARM.queue.length) + '：可用 ' + PVWARM.done + '，线上无预览片 ' + PVWARM.miss + '，失败 ' + PVWARM.fail)
+        }
+        PVWARM.timer = setTimeout(step, 700)
+      })
+  }
+  step()
+}
+async function previewOnlineClip(code) {
+  const key = bare(code)
+  if (!key) throw new Error('缺少番号')
+  const hit = pvOnlineCached(key)
+  if (hit) return hit
+  /* 按番号搜一次拿线上 id：只认 number 完全同名的那条，宁可不给也不放错人的预览片 */
+  const s = await onlineGetPaced('v2/search?q=' + encodeURIComponent(code) + '&type=movie&page=1')
+  const list = (((s || {}).data || {}).movies) || []
+  let id = ''
+  for (const m of list) { if (bare(m.number || m.code) === key) { id = m.id || m.video_id || ''; break } }
+  if (!id && list.length === 1) id = list[0].id || list[0].video_id || ''
+  if (!id) { const rec = { url: '', id: '', at: Date.now(), miss: 'no-id' }; PV_ONLINE.set(key, rec); return rec }
+  const d = await onlineGetPaced('v2/movies/' + id)
+  const mv = (((d || {}).data || {}).movie) || {}
+  const rec = { url: String(mv.preview_video_url || ''), id, at: Date.now(), hasImages: !!(mv.has_preview_images) }
+  if (!rec.url) rec.miss = 'no-preview'
+  PV_ONLINE.set(key, rec)
+  return rec
+}
+/* 解析 m3u8 → 头部标签 + 分片表（每片带 EXTINF 时长、原始 media sequence）。
+ * 返回里多带三样，裁剪时必须用：
+ *   mediaSeq —— 原始 #EXT-X-MEDIA-SEQUENCE（实测上游给 1，不是 0）
+ *   keyLine / keyHasIV —— 原始 #EXT-X-KEY 行、以及它有没有显式 IV 属性
+ * #EXT-X-MEDIA-SEQUENCE / #EXT-X-ENDLIST / #EXT-X-DISCONTINUITY 按裁剪结果重写，先丢掉。 */
+function previewParseM3U8(text) {
+  const lines = String(text || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean)
+  const head = []
+  const segs = []
+  let inf = '', keyLine = '', keyHasIV = false, mediaSeq = 0, idx = -1
+  for (const t of lines) {
+    if (t.startsWith('#')) {
+      if (/^#EXTINF:/i.test(t)) { inf = t; continue }
+      if (/^#EXT-X-KEY:/i.test(t)) {
+        keyLine = t; keyHasIV = /[,]\s*IV\s*=/i.test(t) || /^\s*#EXT-X-KEY:\s*IV\s*=/i.test(t)
+        if (inf) continue
+        head.push(t); continue
+      }
+      if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(t)) { mediaSeq = parseInt(t.split(':')[1], 10) || 0; continue }
+      if (/^#EXT-X-(ENDLIST|DISCONTINUITY)/i.test(t)) continue
+      if (inf) continue                       // 夹在段与段之间的标签
+      head.push(t); continue
+    }
+    idx++
+    const dur = parseFloat(((inf.match(/:([\d.]+)/) || [])[1]) || '') || 0
+    segs.push({ inf: inf || '#EXTINF:4.000,', dur, uri: t, sn: mediaSeq + idx })
+    inf = ''
+  }
+  return { head, segs, keyLine, keyHasIV, mediaSeq }
+}
+/* media sequence → 128 位大端十六进制（IV 的写法就是 0x + 32 个 hex） */
+function hex128(n) {
+  const h = (Math.max(0, Math.floor(Number(n) || 0)) % 4294967296).toString(16)
+  return '00000000000000000000000000000000'.slice(0, 32 - h.length) + h
+}
+/* 裁剪 m3u8：保留头部标签，从全部切片里均匀挑 n 个，末尾补 ENDLIST。
+ * 分片与密钥都是绝对地址、且带 `Access-Control-Allow-Origin: *`，浏览器端 hls.js 直连即可。
+ *
+ * ⚠⚠ 有个不能省的坑（2026-10-13 实测确认）：上游 #EXT-X-KEY **没写 IV 属性**，而分片是 AES-128
+ *   加密的。按 RFC 8216，KEY 不带 IV 时播放器用「分片的 media sequence」当 IV —— 实测把 sn 当 IV
+ *   解出来的首块是 `47 40 00 10 00 00 b0 0d … 00 00 01 ef`（标准 PAT 包头，program_number=1、
+ *   PMT PID=0xEFFF），换成其它 IV 首块字节就变成逐片不同的乱码。
+ *   而我的裁剪**必然**要重新编号（挑的是第 1/6/11/17/22/27 片，序号不再连续），
+ *   一旦沿用「按新序号推 IV」的老规矩，每片都会解成乱码、hls.js 直接 fatal。
+ *   → 所以这里给**每个切片**单独补一条带 `IV=0x<原始 sn>` 的 #EXT-X-KEY（重复 KEY 标签是合法的，
+ *     按 RFC「生效到下一个 KEY 标签为止」）。这样无论怎么重编号都能正确解密。
+ *   返回 { list, marks, total }：marks = 每个切片在**裁剪后**播放列表里的起始秒数。 */
+function previewTrimM3U8(text, n) {
+  const { head, segs, keyLine, keyHasIV } = previewParseM3U8(text)
+  if (!segs.length) return { list: '', marks: [], total: 0 }
+  /* 末尾常有「残段」：实测 28 段的最后一段 EXTINF 只有 1.035s、体积 384 字节（等于空片），
+   * 挑到它就是一帧黑屏。按最长分片的一半为界剔除，池子太小时就不剔。 */
+  const maxDur = Math.max.apply(null, segs.map(s => s.dur || 0)) || 0
+  let pool = segs
+  if (maxDur > 0) { const keep = segs.filter(s => (s.dur || 0) >= maxDur * 0.5); if (keep.length >= 2) pool = keep }
+  let pick = pool
+  if (n > 0 && n < pool.length) {
+    pick = []
+    /* n=1 要单独处理：(n-1) 做分母会算出 NaN，一片都挑不出来 */
+    if (n === 1) pick = [pool[Math.floor((pool.length - 1) / 2)]]
+    else {
+      const seen = new Set()
+      for (let i = 0; i < n; i++) {
+        const s = pool[Math.round(i * (pool.length - 1) / (n - 1))]
+        if (s && !seen.has(s.uri)) { seen.add(s.uri); pick.push(s) }
+      }
+    }
+  }
+  const marks = []
+  let acc = 0
+  for (const s of pick) { marks.push(Math.round(acc * 1000) / 1000); acc += (s.dur || 0) }
+  /* AES-128 且原始 KEY 没写 IV → 头部那条裸 KEY 收起来，改成逐片带 IV 的版本（见上面注释） */
+  const needPerSegIV = !!keyLine && !keyHasIV && /METHOD\s*=\s*AES-128/i.test(keyLine)
+  const out = head.filter(x => !(needPerSegIV && x === keyLine))
+  out.push('#EXT-X-MEDIA-SEQUENCE:0')
+  for (const s of pick) {
+    if (needPerSegIV) out.push(keyLine + ',IV=0x' + hex128(s.sn))
+    out.push(s.inf)
+    out.push(s.uri)
+  }
+  out.push('#EXT-X-ENDLIST')
+  return { list: out.join('\n'), marks, total: Math.round(acc * 1000) / 1000 }
+}
+/* 裁剪结果缓存：播放列表里嵌的签名分片地址约 3 小时有效，这里只留 10 分钟，
+ * 既避免每次悬停都去上游取一遍，也远在签名过期之前。 */
+const PV_PL = new Map()                 // code|n -> { list, marks, total, at }
+const PV_PL_TTL = 10 * 60 * 1000
+async function previewOnlinePlaylist(code, n) {
+  const key = bare(code)
+  if (!key) throw new Error('缺少番号')
+  const ck = key + '|' + n
+  const hit = PV_PL.get(ck)
+  if (hit && Date.now() - hit.at < PV_PL_TTL) return hit
+  const clip = await previewOnlineClip(code)
+  if (!clip || !clip.url) {
+    const e = new Error(clip && clip.miss === 'no-id' ? '线上没有这部片（番号对不上，或线上还没收录）' : '这部片线上没有预览片')
+    e.pvMiss = true
+    throw e
+  }
+  let lastErr = null
+  for (let i = 0; i < 2; i++) {
+    try {
+      const rs = await fetch(clip.url, { headers: { 'User-Agent': PV_UA, Accept: '*/*' } })
+      if (!rs.ok) throw new Error('预览片播放列表取回 HTTP ' + rs.status)
+      const t = previewTrimM3U8(await rs.text(), n)
+      if (!t.list) throw new Error('预览片播放列表为空')
+      const rec = { list: t.list, marks: t.marks, total: t.total, id: clip.id, at: Date.now() }
+      PV_PL.set(ck, rec)
+      return rec
+    } catch (e) {
+      lastErr = e
+      /* 首次失败重试一次：boot 期头像回填会打满 socket，实测偶发 `fetch failed`（瞬时） */
+      if (i === 0) await new Promise(r => setTimeout(r, 500))
+    }
+  }
+  throw lastErr || new Error('取预览片失败')
+}
 /* 总开关：设置 → 偏好「生成海报悬停预览」（uiPrefs.hpreview，值是字符串 '0'/'1'）。没设置过 = 开。
  * 关掉后只是「不再生成新的」，已生成的 pv6.mp4 原地保留 —— 用户重新打开开关立刻恢复显示。 */
 function previewEnabled() {
   try { const u = CFG && CFG.uiPrefs; if (!u) return true; const v = u.hpreview; return !(v === '0' || v === 0 || v === 'false') } catch (_) { return true }
 }
+
+/* ---------- 抽帧输入源：本地文件 / 115 网盘（2026-10-13 新增 115 那条） ----------
+ * 115 为什么走**本机** /media/ 这一跳、而不是把 CDN 直链直接交给 ffmpeg：
+ *   · 服务端这一跳已经带 Cookie 处理 302 转发、Range 透传、风控节流与罚则退避，
+ *     直链逻辑只有这一处，不必在抽帧链路里再复刻一遍签名与过期处理；
+ *   · ffmpeg 只 Range 读它真要的那几段（每段 1 秒），**6.8GB 的 4K 片也不用整部下载**
+ *     （实测：ffprobe 取时长 2s、单段抽帧 3s、一部 6 段约 20s）；
+ *   · CDN 直链带签名、几小时就过期，**绝不能存下来复用** —— 每部现取现用。
+ * ⚠ 硬依赖 ffmpeg 的 --enable-network：resources\app\ffmpeg\ 放的是静态版（含 http/https）。
+ *   若被换回旧的 --disable-network 构建，会直接报 "Protocol not found"。
+ * ⚠ 115 抽帧**单独一个开关**（uiPrefs.pvNet，默认关）：它消耗 115 流量（每部约 20MB），
+ *   不能跟着「悬停预览」总开关默认打开。 */
+function encMediaRel(rel) {
+  return encodeURI(String(rel)).replace(/#/g, '%23').replace(/\?/g, '%3F')
+}
+function previewNetEnabled() {
+  try {
+    const u = CFG && CFG.uiPrefs
+    if (!u) return false
+    const v = u.pvNet
+    return v === '1' || v === 1 || v === true || v === 'true'
+  } catch (_) { return false }
+}
+function previewSource(it) {
+  const rel = String((it && it.relVideo) || '')
+  if (!rel || /^web:\/\//i.test(rel)) return null
+  if (v115Rel(rel)) {
+    if (!previewNetEnabled()) return null      // 耗 115 流量，必须用户显式开
+    if (!v115PickOf(rel)) return null          // 没有 pickcode 就取不到直链
+    return 'http://127.0.0.1:' + PORT + '/media/' + encMediaRel(rel)
+  }
+  /* WebDAV / 光鸭暂不放行：它们走 davServe 那套代理，行为还没在抽帧这条路上验证过。
+   * ⚠ 判据用 davRel()：多账号前缀是 'dav@2:/' / 'gy@2:/'，老正则 /^(dav|gy):/ 会漏。 */
+  if (davRel(rel)) return null
+  /* 本地媒体库：必须磁盘上真实存在、读得到 */
+  let fp = null
+  try { fp = safeMediaPath(rel) } catch (_) { fp = null }
+  return (fp && fs.existsSync(fp)) ? fp : null
+}
+/* 一次运行最多抽几部 115 片源：每部约读 20MB、且要过 115 风控，默认保守。
+ * 跑满就停，下次启动/重扫再续 —— 别让它一口气把整库 1300+ 部撞一遍。
+ * 可用 JP_PVNET_MAX 环境变量临时收放（调试时设 1 只跑一部验证用）。 */
+const PV_NET_MAX_PER_RUN = Math.max(1, parseInt(process.env.JP_PVNET_MAX || '30', 10) || 30)
+
+/* ---------- ffmpeg / ffprobe 二进制定位 ----------
+ * macOS 上靠 Homebrew 装进 PATH；Windows 上一般没有 → 整条抽帧链路（悬停预览、进度条缩略图）
+ * 静默失效，日志只有一行「未检测到 ffmpeg/ffprobe」。这里补上可配置的定位：
+ *   ① 环境变量 JP_FFMPEG / JP_FFPROBE（目录或 exe 全路径都认）
+ *   ② 设置里手填的 uiPrefs.ffmpegPath
+ *   ③ 程序目录下的 ffmpeg\ —— 即 resources\app\ffmpeg\ffmpeg.exe（便携版放这里最省事）
+ *   ④ 都找不到就交回裸名字走 PATH（找不到会 ENOENT，由 FFMPEG_OK 三态兜住，不会反复空转）
+ * 结果按名字缓存，找到与否都只 stat 几次。 */
+const FF_BIN_CACHE = {}
+function ffBin(name) {
+  if (FF_BIN_CACHE[name]) return FF_BIN_CACHE[name]
+  const ext = process.platform === 'win32' ? '.exe' : ''
+  const inDir = d => { try { const p = path.join(d, name + ext); return fs.existsSync(p) ? p : '' } catch (_) { return '' } }
+  const probe = v => {
+    const s = String(v || '').trim()
+    if (!s) return ''
+    let st = null
+    try { st = fs.statSync(s) } catch (_) { return '' }
+    if (st.isDirectory()) return inDir(s)
+    /* 给的是文件：basename 同名就直接用，否则退到同目录里找 */
+    return path.basename(s).replace(/\.[^.]*$/, '').toLowerCase() === name ? s : inDir(path.dirname(s))
+  }
+  let hit = probe(process.env['JP_' + name.toUpperCase()])
+  /* 两个二进制永远同目录：用户只设了 JP_FFMPEG 时，ffprobe 也从那儿推导，
+   * 否则 FFMPEG_OK = ff && fp 恒为 false，抽帧链路照样起不来（踩过）。 */
+  if (!hit && name !== 'ffmpeg') hit = probe(process.env.JP_FFMPEG)
+  if (!hit) hit = probe((CFG && CFG.uiPrefs || {}).ffmpegPath)
+  if (!hit) { const p = path.join(path.dirname(UI_ROOT), 'ffmpeg', name + ext); if (fs.existsSync(p)) hit = p }
+  FF_BIN_CACHE[name] = hit || name
+  return FF_BIN_CACHE[name]
+}
+/* ⚠️ ffmpeg/ffprobe 可用性探测（2026-10-10 加，治「播放卡住」）。
+ * 现象：本机没装 ffmpeg，genPreview 对每部片子 execFile('ffprobe') 立刻 ENOENT，
+ *   但那 1279 次进程启动**每次都在抢 CloudDrive/FUSE 的 I/O 通道**，
+ *   而每部失败后还要 setTimeout 2000 再排下一部 → 空转约 43 分钟，
+ *   表现就是「看着视频却卡住不动」，还把日志刷成几百条「取时长失败」。
+ * 现在：FFMPEG_OK 三态（null=还没探 / false=确认没有 / true=可用）。
+ *   探到 false 就整条队列不启动，并打一行明确原因，不做任何无用的进程启动。*/
+let FFMPEG_OK = null
+let FFMPEG_PROBING = false
+function probeFfmpeg() {
+  if (FFMPEG_OK !== null) return FFMPEG_OK
+  if (FFMPEG_PROBING) return null            // 已在探，别重复 fork
+  FFMPEG_PROBING = true
+  let ff = false, fp = false, pending = 2
+  const done = () => {
+    if (--pending > 0) return
+    FFMPEG_OK = ff && fp
+    FFMPEG_PROBING = false
+    if (FFMPEG_OK) {
+      console.log('[preview] ffmpeg/ffprobe 可用，开始生成预览')
+      /* 探测是异步的：调用 schedulePreviews 的那一次已经 return 了，这里补一次，
+       * 否则「启动瞬间探测还没回」就永远不再入队，预览永远不生成。*/
+      try { schedulePreviews() } catch (_) {}
+    } else {
+      console.log('[preview] 未检测到 ffmpeg/ffprobe：跳过「本地抽帧短片」，悬停预览走「线上官方预览片」这条（真视频切片、按需才拉，不受影响）。')
+      console.log('[preview] 想让本地片源也生成真实画面短片：把 ffmpeg.exe/ffprobe.exe 放进 resources\\app\\ffmpeg\\，或设 JP_FFMPEG 环境变量指向它，再重启程序。')
+    }
+  }
+  execFile(ffBin('ffmpeg'), ['-version'], { timeout: 8000 }, err => { ff = !err; done() })
+  execFile(ffBin('ffprobe'), ['-version'], { timeout: 8000 }, err => { fp = !err; done() })
+  return null   // 还在探，本次调用方先跳过
+}
+
 function enqueuePreview(code) {
   if (!previewEnabled()) return
   code = bare(code); if (!code) return
@@ -171,8 +659,36 @@ function enqueuePreview(code) {
 }
 function schedulePreviews() {
   if (!previewEnabled()) return
+  /* ⚠ 线上预览地址预热必须放在下面的 FFMPEG 探测**之前**：两者互不相干 ——
+   * Windows 上一般没有 ffmpeg（本地抽帧那条路整个停摆），但「线上官方预览片」这条路照样得走，
+   * 而它才是 Windows 上唯一能出画面的悬停预览来源。放后面会被 FFMPEG_OK!==true 直接 return 挡掉。 */
+  try { pvWarmStart() } catch (_) {}
+  /* 缺 ffmpeg 就不排：一部下都别试，省得白抢 I/O 还刷日志 */
+  if (FFMPEG_OK !== true) { probeFfmpeg(); return }
   const items = (DATA && DATA.items) || []
-  for (const it of items) { if (it && it.relVideo && !/^web:\/\//i.test(it.relVideo)) enqueuePreview(it.code) }
+  /* 入队判据统一交给 previewSource()，它一次兜住三种情况：
+   *   · 本地媒体库文件 → 磁盘上真存在才收；
+   *   · 115 网盘条目   → 开关（uiPrefs.pvNet）开着 + 有 pickcode 才收，输入给的是本机代理 URL；
+   *   · web:// / 光鸭 / WebDAV / 没片源 → 一律不收。
+   * ⚠️ 这里和前端 hasLocalVideo / pvWarmCodes 的口径**故意不同**，别去「统一」：
+   *   那两个判「能不能播」（115 也算有片源，该去拉线上预览片）；这里判「能不能抽到帧」。
+   *   曾经这里只判 `!web://`，装了 ffmpeg 后会把整库 115 全排进去空转 44 分钟、产出为零。
+   * ⚠️ 115 那条**每次运行限量**（PV_NET_MAX_PER_RUN）：每部约读 20MB 且要过 115 风控，
+   *   一口气把整库 1300+ 部排进去既伤流量又容易触发风控。跑满就停，下次启动/重扫再续。 */
+  let netQueued = 0
+  for (const it of items) {
+    if (!it || it.virtual) continue
+    const code = bare(it.code)
+    if (!code || previewHas(code) || PREV_SET.has(code)) continue   // 已经有片子了，不占配额
+    const src = previewSource(it)
+    if (!src) continue
+    if (v115Rel(it.relVideo)) {
+      if (netQueued >= PV_NET_MAX_PER_RUN) continue
+      netQueued++
+    }
+    enqueuePreview(code)
+  }
+  if (netQueued) console.log('[preview] 本轮排入 115 云盘片源 ' + netQueued + ' 部（单次上限 ' + PV_NET_MAX_PER_RUN + '，每部约读 20MB）')
 }
 function hprvPump() {
   if (PREV_RUN) return
@@ -181,6 +697,10 @@ function hprvPump() {
     if (!PREV_QUEUE.length) { PREV_RUN = false; return }
     /* 开关关掉 → 丢掉未开始的队列（正在跑的那部让它跑完，避免留半成品文件） */
     if (!previewEnabled()) { PREV_QUEUE = []; PREV_RUN = false; console.log('[preview] 开关已关闭，停止排队生成'); return }
+    /* ⚠️ 这里也要挡一道：schedulePreviews 探测未完成时已 return，但队列可能是在
+       探测生效前入好的（或用户中途装的 ffmpeg）。确认缺二进制就别再空转了。 */
+    if (FFMPEG_OK === false) { PREV_QUEUE = []; PREV_RUN = false; console.log('[preview] ffmpeg 不可用，已清空预览队列（不影响播放）'); return }
+    if (FFMPEG_OK === null) { setTimeout(() => { if (FFMPEG_OK === true) step(); else { PREV_QUEUE = []; PREV_RUN = false } }, 3000); return }
     if (SCAN.running) { setTimeout(step, 15000); return }
     const code = PREV_QUEUE.shift()
     if (previewHas(code) || PREV_SET.has(code)) { setTimeout(step, 300); return }
@@ -202,8 +722,8 @@ function hprvStarts(d) {
 /* 跑一条 ffmpeg，macOS 没有 nice 时自动回退裸 ffmpeg（args 必须原样传下去） */
 function hprvRun(args, to, cb) {
   const attempt = useNice => {
-    const cmd = useNice ? 'nice' : 'ffmpeg'
-    const a = useNice ? ['-n', '15', 'ffmpeg'].concat(args) : args
+    const cmd = useNice ? 'nice' : ffBin('ffmpeg')
+    const a = useNice ? ['-n', '15', ffBin('ffmpeg')].concat(args) : args
     execFile(cmd, a, { timeout: to, killSignal: 'SIGKILL' }, err => {
       if (err && err.code === 'ENOENT' && useNice) return attempt(false)
       cb(err || null)
@@ -215,8 +735,16 @@ function genPreview(code) {
   return new Promise(res => {
     const it = (DATA && DATA.items || []).find(x => bare(x.code) === code && x.relVideo && !/^web:\/\//i.test(x.relVideo))
     if (!it) return res()
-    const video = safeMediaPath(it.relVideo)
-    if (!video || !fs.existsSync(video)) return res()
+    /* previewSource 返回：本地磁盘路径 / 115 的本机代理 URL / null（抽不了就别白启动进程） */
+    const video = previewSource(it)
+    if (!video) return res()
+    const viaNet = v115Rel(it.relVideo)
+    /* ⚠️ starts 必须提到 done() 也能看见的外层（done 里要用 starts.length 打日志）。
+     * 2026-10-13 之前它声明在 startBuild() 内部，于是**第一次真正生成成功时**
+     * console.log 抛 ReferenceError → 紧跟其后的 res() 不执行 → Promise 永不 resolve
+     * → hprvPump 的 then 不触发 → **抽帧队列永久卡死**。
+     * 以前从没成功过（没 ffmpeg、也没有本地文件可抽）所以这个雷一直没响。 */
+    let starts = []
     const dir = path.join(cacheDir(), 'movies', code)
     const out = path.join(dir, PREV_FILE)
     const tmp = path.join(dir, PREV_TMP)
@@ -224,11 +752,11 @@ function genPreview(code) {
       try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (_) {}
       if (ok && fs.existsSync(out) && fs.statSync(out).size >= 8000) {
         PREV_SET.add(code); previewSave()
-        console.log('[preview] ✓ ' + code + ' 6 段×2s 已生成 (' + fs.statSync(out).size + 'B)')
+        console.log('[preview] ✓ ' + code + ' ' + starts.length + ' 段×' + PREV_SEG + 's 已生成 (' + fs.statSync(out).size + 'B)' + (viaNet ? ' [115 代理]' : ''))
       } else { try { fs.unlinkSync(out) } catch (_) {} }
       res()
     }
-    execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', video], { timeout: 30000 }, (e, so) => {
+    execFile(ffBin('ffprobe'), ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', video], { timeout: 30000 }, (e, so) => {
       const dur = parseFloat(String(so || ''))
       if (!e && isFinite(dur) && dur > PREV_SEG) return startBuild(dur)
       console.log('[preview] ✗ ' + code + ' 取时长失败/过短，跳过')
@@ -236,7 +764,7 @@ function genPreview(code) {
     })
 
     function startBuild(dur) {
-      const starts = hprvStarts(dur)
+      starts = hprvStarts(dur)
       try { fs.mkdirSync(tmp, { recursive: true }) } catch (_) {}
       const segs = []
       const step = i => {
@@ -259,7 +787,7 @@ function genPreview(code) {
         try {
           fs.writeFileSync(list, segs.map(s => "file '" + s.split("'").join("'\\''") + "'").join('\n'))
         } catch (_) { return done(false) }
-        execFile('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', out],
+        execFile(ffBin('ffmpeg'), ['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', out],
           { timeout: 120000, killSignal: 'SIGKILL' }, err => {
             if (err) { console.log('[preview] ✗ ' + code + ' 拼接失败: ' + String(err.message).slice(0, 120)) }
             done(!err)
@@ -432,7 +960,7 @@ const onNorm = s => String(s || '').toLowerCase().replace(/[\s\u3000・·,，、
 const onKana = s => String(s || '').replace(/[\u30a1-\u30f6]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
 const onNmSplit = s => { const m = String(s || '').match(/^([^\u3040-\u30ff]+)([\u3040-\u30ff]+)$/); return m ? [m[1], m[2]] : null }
 const onSurOf = s => { const m = String(s || '').match(/^([^\u3040-\u30ff]+)/); return m ? m[1] : '' }
-async function onlineActorFind(name) {
+async function onlineActorFind(name, { fallback = false } = {}) {
   const n = onNorm(name)
   if (!n) return null
   const j = await onlineGet('v2/search?q=' + encodeURIComponent(name) + '&type=actor&page=1')
@@ -441,7 +969,12 @@ async function onlineActorFind(name) {
     const names = [a.name, a.name_zht, a.other_name].filter(Boolean).join(',')
     for (const x of String(names).split(',')) if (x && onNorm(x) === n) return a
   }
-  return list[0] || null
+  /* ⚠ 2026-10-13：默认**不再**兜底取 list[0]。名册间隔采样 25 人里有 4 人搜不到精确同名
+   * （占有效结果 21%），兜底会把「松井優子」变成「篠田優」（2310 部）、「七ツ森りり」变成
+   * 「七森莉莉」（160 部）—— 界面于是把**另一个人的全部作品**当成她列出来。
+   * 锁人一律用 onlineActorExact（同名 → 姓同+名部=别名 → 详情全量别名+异体字，三步）；
+   * 确实需要「宁可错也别空手」的场景请显式传 { fallback: true }。 */
+  return fallback ? (list[0] || null) : null
 }
 /* JavDB 线上作为多源刮削的一个源（id = javdb）
  * 不走 HTML，直接用移动端 API（国内直连线路）：封面 / 剧照 / 元数据 / 评分齐全。
@@ -453,6 +986,11 @@ async function onlineScrapeSource(code) {
   const terms = [q]
   const fc2 = q.match(/^FC2[-_ ]?(.+)$/i)
   if (fc2) terms.push(fc2[1])                    // FC2 番号线上搜索常要剥掉前缀
+  /* 番号已是 mdc 式基础码（如 GOJU-317 / GL-014），无 -U / -cdN 后缀，无需再退回基础码。 */
+  /* 后缀码（破解 -U / 碟片 -cdN）在原站可能只有基础码条目：先试全码，搜不到再退回基础码。
+   * 例如 GOJU-317-U → 退回 GOJU-317；GL-014-cd2 → 退回 GL-014。避免正确识别的后缀码直接 404。 */
+  const baseM = q.match(/^([A-Z0-9]{2,10})-(\d{2,7})(-U|-CD\d+)+$/i)
+  if (baseM) terms.push(baseM[1] + '-' + baseM[2])
   for (const term of terms) {
     const j = await onlineGet('v2/search?q=' + encodeURIComponent(term) + '&type=movie&page=1').catch(() => null)
     const list = ((j || {}).data || {}).movies || []
@@ -581,6 +1119,16 @@ function watchRatio(r) { return r && r.d > 0 ? Math.min(1, (r.done ? r.d : r.p) 
  * 万一口令忘了：编辑 server-config.json 删掉 "accessCode" 那一行再重启即可。 */
 const ACCESS_CODE = () => String(CFG.accessCode || '').trim()
 const accessToken = () => crypto.createHash('sha256').update('javpaco:' + ACCESS_CODE()).digest('hex').slice(0, 32)
+/* 这个请求是不是「从本机发出来的」。
+ * ⚠ 绝对不能拿 Host 头来判断！Host 是客户端随便填的字符串 —— 局域网里任何人发一个
+ *   `Host: localhost` 就能冒充本机，跳过访问口令，把 /api/* /media/* /cache/* /thumb/* 全部拿到手。
+ * 只认 TCP 层的对端地址（remoteAddress），那是内核填的、伪造不了。 */
+function isLocalReq(req) {
+  try {
+    const a = String((req.socket && (req.socket.remoteAddress || req.connection && req.connection.remoteAddress)) || '')
+    return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1'
+  } catch (_) { return false }
+}
 function hasAccess(req, p) {
   if (!ACCESS_CODE()) return true
   if (p === '/login' || p === '/api/login' || p === '/favicon.ico') return true
@@ -616,6 +1164,133 @@ function udSaveSoon() {
     try { fs.writeFileSync(t, JSON.stringify(UD, null, 1)); fs.renameSync(t, UD_FILE) }
     catch (e) { console.error('[userdata] 写入失败', e.message) }
   }, 800)
+}
+
+/* ================= 网盘死链检测（2026-10-15） =================
+ * 需求：库里躺着上千部网盘片，分享失效 / 文件被删后条目还在，点开才发现看不了。
+ *
+ * ⚠ 风控是这里的头号约束，所以**绝不对每个文件单独发请求**：
+ *   ① 本地文件 —— fs.existsSync，零请求、零风险。
+ *   ② 网盘（光鸭 / WebDAV）—— 按「要列的目录」聚合，**一个目录只列一次**。
+ *      光鸭实测是一部片一个目录（1050 部散在 996 个目录），但它们的父目录是同一个
+ *      （gy:/测试/KIMR-006/xxx.mp4 → 父目录都挂在 gy:/测试 下）→ 列 1 次就能验完近千部。
+ *      判据：路径深度 ≥2 时验「所在目录还在不在」；深度 1（文件直接在根）时验文件名。
+ *   ③ 115 —— 没有目录 id 可用，只能按 pickcode 取直链；条目数超过 DL_115_MAX 就跳过不去撞风控。
+ * 全程只列目录、不下载任何字节，也不逐个取直链（get_res_download_url 每次都算风控配额）。 */
+const DL_FILE = path.join(UI_ROOT, 'deadlink.json')
+const DL_115_MAX = 60            // 115 逐个取直链的上限
+let DL = { running: false, at: 0, total: 0, done: 0, dead: [], err: '', cancel: false, note: '' }
+try {
+  const d = JSON.parse(fs.readFileSync(DL_FILE, 'utf8'))
+  if (d && Array.isArray(d.dead)) DL.at = d.at || 0, DL.dead = d.dead, DL.note = d.note || ''
+} catch (_) {}
+function dlSave() {
+  const t = DL_FILE + '.tmp'
+  try { fs.writeFileSync(t, JSON.stringify({ at: DL.at, dead: DL.dead, note: DL.note })); fs.renameSync(t, DL_FILE) }
+  catch (e) { console.error('[deadlink] 写入失败', e.message) }
+}
+const dlLabel = rel => {
+  if (v115Rel(rel)) return '115'
+  const sp = davSplitRel(rel)
+  if (!sp) return '本地'
+  return (sp.kind === 'guangya' ? '光鸭' : 'WebDAV') + (sp.n > 1 ? '（账号 ' + sp.n + '）' : '')
+}
+async function dlScan() {
+  if (DL.running) return { ok: false, error: '已经在检测中了' }
+  DL.running = true; DL.cancel = false; DL.err = ''; DL.dead = []; DL.done = 0; DL.note = ''
+  const items = (DATA && Array.isArray(DATA.items) ? DATA.items : []).filter(x => String(x.relVideo || ''))
+  DL.total = items.length
+  const dead = []
+  /* ① 本地：零请求 */
+  const netItems = []
+  for (const it of items) {
+    const rel = String(it.relVideo || '')
+    if (v115Rel(rel) || davRel(rel)) { netItems.push(it); continue }
+    if (/^web:\/\//i.test(rel)) continue              // 纯线上条目没有本地文件可验
+    let fp = null
+    try { fp = safeMediaPath(rel) } catch (_) { fp = null }
+    if (!fp || !fs.existsSync(fp)) dead.push({ code: it.code || '', rel, src: '本地', why: '文件已不在磁盘上' })
+  }
+  DL.done += items.length - netItems.length
+  /* ② 网盘：按「要列的目录」聚合 */
+  const groups = new Map()
+  const w115 = []
+  for (const it of netItems) {
+    const rel = String(it.relVideo || '')
+    if (v115Rel(rel)) { w115.push(it); continue }
+    const sp = davSplitRel(rel)
+    if (!sp) continue
+    const segs = String(sp.p || '').split('/').filter(Boolean)
+    if (!segs.length) continue
+    /* 深度 ≥2：验「所在目录」在不在（光鸭一部片一个目录，验目录即验片子）；
+       深度 1：文件直接挂在根下，只能验文件名。 */
+    const wantDir = segs.length >= 2
+    const listDir = wantDir ? segs.slice(0, -2).join('/') : ''
+    const name = wantDir ? segs[segs.length - 2] : segs[0]
+    if (!name) continue
+    const k = sp.kind + '|' + sp.n + '|' + listDir
+    let g = groups.get(k)
+    if (!g) { g = { kind: sp.kind, n: sp.n, dir: listDir, checks: [] }; groups.set(k, g) }
+    g.checks.push({ it, name, wantDir })
+  }
+  /* ③ 115：逐个取直链（有上限，超了只提示不去撞风控） */
+  if (w115.length > DL_115_MAX) {
+    DL.note = '115 网盘有 ' + w115.length + ' 部，逐个取直链会撞风控 —— 已跳过（上限 ' + DL_115_MAX + ' 部）。要验请直接重扫媒体库。'
+  } else {
+    for (const it of w115) {
+      if (DL.cancel) break
+      DL.done++
+      const rel = String(it.relVideo || '')
+      try {
+        const r = await v115DownURLByApi(String(it.pick || ''), (v115RelParse(rel) || {}).n || 1)
+        if (!r || !r.url) dead.push({ code: it.code || '', rel, src: '115', why: '取不到播放直链' })
+      } catch (e) {
+        const m = String((e && e.message) || e || '')
+        dead.push({
+          code: it.code || '', rel, src: '115',
+          why: /登录|Cookie|失效|401|403/i.test(m) ? '115 登录已失效（重新填 Cookie 再验）' : '取直链失败：' + m.slice(0, 60)
+        })
+      }
+      await new Promise(r => setTimeout(r, 250))       // 别打太急
+    }
+  }
+  /* ④ 列目录：一个目录一次请求 */
+  let dirErr = ''
+  for (const g of groups.values()) {
+    if (DL.cancel) break
+    let list = null
+    try { list = await davList(g.kind, g.dir, true, g.n) }
+    catch (e) {
+      dirErr = String((e && e.message) || e || '')
+      /* 列不出来 ≠ 文件没了：可能是登录过期 / 网络抖动。整组标「未知」而不是判死。 */
+      g.checks.forEach(c => dead.push({
+        code: (c.it.code || ''), rel: String(c.it.relVideo || ''), src: dlLabel(c.it.relVideo),
+        why: '无法确认（' + dirErr.slice(0, 70) + '）', unsure: true
+      }))
+      DL.done += g.checks.length
+      continue
+    }
+    const byName = new Map()
+    ;(list || []).forEach(f => byName.set(String(f.name || '').trim(), !!f.isDir))
+    for (const c of g.checks) {
+      DL.done++
+      const hit = byName.has(c.name) && (c.wantDir ? byName.get(c.name) === true : byName.get(c.name) === false)
+      if (!hit) {
+        dead.push({
+          code: c.it.code || '', rel: String(c.it.relVideo || ''), src: dlLabel(c.it.relVideo),
+          why: c.wantDir ? '网盘上已没有这个目录（文件多半被删了）' : '网盘上已没有这个文件'
+        })
+      }
+    }
+    await new Promise(r => setTimeout(r, 250))         // 目录之间留点间隔，稳一点
+  }
+  DL.dead = dead
+  DL.at = Date.now()
+  DL.running = false
+  if (DL.cancel) DL.note = (DL.note ? DL.note + ' ' : '') + '已手动停止，结果不完整'
+  dlSave()
+  console.log('[deadlink] 检测完成：' + DL.total + ' 部，失效 ' + dead.length + ' 部')
+  return { ok: true, total: DL.total, dead: dead.length }
 }
 
 /* 字幕统一转 WebVTT：浏览器 <track> 只认 vtt。srt 换时间戳分隔符即可，ass/ssa 抽 Dialogue 行重排。 */
@@ -770,10 +1445,32 @@ function getSourcesData() {
 }
 
 if (!fs.existsSync(MEDIA_ROOT)) {
-  console.error(`[错误] 媒体目录不存在: ${MEDIA_ROOT}`)
-  console.error(`用法: node server.js <媒体文件夹路径> [端口]`)
-  console.error(`或者把路径写进 nexdex-ui/media-path.txt（每行一个路径）后直接运行 node server.js`)
-  process.exit(1)
+  /* 媒体根不存在时**不再直接退出**，按顺序回落到：① 真实存在的已配置库 ② 合法的历史基准提示
+   * ③ JP_MEDIA_ROOT ④ 系统盘根 / 家目录；全都没有才报错退出。
+   * 起因（2026-10-13 用户报「启动失败」）：缓存里存了脏基准 → 算出的媒体根不存在 → 又没有任何库可回退 →
+   * 一键 exit(1)，用户只有一个弹窗、连「去设置页把目录指回来」的机会都没有。
+   * 而「0 个媒体库」时媒体根本来只是个相对路径基准（扫描按 LIBS 走，不会去爬整盘），
+   * 没有理由为了它把整个 App 拦在门外。 */
+  const cands = LIBS.concat([HINT_ROOT])
+  let fallback = cands.find(p => { try { return !!p && fs.existsSync(p) } catch (_) { return false } })
+  if (!fallback && process.env.JP_MEDIA_ROOT) { try { if (fs.existsSync(process.env.JP_MEDIA_ROOT)) fallback = process.env.JP_MEDIA_ROOT } catch (_) {} }
+  if (!fallback) {
+    const sysRoot = process.platform === 'win32' ? ((process.env.SystemDrive || 'C:') + path.sep) : '/'
+    try { if (fs.existsSync(sysRoot)) fallback = sysRoot } catch (_) {}
+  }
+  if (!fallback) {
+    try { if (fs.existsSync(os.homedir())) fallback = os.homedir() } catch (_) {}
+  }
+  if (fallback) {
+    console.error(`[警告] 媒体目录不存在: ${MEDIA_ROOT}，已回退到: ${fallback}` +
+      (LIBS.length ? '' : '（当前没有配置任何媒体库 —— 请在「添加影片 → 视频目录」里添加真正的媒体目录）'))
+    MEDIA_ROOT = fallback
+  } else {
+    console.error(`[错误] 媒体目录不存在: ${MEDIA_ROOT}`)
+    console.error(`用法: node server.js <媒体文件夹路径> [端口]`)
+    console.error(`或者把路径写进 nexdex-ui/media-path.txt（每行一个路径）后直接运行 node server.js`)
+    process.exit(1)
+  }
 }
 
 const VIDEO_EXT = ['mp4', 'mkv', 'webm', 'mov', 'm4v', 'avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg']
@@ -812,6 +1509,1920 @@ function offlineCodeDir(code, item) {
 }
 const extOf = n => (path.extname(n).slice(1) || '').toLowerCase()
 const baseOf = n => path.basename(n, path.extname(n))
+
+/* ================= 115 网盘来源（Cookie 直连 webapi） =================
+ * 需求：把 115 网盘上的片子当作媒体库来源，播放走 115 的 302 直链。
+ *
+ * 设计要点（改这段前先读完）：
+ *  1) 配置存 CFG.pan115 = { cookie, savepath, cid, cidName, timeout, roots:[{cid,name,path}], linkTpl }，
+ *     落 server-config.json；其中 cookie / savepath / cid / cidName / timeout 与「115 离线推送」共用一份，
+ *  2) 条目 relVideo 统一用虚拟前缀 `115:/<115内路径>`，如 `115:/我的资源/无码/IPX-123.mp4`。
+ *     这个前缀不会和真实磁盘路径冲突（Windows 路径不可能出现 `:/`），
+ *     且 `relVideo.split('/').pop()` 取文件名依然正确 —— 下游那套「像路径一样用」的代码零改动；
+ *  3) pickcode 是 115 取直链的唯一凭据：扫描时随条目写进 `pick` 字段（落 scan-result.json），
+ *     播放时按 relVideo 反查 V115_MAP 拿 pick（重启后由扫描结果重建，见 rebuildV115Map）；
+ *  4) 播放**不直连**：`/media/115:/…` 在路由层拦下来，服务端带 Cookie 取 302 真链后
+ *     代理转发 Range 流。这样 <video> 不必满足 115 CDN 的 UA / Referer 校验，
+ *     拖动进度条也正常（与 mvStreamUpstream 同一套思路）。
+ *
+ * ⚠ 走的是 115 网页版非公开接口（与 AList / 115drive-webdav 同源），**不是**官方开放平台。
+ *   Cookie 失效要在设置页重贴；接口若改版，日志里会打印原始响应（[115] 前缀）便于定位。
+ */
+const V115_PREFIX = '115:/'
+/* ---- 多账号（2026-10-14）----
+ * 账号 1 = CFG.pan115（离线推送共用，保持原样 → 存量 relVideo `115:/…` 零迁移）；
+ * 账号 N（≥2）= CFG.pan115x[N-2]，relVideo 前缀 `115@N:/…`。
+ * 前缀里带账号号 → 同名路径在两个账号间不会撞车；V115_MAP 直接拿整个 vpath 当键，下游零改动。 */
+const v115Pref = n => { n = parseInt(n, 10) || 1; return n > 1 ? ('115@' + n + ':/') : V115_PREFIX }
+const V115_REL_RE = /^115(?:@(\d+))?:\//i
+/* '115@2:/AV/x.mp4' → { n:2, p:'AV/x.mp4' }；不是 115 前缀 → null */
+function v115RelParse(rel) {
+  const m = V115_REL_RE.exec(String(rel || ''))
+  if (!m) return null
+  return { n: Math.max(1, parseInt(m[1], 10) || 1), p: String(rel).slice(m[0].length) }
+}
+const V115_UA = 'Mozilla/5.0 115Browser/27.0.5.7'
+const V115_API = 'https://webapi.115.com'
+const V115_PRO = 'https://proapi.115.com'
+const V115_ORIGIN = 'https://115.com'
+const V115_MAX_DIRS = 3000        // 单个媒体库最多遍历多少个目录（防递归跑飞）
+const V115_MAX_FILES = 40000      // 单个媒体库最多收录多少个文件
+let V115_MAP = new Map()          // relVideo('115:/…') -> { pick, size, mtime, name }
+/* 目录 id -> { t, items }：列目录结果带**有效期**的缓存。
+ * 每次重扫都重走整棵网盘树 = 几百次接口调用，而 115 的 WAF 对密集请求很敏感（见 v115Throttle），
+ * 所以这份缓存在多次扫描之间**保留 10 分钟**；浏览弹层用 force=true 绕开它，保证看到的是实时目录。 */
+const V115_SNAP_TTL = 10 * 60 * 1000
+let V115_SNAP = new Map()
+let V115_FIND_NOTE = ''           // 上一次按番号找网盘文件失败的原因（回给 /api/library/matchCode 提示用户）
+let V115_URL = new Map()          // pick -> { url, exp } 直链缓存（直链有时效，过期即重取）
+
+/* ===== 115 取直链：网页版内部协议（RSA + XOR），只用 Node 内置 crypto，不引入依赖 =====
+ * 为什么非做不可：GET webapi.115.com/files/download 对**大文件**只回
+ *   {"state":false,"msg":"文件大小超出限制，请使用115电脑端下载","msg_code":50028}
+ * —— 几个 GB 的片子（本机媒体库里 3~8GB）全部命中，一条直链都拿不到。
+ * 115 浏览器走的是另一条路：
+ *   POST https://proapi.115.com/app/chrome/downurl?t=<unix秒>
+ *   Content-Type: application/x-www-form-urlencoded
+ *   body: data = base64( RSA_PKCS1( 16字节随机key ‖ transform(JSON.stringify({pickcode})) ) )
+ *   响应 { state:true, data:"…" } 里的 data 用同一把 key 反解 → { "<pickcode>": { url:{url}, … } }
+ * 算法与 AList / 115drive-webdav / fake115 的公开实现一致（已在多个项目长期验证）。 */
+const V115_XOR_SEED = Buffer.from([
+  0xf0, 0xe5, 0x69, 0xae, 0xbf, 0xdc, 0xbf, 0x8a,
+  0x1a, 0x45, 0xe8, 0xbe, 0x7d, 0xa6, 0x73, 0xb8,
+  0xde, 0x8f, 0xe7, 0xc4, 0x45, 0xda, 0x86, 0xc4,
+  0x9b, 0x64, 0x8b, 0x14, 0x6a, 0xb4, 0xf1, 0xaa,
+  0x38, 0x01, 0x35, 0x9e, 0x26, 0x69, 0x2c, 0x86,
+  0x00, 0x6b, 0x4f, 0xa5, 0x36, 0x34, 0x62, 0xa6,
+  0x2a, 0x96, 0x68, 0x18, 0xf2, 0x4a, 0xfd, 0xbd,
+  0x6b, 0x97, 0x8f, 0x4d, 0x8f, 0x89, 0x13, 0xb7,
+  0x6c, 0x8e, 0x93, 0xed, 0x0e, 0x0d, 0x48, 0x3e,
+  0xd7, 0x2f, 0x88, 0xd8, 0xfe, 0xfe, 0x7e, 0x86,
+  0x50, 0x95, 0x4f, 0xd1, 0xeb, 0x83, 0x26, 0x34,
+  0xdb, 0x66, 0x7b, 0x9c, 0x7e, 0x9d, 0x7a, 0x81,
+  0x32, 0xea, 0xb6, 0x33, 0xde, 0x3a, 0xa9, 0x59,
+  0x34, 0x66, 0x3b, 0xaa, 0xba, 0x81, 0x60, 0x48,
+  0xb9, 0xd5, 0x81, 0x9c, 0xf8, 0x6c, 0x84, 0x77,
+  0xff, 0x54, 0x78, 0x26, 0x5f, 0xbe, 0xe8, 0x1e,
+  0x36, 0x9f, 0x34, 0x80, 0x5c, 0x45, 0x2c, 0x9b,
+  0x76, 0xd5, 0x1b, 0x8f, 0xcc, 0xc3, 0xb8, 0xf5,
+])
+const V115_XOR_CLIENT = Buffer.from([0x78, 0x06, 0xad, 0x4c, 0x33, 0x86, 0x5d, 0x18, 0x4c, 0x01, 0x3f, 0x46])
+const V115_RSA_PUBLIC = Buffer.from(
+  '-----BEGIN PUBLIC KEY-----\n' +
+  'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCGhpgMD1okxLnUMCDNLCJwP/P0\n' +
+  'UHVlKQWLHPiPCbhgITZHcZim4mgxSWWb0SLDNZL9ta1HlErR6k02xrFyqtYzjDu2\n' +
+  'rGInUC0BCZOsln0a7wDwyOA43i5NO8LsNory6fEKbx7aT3Ji8TZCDAfDMbhxvxOf\n' +
+  'dPMBDjxP5X3zr7cWgwIDAQAB\n' +
+  '-----END PUBLIC KEY-----\n')
+
+/* key[i] = (seed[i] + XOR_SEED[size*i]) ^ XOR_SEED[size*(size-1-i)] */
+function v115XorDerive(seed, size) {
+  const key = Buffer.alloc(size)
+  for (let i = 0; i < size; i++) {
+    key[i] = (seed[i] + V115_XOR_SEED[size * i]) & 0xff
+    key[i] ^= V115_XOR_SEED[size * (size - i - 1)]
+  }
+  return key
+}
+/* 前 len%4 个字节先按原位异或，其余按 (i-mod) 循环 —— 与 Go 版逐字节等价 */
+function v115XorBuf(data, key) {
+  const mod = data.length % 4
+  for (let i = 0; i < mod; i++) data[i] ^= key[i % key.length]
+  for (let i = mod; i < data.length; i++) data[i] ^= key[(i - mod) % key.length]
+  return data
+}
+function v115ReverseBuf(data) {
+  for (let i = 0, j = data.length - 1; i < j; i++, j--) { const t = data[i]; data[i] = data[j]; data[j] = t }
+  return data
+}
+function v115Encode(plainBytes, key) {
+  const buf = Buffer.concat([key, Buffer.from(plainBytes)])
+  const tail = buf.subarray(16)
+  v115XorBuf(tail, v115XorDerive(key, 4))
+  v115ReverseBuf(tail)
+  v115XorBuf(tail, V115_XOR_CLIENT)
+  const bs = 117                       // 1024 位密钥 PKCS#1 v1.5 填充后单块最多 117 字节
+  const out = []
+  for (let off = 0; off < buf.length; off += bs) {
+    out.push(crypto.publicEncrypt(
+      { key: V115_RSA_PUBLIC, padding: crypto.constants.RSA_PKCS1_PADDING },
+      buf.subarray(off, Math.min(off + bs, buf.length))))
+  }
+  return Buffer.concat(out).toString('base64')
+}
+function v115Decode(b64, key) {
+  const raw = Buffer.from(String(b64 || ''), 'base64')
+  const bs = 128
+  const parts = []
+  for (let off = 0; off < raw.length; off += bs) {
+    const chunk = crypto.publicDecrypt(
+      { key: V115_RSA_PUBLIC, padding: crypto.constants.RSA_NO_PADDING },
+      raw.subarray(off, Math.min(off + bs, raw.length)))
+    /* 对齐 Go 的 big.Int.Bytes()：先去前导 0，再取第一个 0x00 之后的内容（PKCS#1 的 00 02 … 00 分隔） */
+    let i = 0
+    while (i < chunk.length - 1 && chunk[i] === 0) i++
+    const idx = chunk.indexOf(0, i)
+    if (idx < 0) return null
+    parts.push(chunk.subarray(idx + 1))
+  }
+  const all = Buffer.concat(parts)
+  if (all.length <= 16) return null
+  const body = Buffer.from(all.subarray(16))
+  v115XorBuf(body, v115XorDerive(all.subarray(0, 16), 12))
+  v115ReverseBuf(body)
+  v115XorBuf(body, v115XorDerive(key, 4))
+  return body
+}
+/* 调 115 的 downurl 取直链。返回 { url, cookie }：
+ *   url    = 真正的 CDN 地址
+ *   cookie = CDN 校验用的 auth_cookie（**必须一起带着**，否则 403 {"message":"no cookie"}）
+ * 返回形态有两种，都要认（2026-10 实测）：
+ *   A) HTTP 302 → https://dl.115cdn.net/files/dl302?t=…&f=pro → 再取一次，body 是 { state:true, data:"…" }
+ *   B) HTTP 200 + { state:true, data:"…" }  → 直接就是密文
+ * 密文都用**本次请求我们自己生成的 key** 解开（115 用请求方的 key 加密响应，不是 URL 里那个 t）。 */
+async function v115DownURLByApi(pick, n) {
+  const key = crypto.randomBytes(16)
+  const data = v115Encode(Buffer.from(JSON.stringify({ pickcode: pick }), 'utf8'), key)
+  const url = V115_PRO + '/app/chrome/downurl?t=' + Math.floor(Date.now() / 1000)
+  const rs = await v115FetchRaw(url, {
+    method: 'POST', timeout: 20000,
+    body: new URLSearchParams({ data }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }
+  }, n)
+
+  /* 从一段响应里抠出加密 data（同时兼容「直接给 url」的老形态） */
+  const pickPayload = async (r, tag) => {
+    const txt = await r.text().catch(() => '')
+    let j = null
+    try { j = JSON.parse(txt) } catch (_) {}
+    if (!j) {
+      console.log('[115] ' + tag + ' 非 JSON HTTP ' + r.status + ' → ' + txt.slice(0, 200))
+      if (v115Blocked(r.status, txt)) { v115MarkBlocked(); throw v115BlockErr() }
+      throw new Error('115 返回了非预期内容（HTTP ' + r.status + '，多半是 Cookie 失效或被风控）')
+    }
+    if (j.state === false || j.state === 0 || j.state === '0') {
+      console.log('[115] ' + tag + ' state=false → ' + JSON.stringify(j).slice(0, 260))
+      throw new Error(v115ErrText(j.error || j.msg || j.message || ''))
+    }
+    if (typeof j.data === 'string' && j.data) return j.data
+    const direct = (j.data && (j.data.url || j.data.file_url)) || j.url || j.file_url || ''
+    if (direct) return { direct: direct }
+    console.log('[115] ' + tag + ' 没有 data → ' + JSON.stringify(j).slice(0, 260))
+    throw new Error('115 未返回直链数据')
+  }
+
+  let payload = ''
+  const loc = rs.headers.get('location')
+  if ([301, 302, 303, 307, 308].includes(rs.status) && loc) {
+    try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+    const next = new URL(loc, url).href
+    const r2 = await v115FetchRaw(next, { timeout: 20000, headers: { 'Accept': '*/*' } }, n)
+    payload = await pickPayload(r2, 'dl302')
+  } else {
+    payload = await pickPayload(rs, 'downurl')
+  }
+  if (payload && payload.direct) return { url: payload.direct, cookie: '' }
+
+  const plain = v115Decode(payload, key)
+  if (!plain) throw new Error('115 直链响应解密失败（协议可能改版）')
+  const text = plain.toString('utf8')
+  let info = null
+  try { info = JSON.parse(text) } catch (_) { throw new Error('115 直链响应不是 JSON：' + text.slice(0, 160)) }
+  const one = (info && (info[pick] || info[Object.keys(info)[0]])) || {}
+  const uo = one.url
+  const u = (typeof uo === 'string' ? uo : (uo && uo.url)) || ''
+  if (!u) {
+    console.log('[115] downurl 解密后没有 url → ' + text.slice(0, 260))
+    throw new Error('115 没有返回直链')
+  }
+  /* auth_cookie：CDN 侧校验用，不带上必 403 */
+  const ac = (uo && uo.auth_cookie) || null
+  const cookie = (ac && ac.name) ? (ac.name + '=' + ac.value) : ''
+  return { url: u, cookie: cookie }
+}
+
+function v115Cfg(n) {
+  /* ⚠ Cookie 与「115 离线推送」共用同一份（设置页只填一次，两个功能都生效）：
+   *   CFG.pan115 = { cookie, savepath, cid, cidName, timeout, linkTpl, roots[] }   ← 账号 1
+   *   cookie/savepath/cid/cidName/timeout 归离线推送用（见 handleActorApi 里的 pan115Cfg）；
+   *   本模块只用 cookie + linkTpl + roots。账号 N（≥2）存 CFG.pan115x[N-2]（见多账号注释）。 */
+  n = Math.max(1, parseInt(n, 10) || 1)
+  if (!CFG.pan115 || typeof CFG.pan115 !== 'object') CFG.pan115 = {}
+  const c = CFG.pan115
+  if (typeof c.cookie !== 'string') c.cookie = ''
+  if (typeof c.linkTpl !== 'string') c.linkTpl = ''
+  if (!Array.isArray(c.roots)) c.roots = []
+  if (n === 1) return c
+  if (!Array.isArray(CFG.pan115x)) CFG.pan115x = []
+  const cx = CFG.pan115x[n - 2] = (CFG.pan115x[n - 2] && typeof CFG.pan115x[n - 2] === 'object') ? CFG.pan115x[n - 2] : {}
+  if (typeof cx.cookie !== 'string') cx.cookie = ''
+  if (typeof cx.linkTpl !== 'string') cx.linkTpl = ''
+  if (!Array.isArray(cx.roots)) cx.roots = []
+  if (typeof cx.name !== 'string') cx.name = ''
+  return cx
+}
+/* 推送目标账号（2026-10-15）：CFG.pan115.pushAcct，缺省 1 —— 离线推送/离线任务/推送目录/盯梢登记共用。
+ * 模块层函数（watch115Push 也要用，不能放 handleActorApi 局部）。 */
+function pan115PushAcctOf() { return Math.max(1, parseInt(CFG.pan115 && CFG.pan115.pushAcct, 10) || 1) }
+/* 账号 N 算「存在」= 配了 Cookie / 收录了目录 / 起了名（三占其一；纯空槽不算） */
+function v115AcctExists(n) {
+  const c = v115Cfg(n)
+  return !!(String(c.cookie || '').trim() || (Array.isArray(c.roots) && c.roots.length) || String(c.name || '').trim())
+}
+/* 现存账号号列表（[1] 或 [1,2,…]，稀疏空槽跳过） */
+function v115AcctList() {
+  const out = []
+  const x = Array.isArray(CFG.pan115x) ? CFG.pan115x.length : 0
+  if (v115AcctExists(1)) out.push(1)
+  for (let i = 0; i < x; i++) { const n = i + 2; if (v115AcctExists(n)) out.push(n) }
+  return out
+}
+/* 新账号该用几号：现存最高号 + 1 */
+const v115AcctNext = () => { const l = v115AcctList(); return l.length ? l[l.length - 1] + 1 : 1 }
+/* 对外展示用的账号列表：**账号 1 恒在**（哪怕还没配置 Cookie —— 卡片要显示「未连接 / 还没有收录目录」）。
+   这是老行为，前端与外界都依赖它；账号 ≥2 才要求真的存在（没建过不该凭空冒一张空卡）。 */
+const v115AcctListAll = () => { const l = v115AcctList(); return l.includes(1) ? l : [1].concat(l) }
+const v115Cookie = n => String(v115Cfg(n).cookie || '').trim()
+const v115Ready = n => !!v115Cookie(n)
+function v115Roots(n) { return v115Cfg(n).roots.filter(r => r && r.cid != null && r.cid !== '') }
+
+/* 遍历用的根列表（风控优化 2026-10-13）：去掉「被另一个已收录根包含」的根。
+ * 场景：用户先收了 /AV，又收了 /AV/破解测试 —— 遍历时前者已经把后者整棵走完，
+ *   再走一遍 = 同一批目录重复请求（本机实测一个根 27 个子目录 = 27 次 webapi 请求，翻倍很致命）。
+ * 判据用 115 内路径按**段**比：p 以 q + '/' 开头（或 q 为空 = 根目录）即被包含。
+ * ⚠ 只在遍历/查找时用；UI 展示（卡片、管理面板）仍用 v115Roots()，用户加了什么就列什么。 */
+function v115WalkRoots(all) {
+  all = all || v115Roots(1)   // 默认账号 1；多账号由调用方传各自的 roots（不同账号之间不存在互相包含）
+  const norm = r => String(r.path || '').replace(/^\/+|\/+$/g, '')
+  return all.filter(r => {
+    const p = norm(r)
+    const ri = all.indexOf(r)
+    return !all.some(o => {
+      if (o === r) return false
+      const q = norm(o)
+      if (q === p) return all.indexOf(o) < ri     // 同一路径（重复添加）：只保留先加的那个
+      if (!q) return true                         // 另一个是「根目录」→ 包含一切
+      return p.startsWith(q + '/')
+    })
+  })
+}
+
+/* ---- 115「网盘可读」状态（2026-10-13）------------------------------------------------
+ * ⚠ 115 的 Cookie 有**两套鉴权**，不能用一条「连接成功」概括：
+ *   ① 离线推送：clouddownload.115.com/web/?ac=task_lists  —— 还能用
+ *   ② 网盘文件：webapi.115.com/files（show_dir=1）       —— 已经 errNo 990001「登录超时，请重新登录」
+ * 实测（2026-10-13 用户报「SNOS-338 明明下载了却匹配不到」）：设置页「测试连接」只打了 ①，
+ * 于是显示「✓ 连接成功」，而扫描网盘 / 📂 匹配文件 / 目录下拉 全部读不到网盘 —— UI 上一点异常都看不出来。
+ * 这里把「网盘能不能读」单独记一份，供设置页 / 媒体源卡片 / 匹配失败提示分路显示。 */
+const V115_AUTHS = {}                             // acct -> { ok, err, at }（每个账号各有一份登录态）
+const v115AuthOf = n => {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  if (!V115_AUTHS[n]) V115_AUTHS[n] = { ok: null, err: '', at: 0 }
+  return V115_AUTHS[n]
+}
+const V115_AUTH_SKIP = 60 * 1000                  // 「读不了」的结论只压 60 秒：过期后允许再试（用户换了 Cookie 就能自愈）
+/* 只有「登录类」失败才算网盘读不了；WAF 拦截（405）/ 网络超时都是暂态，不能据此判死 */
+const v115AuthErr = msg => /登录|未登录|过期|失效|login|重新登录/i.test(String(msg || ''))
+function v115MarkAuth(ok, err, n) {
+  const a = v115AuthOf(n)
+  a.ok = !!ok
+  a.err = ok ? '' : String(err || '')
+  a.at = Date.now()
+}
+/* 一句话原因（没问题返回 ''）；粘性显示 —— 只有下次读盘成功才会翻回 true */
+function v115AuthNote(n) {
+  const a = v115AuthOf(n)
+  if (a.ok !== false) return ''
+  const which = (parseInt(n, 10) || 1) > 1 ? '（账号 ' + parseInt(n, 10) + '）' : ''
+  return '115 网盘读不了' + which + '（' + (a.err || '登录已过期') + '）。注意：离线推送接口可能仍然是好的，' +
+    '所以「测试连接」看着正常 —— 账号 1 到「设置 → 115 推送」、账号 ≥2 到「媒体源管理」重新粘贴 Cookie'
+}
+const v115AuthStale = n => { const a = v115AuthOf(n); return a.ok === false && Date.now() - a.at < V115_AUTH_SKIP }
+/* Cookie 里的 UID：部分直链接口要带 user_id */
+const v115Uid = n => (v115Cookie(n).match(/(?:^|;\s*)UID=(\d+)/i) || [])[1] || ''
+
+/* 统一的错误文案：把 115 的黑话翻成人话 */
+function v115ErrText(msg) {
+  const m = String(msg || '')
+  if (/登录|未登录|login|过期|失效/i.test(m)) return '115 未登录或登录已过期 —— 账号 1 到「设置 → 115 推送」、账号 ≥2 到「媒体源管理」重新粘贴 Cookie'
+  if (/频繁|限流|too many|稍后/i.test(m)) return '115 提示操作过于频繁，请稍等一会儿再试'
+  return '115 拒绝了请求：' + (m || '未知原因')
+}
+
+/* ==================== 115 请求节流器（2026-10-13 重做） ====================
+ * 为什么改：115 的阿里云 WAF 看的是**请求密度与规律性**。原实现是固定 350ms 等距脉冲
+ *   （≈2.9 req/s 不停歇），遍历一棵 100 目录的网盘树 = 100 次请求 / 35 秒不间断 ——
+ *   这是教科书级的爬虫特征，实测几轮就被整段拦 /files（HTTP 405「访问被阻断」）。
+ *
+ * 现在的三层节奏：
+ *   ① 基础间隔 × 随机抖动（0.65~1.35）→ 打散等距脉冲，不再是机器心拍
+ *   ② 每连续 20 次请求插入 3~8 秒「翻页停顿」→ 模拟人翻目录时的间歇
+ *   ③ 全部请求**串行排队**（同一时刻只飞一个）→ 不会出现多任务并发抢跑
+ * 被拦一次 → 惩罚升级：基础间隔 ×1.7（上限 = 基础 ×2.5）+ 长停顿更久，冷却时间指数递增
+ *   （5 → 12 → 30 分钟，封顶 30）；此后连续 40 次成功且 20 分钟无异常 → 惩罚缓慢降回 1x。
+ *
+ * 2026-10-15 补两件事（用户诉求「降低请求速率，保证不被风控」）：
+ *   · **基础间隔可档位调节**（CFG.v115Pace）：标准 780ms / 保守 1500ms / 极慢 3000ms，
+ *     默认「保守」—— 宁可慢一点，也别把 Cookie 送进风控；
+ *   · **离线推送那条通道以前完全没节流**（pan115Request 是独立的 https 请求，没走这里），
+ *     批量推 20 部磁力 = 瞬间 40 个请求，是最典型的「自己灌爆自己」。现在两条通道共用本闸门。
+ * 所有数值都只是**下限**：宁可慢，也不喂拦截。见 v115ThrottleState() 可观测。 */
+const V115_PACE = { fast: 420, normal: 780, safe: 1500, turtle: 3000 }
+function v115GapBase() {
+  try { return V115_PACE[String((CFG && CFG.v115Pace) || 'safe')] || V115_PACE.safe } catch (_) { return V115_PACE.safe }
+}
+const v115GapMax = () => Math.max(3500, Math.round(v115GapBase() * 2.5))
+const V115_BURST = 20
+let V115_LAST = 0
+let V115_BURST_N = 0
+let V115_PENALTY = 1              // 自适应惩罚倍率（1 = 无惩罚）
+let V115_OK_STREAK = 0            // 连续成功请求数（用于惩罚回落）
+let V115_LAST_BAD = 0             // 最近一次被拦的时刻
+let V115_REQ_TOTAL = 0            // 本进程累计请求数（诊断用）
+let V115_QUEUE = Promise.resolve()   // 串行闸门：同一时刻只允许一个 115 请求在飞
+const v115GapNow = () => Math.min(v115GapMax(), Math.round(v115GapBase() * V115_PENALTY))
+async function v115Throttle() {
+  const prev = V115_QUEUE
+  let release = null
+  V115_QUEUE = new Promise(r => { release = r })
+  try {
+    await prev                                        // 排队：等上一个请求彻底走完
+    const gap = v115GapNow()
+    const jitter = 0.65 + Math.random() * 0.7         // 0.65 ~ 1.35
+    const wait = V115_LAST + Math.round(gap * jitter) - Date.now()
+    if (wait > 0) await new Promise(r => setTimeout(r, wait))
+    V115_LAST = Date.now()
+    V115_REQ_TOTAL++
+    /* 长停顿：一口气翻太多页不是人的行为 */
+    V115_BURST_N++
+    if (V115_BURST_N >= V115_BURST) {
+      V115_BURST_N = 0
+      const rest = Math.round((3000 + Math.random() * 5000) * Math.min(2, V115_PENALTY))
+      console.log('[115] 节流：连续 ' + V115_BURST + ' 次请求，休息 ' + (rest / 1000).toFixed(1) + 's')
+      await new Promise(r => setTimeout(r, rest))
+      V115_LAST = Date.now()
+    }
+  } finally { if (release) release() }
+}
+/* 惩罚升级（被拦 / 明确限流时调用） */
+function v115PenaltyUp(why) {
+  V115_PENALTY = Math.min(4.5, V115_PENALTY * 1.7)
+  V115_OK_STREAK = 0
+  V115_LAST_BAD = Date.now()
+  console.log('[115] 风控惩罚升级' + (why ? '（' + why + '）' : '') + '：基础间隔 → ' + v115GapNow() + 'ms（倍率 ' + V115_PENALTY.toFixed(2) + '）')
+}
+/* 惩罚回落：连续 40 次成功 且 距上次出事 > 20 分钟，才降一档（降到 1x 为止） */
+function v115PenaltyDecay() {
+  if (V115_PENALTY <= 1) {
+    /* 惩罚已回到正常 且 一小时没出事 → 冷却档位也重置（下次出事从 5 分钟重新开始） */
+    if (V115_BLOCK_COUNT > 0 && Date.now() - V115_LAST_BAD > 60 * 60 * 1000) V115_BLOCK_COUNT = 0
+    return
+  }
+  V115_OK_STREAK++
+  if (V115_OK_STREAK >= 40 && Date.now() - V115_LAST_BAD > 20 * 60 * 1000) {
+    V115_PENALTY = Math.max(1, V115_PENALTY / 1.5)
+    V115_OK_STREAK = 0
+    console.log('[115] 风控惩罚回落：基础间隔 → ' + v115GapNow() + 'ms（倍率 ' + V115_PENALTY.toFixed(2) + '）')
+  }
+}
+/* 供 UI / 诊断查看当前节流状态（设置页「请求节奏」卡片直接显示这些） */
+function v115ThrottleState() {
+  return {
+    gapMs: v115GapNow(), pace: v115PaceOf(), penalty: Math.round(V115_PENALTY * 100) / 100,
+    requests: V115_REQ_TOTAL, blocked: v115BlockedNow(), remainMin: v115BlockRemain(),
+    blockCount: V115_BLOCK_COUNT,
+    /* 登录失效冷却（分通道：web = 网盘列目录/搜索，push = 离线推送） */
+    authCd: { web: v115AuthCdRemain('web', 1), push: v115AuthCdRemain('push', 1) }
+  }
+}
+/* 判断是不是被 WAF 拦了（非 JSON + 405 / 拦截页特征） */
+const v115Blocked = (status, txt) => status === 405 || /security threat|blocked|访问被阻断|安全威胁/i.test(String(txt || '').slice(0, 1000))
+const V115_BLOCK_MSG = '115 安全拦截：短时间内请求过多，被临时阻断（HTTP 405）—— 稍后重试即可，程序已自动放慢速度'
+/* 被拦之后进冷却：这段时间内**不再打接口**（否则会一路喂拦截、越喂越久），直接抛带剩余时间的错。
+ * 冷却时长**指数递增**（5 → 12 → 30 分钟）：反复撞同一堵墙说明对面判定更严，硬试只会更久。 */
+let V115_BLOCK_UNTIL = 0
+let V115_BLOCK_COUNT = 0          // 已发生的**累计**拦截次数（定冷却档位用，见 v115CooldownMs）
+const V115_COOLDOWN_MIN = [5, 12, 30]
+/* 档位取「本次之前」的次数：第 1 次被拦 → 5 分钟，第 2 次 → 12，第 3 次起 → 30 */
+const v115CooldownMs = () => V115_COOLDOWN_MIN[Math.min(V115_BLOCK_COUNT, V115_COOLDOWN_MIN.length - 1)] * 60 * 1000
+const v115BlockedNow = () => Date.now() < V115_BLOCK_UNTIL
+const v115BlockRemain = () => Math.max(0, Math.ceil((V115_BLOCK_UNTIL - Date.now()) / 60000))
+const v115MarkBlocked = () => {
+  const cd = v115CooldownMs()                  // ⚠ 先按「之前的次数」定档，再自增 —— 否则第 1 次就跳到 12 分钟
+  V115_BLOCK_COUNT++
+  V115_BLOCK_UNTIL = Date.now() + cd
+  v115PenaltyUp('HTTP 405')
+  console.log('[115] 进入冷却 ' + (cd / 60000) + ' 分钟（累计第 ' + V115_BLOCK_COUNT + ' 次被拦，冷却时间递增）')
+}
+function v115BlockErr() {
+  const e = new Error(V115_BLOCK_MSG + (v115BlockedNow() ? '（冷却中，还剩约 ' + v115BlockRemain() + ' 分钟）' : ''))
+  e.v115Blocked = true
+  return e
+}
+
+/* ==================== 登录失效冷却（2026-10-15 新增） ====================
+ * 与上面的「风控冷却」是两回事，必须分开处理：
+ *   · 风控（HTTP 405）：请求太密被 WAF 挡 → 放慢即可自愈；
+ *   · 登录失效（errNo 990001「登录超时，请重新登录」）：**Cookie 已经死了**。
+ *     拿一张死 Cookie 继续按节奏打接口，既一次也打不通，又是白白送给风控的流量 ——
+ *     而且这类请求往往成串（扫描整棵树 = 几十次），极其难看。
+ * 所以一旦某条通道明确报「未登录 / 登录超时」，就给它单独进冷却（15 → 45 → 120 分钟递增），
+ * 冷却期内该通道的请求**直接本地失败**，一个字节都不发；用户重新粘贴 Cookie（/api/115/config
+ * 或媒体源里保存）时立即解冻。
+ * ⚠ 按**通道**分开记（web = webapi 列目录/搜索，push = 离线推送/任务列表）：
+ *   实测这两套接口鉴权独立 —— 推送还正常时 webapi 可能已经 990001，反之亦然，
+ *   一刀切会把还能用的那条路也一起封掉。 */
+const V115_AUTH_CD_MIN = [15, 45, 120]
+const V115_AUTH_CD = new Map()          // 'web@1' / 'push@2' → { until, hits }
+const v115CdKey = (ch, n) => ch + '@' + Math.max(1, parseInt(n, 10) || 1)
+function v115AuthCdOf(ch, n) { return V115_AUTH_CD.get(v115CdKey(ch, n)) || null }
+const v115AuthCdRemain = (ch, n) => { const c = v115AuthCdOf(ch, n); return c ? Math.max(0, Math.ceil((c.until - Date.now()) / 60000)) : 0 }
+const v115AuthCdOn = (ch, n) => { const c = v115AuthCdOf(ch, n); return !!(c && Date.now() < c.until) }
+function v115AuthCdHit(ch, n, why) {
+  const k = v115CdKey(ch, n)
+  const c = V115_AUTH_CD.get(k) || { until: 0, hits: 0 }
+  const cd = V115_AUTH_CD_MIN[Math.min(c.hits, V115_AUTH_CD_MIN.length - 1)] * 60 * 1000
+  c.hits++
+  c.until = Date.now() + cd
+  V115_AUTH_CD.set(k, c)
+  console.log('[115] ' + ch + ' 通道登录失效 → 暂停请求 ' + (cd / 60000) + ' 分钟（第 ' + c.hits + ' 次，' + String(why || '').slice(0, 80) + '）')
+}
+function v115AuthCdClear(ch, n) {
+  const k = v115CdKey(ch, n)
+  if (V115_AUTH_CD.has(k)) { V115_AUTH_CD.delete(k); console.log('[115] ' + ch + ' 通道鉴权恢复（账号 ' + Math.max(1, parseInt(n, 10) || 1) + '），已解除请求暂停') }
+}
+/* 换 Cookie / 改账号凭据后调用：解除登录失效冷却 + 丢掉 get_id 缓存。
+ * 没有它的话，用户重贴了新 Cookie 还得干等 15~120 分钟冷却（界面上看不出为什么还是失败）。 */
+function v115CookieChanged(n) {
+  const k = Math.max(1, parseInt(n, 10) || 1)
+  v115AuthCdClear('web', k)
+  v115AuthCdClear('push', k)
+  try { V115_LXID.delete(k) } catch (_) {}
+}
+/* 请求节奏档位（设置 → 115 推送 → 请求节奏）：safe（默认，1.5s）最省心 */
+function v115PaceOf() {
+  const v = String((CFG && CFG.v115Pace) || 'safe')
+  return V115_PACE[v] ? v : 'safe'
+}
+function v115AuthCdErr(ch, n) {
+  const m = v115AuthCdRemain(ch, n)
+  const e = new Error('115 ' + (ch === 'push' ? '离线推送' : '网盘') + '接口登录已失效，为避免继续被风控，' +
+    (m > 0 ? '已暂停请求 ' + m + ' 分钟' : '已暂停请求') + '。请在 ' +
+    (ch === 'push' ? '「设置 → 115 推送」' : '「设置 → 115 推送」或「媒体源 → 115 网盘」') + '重新粘贴 Cookie')
+  e.v115AuthCd = true
+  return e
+}
+/* 115 的「登录失效」长相：errNo/errno = 990001，或文案里带登录超时/重新登录 */
+const v115LoginErrCode = j => { const v = Number(j && (j.errNo != null ? j.errNo : j.errno)); return v === 990001 || v === 990002 }
+const v115LoginErrText = s => /登录超时|重新登录|未登录|请先登录|登录已过期/i.test(String(s || ''))
+
+/* WAF 会话粘性（2026-10-13 新增）：
+ * 115 的 WAF（阿里云）用 acw_tc 标记「同一个访客的连续请求」。我们以前每次请求都把它丢掉，
+ * 等于每打一次接口就换一张脸 —— 风控看到的是一串互不相干的陌生请求，评分更高、更容易被限流。
+ * 这里把响应里下发的这条存住，后续请求带上（内存即可：它是短期流量标记，重启重取）。
+ * ⚠ 实测（同日）：115 只下发 acw_tc，**不会**下发新的 SEID / CID / KID ——
+ *   所以「保存 Set-Cookie 就能续期登录」这条思路不成立，Cookie 失效是 115 服务端的主动行为，
+ *   本地无法靠回写续命。见 v115AuthNote() / w115GapMs() 上方的说明。 */
+let V115_WAF = ''
+/* 两条请求通道（fetch 的 v115FetchRaw / https 的 pan115Request）共用这一份吸收逻辑 */
+function v115WafAbsorb(arr) {
+  try {
+    for (const s of (arr || [])) {
+      const kv = String(s).split(';')[0].trim()
+      const nm = kv.split('=')[0].trim()
+      if (!/^(acw_tc|cdn_sec_tc|acw_sc__v2)$/i.test(nm)) continue
+      const dead = /max-age=0/i.test(s) || /expires=thu, 01 jan 1970/i.test(s)
+      V115_WAF = (!dead && kv.indexOf('=') > 0) ? ('; ' + kv) : ''
+    }
+  } catch (_) {}
+}
+function v115WafKeep(rs) {
+  try { v115WafAbsorb(typeof rs.headers.getSetCookie === 'function' ? rs.headers.getSetCookie() : []) } catch (_) {}
+}
+
+/* 带 Cookie / UA / Referer 的请求封装（UA 必须伪装成 115 浏览器，否则风控直接挡）。
+ * ⚠ UA 必须与 pan115Request 的**完全一致** —— 同一份 Cookie（同一设备 CID）从「两个不同浏览器」
+ *   发请求是 115 判定会话异常的经典特征，可能直接让登录态被安全下线。 */
+async function v115FetchRaw(url, opts, n) {
+  opts = opts || {}
+  const ck = v115Cookie(n)
+  if (!ck) throw new Error('未配置 115 Cookie（设置 → 115 网盘' + ((parseInt(n, 10) || 1) > 1 ? '，账号 ' + parseInt(n, 10) : '') + '）')
+  if (v115BlockedNow()) throw v115BlockErr()       // 风控冷却期内不打接口
+  /* 登录失效冷却：一个字节都不发。⚠ 健康自检（probe）例外 —— 自检的唯一目的就是判断
+   * 「Cookie 到底活了没有」，被自己的冷却挡住就永远等不到「自动恢复」那一刻（2026-10-15）。 */
+  if (v115AuthCdOn('web', n) && !opts.probe) throw v115AuthCdErr('web', n)
+  if (opts.throttle !== false) await v115Throttle()
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), opts.timeout || 20000)
+  try {
+    const rs = await fetch(url, {
+      method: opts.method || 'GET',
+      redirect: opts.redirect || 'manual',
+      headers: Object.assign({
+        'Cookie': ck + V115_WAF,
+        'User-Agent': V115_UA,
+        'Referer': V115_ORIGIN + '/',
+        'Accept': 'application/json, text/plain, */*'
+      }, opts.headers || {}),
+      body: opts.body,
+      signal: ctl.signal
+    })
+    v115WafKeep(rs)
+    return rs
+  } finally { clearTimeout(timer) }
+}
+
+/* 期望 JSON 的接口：非 JSON / state=false 一律抛出可读错误，并把原始响应打进日志 */
+async function v115Json(pathname, opts, n) {
+  const rs = await v115FetchRaw(V115_API + pathname, opts, n)
+  const txt = await rs.text().catch(() => '')
+  let j = null
+  try { j = JSON.parse(txt) } catch (_) {}
+  if (!j) {
+    console.log('[115] 非 JSON 响应 HTTP ' + rs.status + ' ' + pathname + ' → ' + txt.slice(0, 300))
+    if (v115Blocked(rs.status, txt)) { v115MarkBlocked(); throw v115BlockErr() }
+    throw new Error('115 返回了非预期内容（HTTP ' + rs.status + '，多半是 Cookie 失效或被风控）')
+  }
+  const bad = j.state === false || j.state === 0 || j.state === '0' ||
+    (j.errno !== undefined && Number(j.errno) !== 0) ||
+    (j.errNo !== undefined && Number(j.errNo) !== 0)
+  if (bad) {
+    const raw = String(j.error || j.errorMsg || j.msg || j.message || '')
+    console.log('[115] state=false ' + pathname + ' → ' + JSON.stringify(j).slice(0, 300))
+    /* 115 有时把「操作过于频繁」也塞在 state=false 里 —— 这同样算风控信号，一并升级惩罚 */
+    if (/频繁|限流|稍后/i.test(raw)) { v115MarkBlocked(); throw v115BlockErr() }
+    /* 登录失效（990001）：不是频率问题，别去加节流惩罚 —— 直接让这条通道进「暂停请求」冷却，
+     * 免得拿死 Cookie 继续把整棵树打一遍（扫描时一次就是几十个请求）。 */
+    if (v115LoginErrCode(j) || v115LoginErrText(raw)) {
+      v115AuthCdHit('web', n, raw)
+      throw v115AuthCdErr('web', n)
+    }
+    throw new Error(v115ErrText(raw))
+  }
+  v115AuthCdClear('web', n)   // 通了 → 解冻（用户换了 Cookie 之后自愈）
+  v115PenaltyDecay()          // 一次干净的成功：喂给节流器的「风控已缓和」信号
+  return j
+}
+
+/* 115 账号信息（2026-10-13）：容量 + 会员状态 + 账号，媒体源卡片 / 115 设置 / 管理弹窗共用。
+ *   容量  GET https://webapi.115.com/user/space
+ *         → data.all_total / all_use / all_remain，各带 {size, size_format}（实测 51.36TB / 44.52TB / 6.84TB）
+ *   会员  网盘页 https://115.com/?cid=0&mode=wangpan 的 HTML 里内嵌 `is_vip: Number('1')`
+ *         —— 没有独立的 JSON 会员接口（/user/vip 等全是「服务器开小差了」），只能从页面里抠这一行。
+ *   账号  GET /user/info → data 是脱敏手机号 "198*****405"
+ * 10 分钟缓存；纯展示性数据，任何一步失败都不抛 —— 拿不到就让 UI 缺着，不影响主流程。 */
+const V115_USERS = {}   // acct -> { t, data, busy }
+const V115_LXID = new Map()   // 离线推送 get_id 缓存：acct -> { t, data }（见 pan115GetId）
+function v115UserCached(n) {
+  const u = V115_USERS[Math.max(1, parseInt(n, 10) || 1)]
+  const d = u && u.data
+  return (d && u.t && Date.now() - u.t < 600000) ? d : null
+}
+async function v115UserInfo(force, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  if (!force) { const c = v115UserCached(n); if (c) return c }
+  const slot = V115_USERS[n] = (V115_USERS[n] || { t: 0, data: null, busy: null })
+  if (slot.busy) return slot.busy     // 并发请求共用同一次探测
+  slot.busy = (async () => {
+    const out = {}
+    try {
+      const j = await v115Json('/user/space', null, n)
+      const a = (j.data && j.data.all_total) || {}, u = (j.data && j.data.all_use) || {}, r = (j.data && j.data.all_remain) || {}
+      out.total = Number(a.size) || 0; out.totalFmt = a.size_format || ''
+      out.used = Number(u.size) || 0; out.usedFmt = u.size_format || ''
+      out.remain = Number(r.size) || 0; out.remainFmt = r.size_format || ''
+      out.percent = out.total ? Math.min(100, Math.round(out.used / out.total * 1000) / 10) : 0
+    } catch (e) { out.err = e.message }
+    try {
+      const rs = await v115FetchRaw('https://115.com/?cid=0&mode=wangpan', { redirect: 'follow' }, n)
+      const html = await rs.text().catch(() => '')
+      const mv = html.match(/is_vip:\s*Number\('(\d)'\)/)
+      if (mv) out.vip = mv[1] === '1'
+    } catch (_) {}
+    try {
+      const u = await v115Json('/user/info', null, n)
+      if (u && typeof u.data === 'string') out.user = u.data
+    } catch (_) {}
+    Object.assign(slot, { t: Date.now(), data: out, busy: null })
+    return out
+  })()
+  try { return await slot.busy } finally { slot.busy = null }
+}
+
+/* 目录 / 文件判定（2026-10-13 用真实账号实测，原始响应如下）：
+ *   目录项：{ fc:"0", cid:<自己的id>, pid:<父目录id>, n:名字, m:<子目录数>, pc:<pickcode> }
+ *   文件项：{ fc:"1", fid:<自己的id>, cid:<所在目录id>, n:名字, s:<字节数>, pc:<pickcode>, m }
+ * ⚠ 两个坑：
+ *   ① **目录也有 pc（pickcode）**！所以「没有 pc 就是目录」的写法会把所有目录误判成文件 ——
+ *      真实账号根目录 15 个文件夹会全部消失，界面只剩「根目录」可加（就是踩过的这个）。
+ *   ② 文件也有 cid（父目录 id），所以也不能靠 cid 区分。
+ * 可靠顺序：fc（0=目录 1=文件）> 有无 fid > 有无 pid。 */
+function v115IsDir(f) {
+  f = f || {}
+  const yes = v => (v === true || v === 1 || v === '1')
+  if (f.is_dir !== undefined) return yes(f.is_dir)
+  if (f.is_directory !== undefined) return yes(f.is_directory)
+  if (f.fc !== undefined && f.fc !== null && f.fc !== '') return String(f.fc) === '0'
+  if (f.fid !== undefined) return false
+  return f.pid !== undefined
+}
+/* 115 各端返回的字段名不统一，这里统一归一化（字段名差异见 v115IsDir 上方注释）。
+ * 拿不准时把首条字段名打进日志（见 v115List / /api/115/lib/browse），接口改版后能第一时间发现。 */
+function v115NormItem(f) {
+  f = f || {}
+  const name = String(f.n != null ? f.n : (f.fn != null ? f.fn : (f.name != null ? f.name : (f.file_name || ''))))
+  const pick = String(f.pc != null ? f.pc : (f.pickcode != null ? f.pickcode : (f.pick_code || '')))
+  const isDir = v115IsDir(f)
+  const id = String(isDir ? (f.cid != null ? f.cid : '') : (f.fid != null ? f.fid : (f.id != null ? f.id : '')))
+  let size = Number(f.s != null ? f.s : (f.fs != null ? f.fs : (f.size != null ? f.size : (f.file_size != null ? f.file_size : 0))))
+  if (!isFinite(size) || size < 0) size = 0
+  const tp = f.tp || f.uet || f.modify_time || f.mtime || f.utime || f.user_ptime || ''
+  const mtime = Date.parse(String(tp).replace(/-/g, '/')) || (Number(f.te) ? Number(f.te) * 1000 : 0)
+  /* 注意别用 m 当子项数：真实返回里「影视」明明有 6 个子目录却给 m=1，文件和目录都带这个字段，语义不明 */
+  return { id, name, pick, size, isDir: !!isDir, mtime: mtime || 0 }
+}
+
+/* 列一个目录的全部子项（自动翻页）。按 cid 缓存（10 分钟有效，见 V115_SNAP_TTL），
+ * 避免「每加一个本地目录/改一次设置 → 重扫 → 又把整棵网盘树重打一遍」。
+ * 查询参数直接沿用项目里已实测可用的那套（见 /api/115/dirs），别自行精简。
+ * ⚠ 防重：万一 115 忽略 offset 参数，会反复返回同一页 —— 用「首项 id + 条数」指纹识别并立刻收手，
+ *   否则会一路拉到 V115_MAX_FILES 才对（40 次无效请求）。
+ * force=true（浏览弹层）永远打接口，保证用户看到的是实时目录。 */
+async function v115List(cid, force, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const cidS = String(cid || '0')
+  const key = n + '|' + cidS
+  if (!force) {
+    const hit = V115_SNAP.get(key)
+    if (hit && hit.t && Date.now() - hit.t < V115_SNAP_TTL) return hit.items
+  }
+  try {
+    const out = []
+    const LIMIT = 1000
+    let lastSig = ''
+    for (let off = 0; off < V115_MAX_FILES; off += LIMIT) {
+      const q = new URLSearchParams({
+        cid: cidS, show_dir: '1', limit: String(LIMIT), offset: String(off),
+        o: 'user_ptime', asc: '0', format: 'json'
+      })
+      const j = await v115Json('/files?' + q.toString(), null, n)
+      let arr = Array.isArray(j.data) ? j.data : (j.data && Array.isArray(j.data.list) ? j.data.list : [])
+      if (off === 0 && arr.length) console.log('[115] 列目录 cid=' + key + '（' + arr.length + ' 项）字段：' + Object.keys(arr[0]).join(','))
+      if (!arr.length) break
+      if (off > 0) {
+        const f0 = arr[0] || {}
+        const sig = arr.length + ':' + String(f0.fid || f0.cid || '')
+        if (sig === lastSig) { console.log('[115] 分页参数似乎未被支持（返回同一页），提前结束 cid=' + key); break }
+        lastSig = sig
+      } else {
+        const f0 = arr[0] || {}
+        lastSig = arr.length + ':' + String(f0.fid || f0.cid || '')
+      }
+      for (const f of arr) out.push(v115NormItem(f))
+      const total = Number(j.count || 0)
+      if (arr.length < LIMIT) break
+      if (total && out.length >= total) break
+    }
+    v115MarkAuth(true, '', n)          // 列目录成功 = 网盘确实可读
+    V115_SNAP.set(key, { t: Date.now(), items: out })
+    return out
+  } catch (e) {
+    /* 集中在这里判定「网盘读不了」—— 任何走 v115List 的路径（扫描 / 匹配文件）都会把状态带出来，
+     * 不必让每个调用方各自去认错（以前就是没人认，才被静默吞掉）。 */
+    if (v115AuthErr(e && e.message)) v115MarkAuth(false, e && e.message, n)
+    throw e
+  }
+}
+
+/* 目录 cid → 收录根内相对路径（'AV/破解测试'，**不含** V115_PREFIX、无尾斜杠；根=''）。
+ * v115Walk 遍历时顺手填 —— 与扫描的拼接口径**完全一致**；v115PathOf 兜底。 */
+const V115_PID_PATH = new Map()
+
+/* 递归遍历一个 115 媒体库根，产出与本地 walk 同构的条目：
+ * { vpath:'115:/…', pick, size, mtime, name }
+ * ⚠ 失败处理见函数末尾 —— 以前把「列目录失败」静默吞成空数组，调用方分不清「目录真的是空的」
+ *   和「网盘根本没读到」（2026-10-13 用户报的「匹配文件找不到」就是这个坑）。 */
+async function v115Walk(root, onDir, force) {
+  const n = Math.max(1, parseInt(root && root.acct, 10) || 1)   // 账号号随 root 走（root.acct 由扫描/收录路由填好）
+  const pref = v115Pref(n)
+  const files = []
+  const base = String(root.path || '').replace(/^\/+|\/+$/g, '')
+  const t0 = Date.now()
+  let dirs = 0
+  let err0 = null
+  let failSeq = 0          // 连续列目录失败次数（2026-10-15：见下方「早停」）
+  const rec = async (cid, rel, depth) => {
+    V115_PID_PATH.set(n + '|' + String(cid || '0'), rel || '')   // 顺手建「cid → 网盘路径」映射（0 成本；按番号搜索解析路径要用，见 v115PathOf）
+    if (files.length >= V115_MAX_FILES || dirs >= V115_MAX_DIRS) return
+    /* 扫描中途取消 → 每个子目录问一次，立刻收手（口径见 scWalkStopped 注释） */
+    if (scWalkStopped()) return files
+    let list = []
+    try { list = await v115List(cid, force, n); failSeq = 0 }
+    catch (e) {
+      console.log('[115] 列目录失败 cid=' + cid + '：' + e.message)
+      if (!err0) err0 = e
+      /* ⚠ 早停（2026-10-15）：以前列目录失败只是「跳过这个目录」然后继续 ——
+       * Cookie 失效 / 被风控时，一棵 30 个目录的树照样要打满 30 次请求才收手，
+       * 全是注定失败的请求，纯给风控送流量。现在连续 3 次失败、或已进冷却/风控期，
+       * 立刻中止整棵树（已拿到的文件照常返回）。 */
+      failSeq++
+      if (failSeq >= 3 || e.v115Blocked || e.v115AuthCd) throw e
+      return
+    }
+    for (const f of list) {
+      if (!f.name || f.name.startsWith('.')) continue
+      const p = rel ? rel + '/' + f.name : f.name
+      if (f.isDir) {
+        if (depth < 12) { dirs++; if (onDir) onDir(p); await rec(f.id, p, depth + 1) }
+      } else if (VIDEO_EXT.includes(extOf(f.name))) {
+        files.push({ vpath: pref + p, pick: f.pick, size: f.size, mtime: f.mtime, name: f.name })
+      }
+    }
+  }
+  try { await rec(String(root.cid || '0'), base, 0) } catch (e) { if (!err0) err0 = e }   // 早停时 rec 会抛，统一在这里收
+  console.log('[115' + (n > 1 ? '@' + n : '') + '] 遍历「' + (root.name || root.path || root.cid) + '」：' + files.length + ' 个视频 / ' + dirs + ' 个目录，用时 ' + (Date.now() - t0) + 'ms')
+  /* 一个文件都没拿到又出过错 → 抛出去（调用方能看到真实原因；扫描那条路本来就包了 try/catch）；
+   * 拿到了一部分 → 照常返回，把错误挂在数组的 err 上备查，别把已有结果一起丢掉。 */
+  if (err0) {
+    if (!files.length) throw err0
+    files.err = err0.message
+  }
+  return files
+}
+
+/* ---------- 按番号找网盘文件：搜索接口优先（2026-10-14 风控优化） ----------
+ * 以前 v115FindByCode 是「整棵收录树逐目录列一遍」—— 每个子目录一次 /files 请求
+ * （本机实测一个根 27 个子目录 = 27 次）。📂 匹配文件每按一次、盯梢快照一失效（10 分钟），
+ * 就把整树重打一遍 —— 这是触发 115 风控、进而让 Cookie 被安全下线的最大来源。
+ * 实测（2026-10-14，真实账号）：
+ *   ① GET webapi.115.com/files/search?search_value=<番号>&format=json —— **1 次请求**
+ *      按文件名/目录名搜出全盘匹配；文件项 { fc:'1', fid, cid:<所在目录>, pc, s, n }。
+ *   ② GET webapi.115.com/files?cid=X 顶层带 path 数组 = 根→X 的完整目录链，
+ *      直接拼出 '115:/AV/破解测试/…' 路径。
+ * 所以「搜 1 次 + 拼路径 0~1 次」≤ 2 个请求，替代整树。 */
+
+/* 从 10 分钟列目录快照反查路径（纯内存，0 请求）：SNAP 只存「cid → 子项列表」没有路径，
+ * 从每个收录根 DFS 一次即可建全表。返回本次新补了多少条。 */
+function v115SnapFillPaths(n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  let cnt = 0
+  const walk = (cid, rel) => {
+    const k = n + '|' + String(cid || '0')
+    if (V115_PID_PATH.has(k)) return
+    V115_PID_PATH.set(k, rel || '')
+    cnt++
+    const hit = V115_SNAP.get(k)
+    if (!hit || !Array.isArray(hit.items)) return
+    for (const f of hit.items) {
+      if (!f || !f.isDir || !f.id) continue
+      walk(f.id, rel ? rel + '/' + f.name : f.name)
+    }
+  }
+  for (const r of v115Roots(n)) walk(r.cid, String(r.path || '').replace(/^\/+|\/+$/g, ''))
+  return cnt
+}
+
+/* 目录 cid → '115:/AV/破解测试/MIDA-812'（文件所在目录的完整虚拟路径，带所在账号的前缀）。
+ * 三级：内存映射 → 快照反查 → 列一次该目录拿 path 链（1 请求）。
+ * 返回 '' = 解析失败或**不在任何已收录根内**（调用方据此跳过）。 */
+async function v115PathOf(cid, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  cid = String(cid || '0')
+  const k = n + '|' + cid
+  let rel = V115_PID_PATH.get(k)
+  if (rel === undefined) { v115SnapFillPaths(n); rel = V115_PID_PATH.get(k) }
+  if (rel === undefined) {
+    try {
+      const j = await v115Json('/files?cid=' + encodeURIComponent(cid) + '&show_dir=1&limit=1&offset=0&format=json', null, n)
+      const chain = Array.isArray(j.path) ? j.path : []
+      rel = chain.filter(x => x && x.cid !== '0' && x.cid !== 0).map(x => String(x.name || '')).join('/')
+      V115_PID_PATH.set(k, rel)
+    } catch (e) { rel = null }   // 列不出（权限/风控）→ 按收录范围外处理，别把一次失败放大成整树重打
+  }
+  if (rel === null || rel === undefined) return ''
+  const pref = v115Pref(n)
+  for (const r of v115WalkRoots(v115Roots(n))) {
+    const rp = String(r.path || '').replace(/^\/+|\/+$/g, '')
+    if (!rp || rel === rp || rel.startsWith(rp + '/')) return pref + rel
+  }
+  return ''
+}
+
+/* 按番号搜索网盘文件（webapi /files/search）：1 次请求替代整树遍历。只返回文件项（fc=1），
+ * 附 dirCid（所在目录 id，v115NormItem 会把它归并进 id，这里单独留一份）。 */
+async function v115SearchByCode(ccode, n) {
+  const out = []
+  const LIMIT = 200
+  let lastSig = ''
+  for (let off = 0; off < 4000; off += LIMIT) {
+    const q = new URLSearchParams({ search_value: ccode, format: 'json', limit: String(LIMIT), offset: String(off) })
+    const j = await v115Json('/files/search?' + q.toString(), null, n)
+    const arr = Array.isArray(j.data) ? j.data : (j.data && Array.isArray(j.data.list) ? j.data.list : [])
+    if (!arr.length) break
+    const sig = arr.length + ':' + String(arr[0].fid || arr[0].cid || '')
+    if (off > 0 && sig === lastSig) break    // 分页参数被忽略（返回同一页）→ 立刻收手
+    lastSig = sig
+    for (const f of arr) {
+      if (String(f.fc) !== '1') continue
+      out.push(Object.assign(v115NormItem(f), { dirCid: String(f.cid || '') }))
+    }
+    const total = Number(j.count || 0)
+    if (out.length >= total || arr.length < LIMIT) break
+  }
+  return out
+}
+
+/* 在 115 网盘里按番号找视频 —— 供「📂 匹配文件」和「推送自动认领盯梢」用。
+ * ccode = bare 化番号（'MIDA812'，匹配判定用）；origCode = 原始形态（'MIDA-812'，**搜索用**）。
+ * 2026-10-14 重写：**先走搜索接口（1~2 次请求），彻底不再整树实时遍历**。
+ *   · 搜索命中/零命中都到此为止 —— 搜索覆盖整个网盘，零命中就是真没有；
+ *   · 搜索接口不可用（改版/权限，非风控）→ 回退「10 分钟列目录快照内查找」（纯内存，0 请求）；
+ *   · 风控冷却中 → 什么都不打，把状态交出去。
+ * 返回结构与本地 walkAsync 那条支路同构：{ relVideo, file, dir, net115, size }。 */
+async function v115FindByCode(ccode, origCode) {
+  const out = []
+  V115_FIND_NOTE = ''
+  const accts = v115AcctList().filter(n => v115Ready(n))
+  if (!ccode || !accts.length) return out
+  /* 搜索形态（原始番号优先，见下）对每个账号都一样，先算一次 */
+  const tries = []
+  const oc = String(origCode || ccode || '').trim().toUpperCase()
+  if (oc) tries.push(oc)
+  const hm = ccode.match(/^([A-Z]{2,6})(\d{2,6})$/)
+  if (hm) { const hy = hm[1] + '-' + hm[2]; if (tries.indexOf(hy) < 0) tries.push(hy) }
+
+  const nameHit = (f, dirName) => {
+    const bn = bare(baseOf(f.name))
+    const dn = bare(String(dirName || ''))
+    let pc = ''
+    try { pc = bare(parseName(f.name).code) } catch (_) {}
+    return pc === ccode || (ccode.length >= 3 && (bn.includes(ccode) || dn.includes(ccode)))
+  }
+
+  let searchOkAny = false      // 有没有任何一个账号的搜索接口是通的（用于区分「搜了没有」和「压根没搜成」）
+  for (const n of accts) {
+    if (v115AuthStale(n)) { V115_FIND_NOTE = v115AuthNote(n); continue }
+
+    /* ① 搜索接口。⚠ 115 的搜索是普通子串匹配：文件名里是「MIDA-812」时搜「MIDA812」搜不到
+     * （2026-10-14 实测 0 结果）。按「最像发布名」的形态搜：优先原始番号；原始形态就是
+     * 裸「字母+数字」时补一次「字母-数字」。两次封顶，仍远小于整树。 */
+    let cand = []
+    let searchOk = false
+    try {
+      for (const sv of tries) {
+        cand = await v115SearchByCode(sv, n)
+        console.log('[115' + (n > 1 ? '@' + n : '') + '] 按番号搜索「' + sv + '」：' + cand.length + ' 个候选（1 次请求，不遍历目录）')
+        if (cand.length) break
+      }
+      searchOk = true
+      searchOkAny = true
+      /* 搜索成功 = 网盘确实读得到 → 把「读不了」的结论翻回来（自愈）。
+       * 与 v115List 列目录成功同口径；否则用户换了 Cookie 之后，
+       * 媒体源卡片会一直挂着「网盘读不了」直到下一次扫描。 */
+      v115MarkAuth(true, '', n)
+    } catch (e) {
+      if (e && e.v115Blocked) { V115_FIND_NOTE = '115 正在风控冷却中，稍后再试匹配'; return out }
+      /* 登录类失败 = 网盘确实读不了 → 记进账号状态（设置页/媒体源卡片据此提示重新贴 Cookie）。
+       * ⚠ 必须在这里记：搜索接口现在是「📂 匹配文件」的第一条路，如果只让 v115List 记，
+       *   搜索这条路上的登录失效就永远不会浮出来 —— 又变成当年那个「界面看着一切正常、
+       *   匹配就是找不到」的坑。 */
+      if (v115AuthErr(e && e.message)) v115MarkAuth(false, e && e.message, n)
+      cand = null
+      console.log('[115' + (n > 1 ? '@' + n : '') + '] 按番号搜索不可用，回退列目录快照：' + e.message)
+    }
+    /* ⚠ 只有「搜出了候选」才算到此为止。**搜索成功但零命中要继续往下走**：
+     *   115 的搜索只匹配名字，文件名字面里没有番号的（典型：番号在目录名上，
+     *   如「SNOS-338/part1.mp4」「MIDA-812/CD1/part1.mp4」）永远搜不到 ——
+     *   而这正是当年用户报「明明下载了却匹配不到」的场景。零命中时再花 0 请求查一遍
+     *   内存里的 10 分钟列目录快照，能捞回一大批。 */
+    if (cand && cand.length) {
+      /* 搜索是全盘的 —— 只留「已收录目录里」的（bindCode/重扫才收得进来）。
+       * 路径解析走内存/快照缓存，只有快照没有的新目录才发 1 次列目录。 */
+      let outside = 0
+      for (const f of cand) {
+        const dir = await v115PathOf(f.dirCid, n)
+        if (!dir) { outside++; continue }
+        const pp = v115RelParse(dir)
+        const rel = pp ? pp.p : ''
+        if (!nameHit(f, rel.split('/').pop())) continue   // 搜索是子串匹配，防 ABC-1 误伤 ABC-123
+        out.push({ relVideo: dir + '/' + f.name, file: f.name, dir: rel, net115: true, size: f.size || 0, acct: n })
+      }
+      if (!out.length && outside && !V115_FIND_NOTE) {
+        V115_FIND_NOTE = '在网盘里搜到了「' + ccode + '」，但都不在已收录的目录里 —— 到 设置 → 115 网盘 把那个目录收进来'
+      }
+      continue
+    }
+
+    /* ② 回退：10 分钟列目录快照内查找（纯内存，0 请求）。
+     * 走到这里有两种来路：搜索接口不可用（cand === null），或搜索成功但零命中。 */
+    v115SnapFillPaths(n)
+    for (const [k, info] of V115_SNAP) {
+      const m = /^(\d+)\|/.exec(String(k))
+      if (!m || parseInt(m[1], 10) !== n || !info || !Array.isArray(info.items)) continue
+      const rel = V115_PID_PATH.get(String(k)) || ''
+      for (const f of info.items) {
+        if (!f || f.isDir || !VIDEO_EXT.includes(extOf(f.name))) continue
+        if (!nameHit(f, rel ? rel.split('/').pop() : '')) continue
+        const fp = rel ? rel + '/' + f.name : f.name
+        out.push({ relVideo: v115Pref(n) + fp, file: f.name, dir: rel, net115: true, size: f.size || 0, acct: n })
+      }
+    }
+  }
+  if (!out.length && !V115_FIND_NOTE) {
+    /* 优先说真因：有账号被判「网盘读不了」时，别拿「搜不到」糊弄用户 ——
+     * 这正是当年 SNOS-338 那个坑（Cookie 已失效，界面却显示一切正常）。 */
+    const dead = accts.filter(n => v115AuthStale(n))
+    if (dead.length) V115_FIND_NOTE = v115AuthNote(dead[0])
+    else if (searchOkAny) V115_FIND_NOTE = '115 网盘里没搜到「' + ccode + '」（文件名与 10 分钟列目录快照都查过了）—— 确认文件已经放进「设置 → 115 网盘」收录的目录里，或等下次扫描后再试'
+    else V115_FIND_NOTE = '115 按番号搜索接口暂不可用，且 10 分钟列目录快照里没有「' + ccode + '」—— 等下次扫描后再试'
+  }
+  return out
+}
+
+/* 跟随重定向取最终地址；返回 '' 表示这个接口没给直链（交给下一个候选接口） */
+async function v115Follow(url, n) {
+  const rs = await v115FetchRaw(url, { timeout: 20000, headers: { 'Accept': '*/*' } }, n)
+  const loc = rs.headers.get('location')
+  if ([301, 302, 303, 307, 308].includes(rs.status) && loc) {
+    try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+    return new URL(loc, url).href
+  }
+  const txt = await rs.text().catch(() => '')
+  let j = null
+  try { j = JSON.parse(txt) } catch (_) {}
+  console.log('[115] 直链接口 ' + url.replace(/pickcode=[^&]+/, 'pickcode=…') + ' → HTTP ' + rs.status + ' ' + txt.slice(0, 200))
+  if (!j && v115Blocked(rs.status, txt)) { v115MarkBlocked(); throw v115BlockErr() }
+  if (j) {
+    if (j.state === false) throw new Error(v115ErrText(j.error || j.msg || ''))
+    const u = j.file_url || j.url || (j.data && (j.data.url || j.data.file_url))
+    if (u) return u
+  }
+  return ''
+}
+
+/* 直链进缓存（115 直链有时效，4 分钟后自动重取；最多留 80 条）。缓存键带账号（pickcode 虽全局唯一，稳妥起见分账号）。 */
+function v115CacheURL(pick, info, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  V115_URL.set(n + '|' + pick, { url: info.url, cookie: info.cookie || '', exp: Date.now() + 4 * 60 * 1000 })
+  if (V115_URL.size > 80) V115_URL.delete(V115_URL.keys().next().value)
+  return info
+}
+
+/* pickcode → 302 直链。先试用户在设置里填的自建服务，再走官方加密协议；
+ * 都失败时给出明确指引。 */
+async function v115DownURL(pick, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const key = String(pick || '')
+  if (!key) throw new Error('缺少 pickcode（115 条目没有识别到文件标识）')
+  const ck = n + '|' + key
+  const hit = V115_URL.get(ck)
+  if (hit && hit.exp > Date.now()) return { url: hit.url, cookie: hit.cookie || '' }
+  const uid = v115Uid(n)
+  const tpl = String(v115Cfg(n).linkTpl || '').trim()
+  let last = ''
+  /* 1) 用户自建 302 服务（填了就最优先，方便内置协议失效时自救） */
+  if (tpl) {
+    const u = tpl.replace(/\{\{?pick(code)?\}?\}/gi, encodeURIComponent(key)).replace(/\{\{?uid\}?\}/gi, uid)
+    try {
+      const got = await v115Follow(u, n)
+      if (got) return v115CacheURL(key, { url: got, cookie: '' }, n)
+      last = '自定义接口未返回直链'
+    } catch (e) { last = e.message }
+  }
+  /* 2) 官方网页版协议：POST + RSA 加密（见 v115DownURLByApi）。
+   *    这是**大文件唯一可行**的一条 —— GET webapi/files/download 对几 GB 的片子
+   *    一律回「文件大小超出限制，请使用115电脑端下载」(50028)，所以不再拿它当候选。 */
+  try {
+    const got = await v115DownURLByApi(key, n)
+    if (got && got.url) return v115CacheURL(key, got, n)
+    last = '官方接口未返回直链'
+  } catch (e) { last = e.message }
+  throw new Error('115 没能返回直链（' + last + '）。可在「设置 → 115 网盘」填「自定义直链接口」兜底')
+}
+
+/* 代理转发 115 的流：带 Range 透传，直链过期/CDN 403 时自动重取一次。
+ * ⚠ 超时只能兜「迟迟拿不到响应头」这一段：响应体是动辄几 GB 的视频，
+ *   把 AbortSignal.timeout 一路带进传输期会把正常播放掐断（fetch 的 signal 覆盖整个 body 传输）。
+ *   所以拿到响应头立刻 clearTimeout，之后按客户端节奏慢慢传。 */
+async function v115Proxy(req, res, url, pick, rel, depth, ck) {
+  depth = depth || 0
+  const hdrs = { 'User-Agent': V115_UA, 'Referer': V115_ORIGIN + '/', 'Accept': '*/*' }
+  /* CDN 侧的 auth_cookie（由 downurl 一并返回）：缺了它 CDN 直接 403 {"message":"no cookie"} */
+  if (ck) hdrs.Cookie = ck
+  if (req.headers.range) hdrs.Range = req.headers.range
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 30000)
+  let rs
+  try { rs = await fetch(url, { headers: hdrs, redirect: 'manual', signal: ctl.signal }) }
+  catch (e) {
+    clearTimeout(timer)
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('115 取流失败：' + e.message)
+  }
+  clearTimeout(timer)
+  const loc = rs.headers.get('location')
+  if ([301, 302, 303, 307, 308].includes(rs.status) && loc && depth < 3) {
+    try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+    return v115Proxy(req, res, new URL(loc, url).href, pick, rel, depth + 1, ck)
+  }
+  if (rs.status === 401 || rs.status === 403) {
+    try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+    if (depth < 2) {
+      const pn = (v115RelParse(rel) || { n: 1 }).n
+      V115_URL.delete(pn + '|' + pick)               // 直链多半过期了 → 重取再试
+      const next = await v115DownURL(pick, pn).catch(() => null)
+      if (next && next.url) return v115Proxy(req, res, next.url, pick, rel, depth + 1, next.cookie)
+    }
+  }
+  if (rs.status !== 200 && rs.status !== 206) {
+    try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+    res.writeHead(rs.status === 416 ? 416 : 502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('115 CDN 返回 HTTP ' + rs.status)
+  }
+  const hh = {
+    'Content-Type': rs.headers.get('content-type') || MIME['.' + extOf(rel).toLowerCase()] || 'application/octet-stream',
+    'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*'
+  }
+  const cl = rs.headers.get('content-length'); if (cl) hh['Content-Length'] = cl
+  const cr = rs.headers.get('content-range'); if (cr) hh['Content-Range'] = cr
+  res.writeHead(rs.status === 206 ? 206 : 200, hh)
+  const body = require('stream').Readable.fromWeb(rs.body)
+  /* 客户端断开（关播放器 / 拖进度条换 Range / 跳转）→ 中止上游，别让 115 那条连接空挂着 */
+  let finished = false
+  const stop = () => {
+    if (finished) return
+    finished = true
+    try { body.destroy() } catch (_) {}
+    try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
+  }
+  res.on('close', stop)
+  body.on('end', () => { finished = true })
+  body.on('error', stop)
+  body.pipe(res)
+}
+
+/* 播放取流失败该说什么（2026-10-13）：直链是**现取**的（缓存 4 分钟），Cookie 一失效就断在半路，
+ * 而用户看到「取 115 直链失败：…」只会以为是网络问题。这里把「登录失效」单独标出来，
+ * 明确告诉他要做什么 —— 也顺手解释了「播一会儿就断」这个现象的真正原因。 */
+function v115PlayErrText(e, n) {
+  const msg = (e && e.message) || '未知错误'
+  const loginish = v115AuthOf(n).ok === false || /登录|重新登录|未登录|Cookie/i.test(msg)
+  const which = (parseInt(n, 10) || 1) > 1 ? '（账号 ' + parseInt(n, 10) + '）' : ''
+  return loginish
+    ? '115 登录状态已失效' + which + '，取不到播放直链。账号 1 到「设置 → 115 推送」、账号 ≥2 到「媒体源管理」重新粘贴 Cookie 后再播放。\n（原始错误：' + msg + '）'
+    : '取 115 直链失败：' + msg
+}
+
+/* 播放入口：relVideo → pick → 直链 → 代理 */
+async function v115Serve(req, res, rel) {
+  const pn = (v115RelParse(rel) || { n: 1 }).n
+  const pick = v115PickOf(rel)
+  if (!pick) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('115 条目缺少文件标识（pickcode）。请在「添加影片 → 全部重新扫描」后再试')
+  }
+  let down = null
+  try { down = await v115DownURL(pick, pn) }
+  catch (e) {
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end(v115PlayErrText(e, pn))
+  }
+  return v115Proxy(req, res, down.url, pick, rel, 0, down.cookie)
+}
+
+/* relVideo → pickcode：先查内存表（扫描时填的），没有再翻已扫描出来的条目（重启后未重扫也能播） */
+function v115PickOf(rel) {
+  const hit = V115_MAP.get(rel)
+  if (hit && hit.pick) return hit.pick
+  try {
+    const items = (DATA && DATA.items) || []
+    for (const it of items) {
+      if (it.relVideo !== rel) continue
+      if (it.pick) { V115_MAP.set(rel, { pick: it.pick, size: it.size || 0, mtime: it.mtime || 0, name: it.relVideo }); return it.pick }
+      const fs2 = (it.files || []).find(f => f && f.relVideo === rel && f.pick)
+      if (fs2) { V115_MAP.set(rel, { pick: fs2.pick, size: fs2.size || 0, mtime: fs2.mtime || 0, name: rel }); return fs2.pick }
+    }
+  } catch (_) {}
+  return ''
+}
+
+/* 从已扫描的条目重建 V115_MAP（服务启动 / 重扫开始时调用） */
+function rebuildV115Map() {
+  V115_MAP = new Map()
+  try {
+    for (const it of (DATA && DATA.items) || []) {
+      if (!it || !it.relVideo || !v115Rel(it.relVideo)) continue
+      if (it.pick) V115_MAP.set(it.relVideo, { pick: it.pick, size: it.size || 0, mtime: it.mtime || 0, name: it.relVideo })
+      for (const f of (it.files || [])) {
+        if (f && f.relVideo && f.pick && v115Rel(f.relVideo))
+          V115_MAP.set(f.relVideo, { pick: f.pick, size: f.size || 0, mtime: f.mtime || 0, name: f.relVideo })
+      }
+    }
+  } catch (_) {}
+}
+const v115Rel = vp => !!v115RelParse(vp)
+
+/* 115 媒体库根的收录统计（设置页逐库展示，与本地库 libStats 同形）。n = 账号号 */
+function v115Stats(n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const items = (DATA && DATA.items) || []
+  const pref = v115Pref(n)
+  return v115Roots(n).map(r => {
+    const base = pref + String(r.path || '').replace(/^\/+|\/+$/g, '')
+    const bp = base === pref ? pref : base + '/'
+    let videos = 0, ok = 0, fail = 0, cover = 0
+    for (const it of items) {
+      const rv = (it && it.relVideo) ? String(it.relVideo) : ''
+      if (rv.indexOf(pref) !== 0) continue
+      if (!(rv === base || rv.indexOf(bp) === 0)) continue
+      videos++
+      if (it.pending) fail++; else ok++
+      if (it.relPoster || it.relFanart) cover++
+    }
+    return {
+      kind: '115', acct: n, cid: String(r.cid), path: r.path || '',
+      name: r.name || r.path || ('115 目录 ' + r.cid),
+      videos, ok, fail, cover
+    }
+  })
+}
+/* ==================== WebDAV / 光鸭网盘媒体源（2026-10-13） ====================
+ * 与 115 同一套思路，但协议是**标准 WebDAV**（RFC 4918），所以整个引擎比 115 短得多：
+ *   列目录 = PROPFIND Depth:1（自带文件大小 / 修改时间，不用翻页）
+ *   播放   = GET + Range 原样转发（服务端只当管道，不需要解析直链）
+ *   容量   = PROPFIND 根目录的 quota-used-bytes / quota-available-bytes（有就显示，没有就不显示）
+ * 两个来源共用这一个引擎，只是配置和 relVideo 前缀不同：
+ *   webdav  → CFG.webdav  = { url, user, pass, name, roots[] }，relVideo = `dav:/<路径>`
+ *   guangya → CFG.guangya = { url, user, pass, name, roots[] }，relVideo = `gy:/<路径>`
+ * 光鸭 = 光鸭云盘客户端「设置 → WebDAV」里复制的 服务器地址 + 账号 + 专属访问密钥；
+ *   它没有公开 API，官方支持的方式就是 WebDAV（Vidhub/爆米花 也是这么接的）。
+ * 网盘地址通常是局域网（NAS 上的 Alist 等）→ **不走系统代理**，直连。 */
+const DAV_PREFIX = 'dav:/'
+const GY_PREFIX = 'gy:/'
+const DAV_MAX_DIRS = 3000
+const DAV_MAX_FILES = 40000
+const DAV_KINDS = ['webdav', 'guangya']
+const DAV_INFO = {
+  webdav: { prefix: DAV_PREFIX, label: 'WebDAV' },
+  guangya: { prefix: GY_PREFIX, label: '光鸭网盘' },
+}
+const DAV_DEFNAME = { webdav: 'WebDAV', guangya: '光鸭网盘' }
+let DAV_MAP = new Map()                 // relVideo('dav:/…' | 'gy:/…' | 带账号的 'dav@2:/…') -> { size, mtime, name }
+const DAV_SNAP_TTL = 10 * 60 * 1000     // 列目录快照（与 115 同策略：重扫之间复用，浏览弹层 force 绕开）
+const DAV_SNAP = new Map()
+/* ---- 多账号（2026-10-14）：账号 1 = CFG[kind]（存量零迁移），账号 N（≥2）= CFG[kind+'x'][N-2]，
+ * relVideo 前缀 `dav@N:/…` / `gy@N:/…`。状态桶（DAV_AUTH/DAV_QUOTA）与快照键都带账号段。 ---- */
+const DAV_AUTH = {}                     // 'webdav' | 'guangya@2' … -> { ok: true|false|null, err }
+const DAV_QUOTA = {}                    // 同上 -> { t, space }
+let DAV_FIND_NOTE = ''                  // 按番号查找失败的原因（回给 /api/library/matchCode）
+/* 来源实例键：账号 1 = kind 原样（老数据/老键全兼容），账号 N = kind@N */
+const davInst = (kind, n) => { n = parseInt(n, 10) || 1; return n > 1 ? (kind + '@' + n) : kind }
+/* 账号 N 的 relVideo 前缀 */
+const davPref = (kind, n) => {
+  const p = (DAV_INFO[kind] || DAV_INFO.webdav).prefix
+  n = parseInt(n, 10) || 1
+  return n > 1 ? p.replace(/^([a-z]+):\//i, '$1@' + n + ':/') : p
+}
+
+function davCfg(kind, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const key = n === 1 ? kind : (kind + 'x')
+  if (n === 1) {
+    if (!CFG[kind] || typeof CFG[kind] !== 'object') CFG[kind] = {}
+    var c = CFG[kind]
+  } else {
+    if (!Array.isArray(CFG[kind + 'x'])) CFG[kind + 'x'] = []
+    const slot = (CFG[kind + 'x'][n - 2] && typeof CFG[kind + 'x'][n - 2] === 'object') ? CFG[kind + 'x'][n - 2] : {}
+    CFG[kind + 'x'][n - 2] = slot
+    c = slot
+  }
+  if (typeof c.url !== 'string') c.url = ''
+  if (typeof c.user !== 'string') c.user = ''
+  if (typeof c.pass !== 'string') c.pass = ''
+  if (typeof c.name !== 'string') c.name = ''
+  if (!Array.isArray(c.roots)) c.roots = []
+  /* 光鸭官方接口模式（短信验证码登录）的字段（2026-10-13）：
+   * mode='api'|'webdav'（空 = 按有无 token 自动认），tokenExp 为秒级时间戳。 */
+  if (kind === 'guangya') {
+    if (typeof c.mode !== 'string') c.mode = ''
+    if (typeof c.accessToken !== 'string') c.accessToken = ''
+    if (typeof c.refreshToken !== 'string') c.refreshToken = ''
+    if (typeof c.account !== 'string') c.account = ''
+    if (typeof c.tokenExp !== 'number') c.tokenExp = 0
+    /* 设备指纹（对齐 AList GuangYaPan 驱动的 device_id / device_sign）：
+     * 必须是**持久且稳定**的 —— 每次重启都换一个新的，光鸭就当成「新设备」，
+     * 既容易触发风控、又可能让已登录态被判无效。首次生成后写回 server-config.json。 */
+    if (typeof c.deviceId !== 'string') c.deviceId = ''
+  }
+  return c
+}
+/* 账号 N 算「存在」= 配了凭据 / 收录了目录 / 起了名（光鸭有 token 也算） */
+function davAcctExists(kind, n) {
+  const c = davCfg(kind, n)
+  if (String(c.name || '').trim() || (Array.isArray(c.roots) && c.roots.length)) return true
+  if (kind === 'guangya' && (String(c.accessToken || '').trim() || String(c.refreshToken || '').trim())) return true
+  return !!(String(c.url).trim() && String(c.user).trim() && String(c.pass).trim())
+}
+function davAcctList(kind) {
+  const out = []
+  if (davAcctExists(kind, 1)) out.push(1)
+  const x = Array.isArray(CFG[kind + 'x']) ? CFG[kind + 'x'].length : 0
+  for (let i = 0; i < x; i++) { const n = i + 2; if (davAcctExists(kind, n)) out.push(n) }
+  return out
+}
+const davAcctNext = kind => { const l = davAcctList(kind); return l.length ? l[l.length - 1] + 1 : 1 }
+/* 同 v115AcctListAll：账号 1 恒在（未配置 = added:false，由前端决定隐不隐藏） */
+const davAcctListAll = kind => { const l = davAcctList(kind); return l.includes(1) ? l : [1].concat(l) }
+const davReady = (kind, n) => {
+  const c = davCfg(kind, n)
+  if (kind === 'guangya' && gyIsApi(kind, n)) return !!(String(c.accessToken || '').trim() || String(c.refreshToken || '').trim())
+  return !!(String(c.url).trim() && String(c.user).trim() && String(c.pass).trim())
+}
+const davLabel = kind => (DAV_INFO[kind] || DAV_INFO.webdav).label
+function davRoots(kind, n) { return davCfg(kind, n).roots.filter(r => r && typeof r.path === 'string' && String(r.path).replace(/^\/+|\/+$/g, '') !== '') }
+/* 服务器地址：没写协议就补 http://（局域网地址常写成 192.168.1.5:5244 这种裸 host:port） */
+function davBase(kind, n) {
+  let u = String(davCfg(kind, n).url || '').trim().replace(/\/+$/, '')
+  if (u && !/^https?:\/\//i.test(u)) u = 'http://' + u
+  return u
+}
+/* 把 relVideo / 目录路径拼成请求 URL：每一段单独 encode（保留 / 与已 encoded 的段不二次转义） */
+function davUrl(kind, n, p) {
+  const enc = String(p || '').replace(/^\/+|\/+$/g, '').split('/').filter(Boolean)
+    .map(s => { try { return /^[%A-Za-z0-9._~!$&'()*+,;=@-]+$/.test(decodeURIComponent(s)) ? s : encodeURIComponent(s) } catch (_) { return encodeURIComponent(s) } })
+    .join('/')
+  return davBase(kind, n) + '/' + enc
+}
+/* relVideo → { kind, n, p }；不是 WebDAV 系前缀返回 null */
+function davSplitRel(rel) {
+  const m = /^(dav|gy)(?:@(\d+))?:\//i.exec(String(rel || ''))
+  if (!m) return null
+  return { kind: m[1].toLowerCase() === 'gy' ? 'guangya' : 'webdav', n: Math.max(1, parseInt(m[2], 10) || 1), p: String(rel).slice(m[0].length) }
+}
+const davRel = rel => !!davSplitRel(rel)
+
+/* 底层请求：Buffer（readBuf=true）或流（readBuf=false，播放转发用）。
+ * 网络层任何失败都抛错（调用方分路认 401/404），不静默 —— 「账号不对」和「地址不通」必须分得开。 */
+function davReq(kind, method, p, { headers = {}, body = null, timeout = 20000, readBuf = true } = {}, n) {
+  return new Promise((resolve, reject) => {
+    let u
+    try { u = new URL(davUrl(kind, n, p)) } catch (e) { return reject(new Error('WebDAV 地址无效：' + davBase(kind, n))) }
+    const c = davCfg(kind, n)
+    const mod = u.protocol === 'http:' ? http : https
+    const rq = mod.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'http:' ? 80 : 443),
+      path: u.pathname + u.search, method,
+      headers: Object.assign({
+        Authorization: 'Basic ' + Buffer.from((c.user || '') + ':' + (c.pass || '')).toString('base64'),
+        'User-Agent': 'JavPaco/1.0 WebDAV',
+        Accept: '*/*'
+      }, headers)
+    }, rsp => {
+      if (!readBuf) return resolve({ status: rsp.statusCode, headers: rsp.headers, stream: rsp })
+      const chunks = []
+      rsp.on('data', d => chunks.push(d))
+      rsp.on('end', () => resolve({ status: rsp.statusCode, headers: rsp.headers, buf: Buffer.concat(chunks), text: () => Buffer.concat(chunks).toString('utf8') }))
+      rsp.on('error', reject)
+    })
+    rq.setTimeout(timeout, () => { try { rq.destroy(new Error('请求超时（' + Math.round(timeout / 1000) + 's）')) } catch (_) {} })
+    rq.on('error', reject)
+    if (body) rq.write(body)
+    rq.end()
+  })
+}
+function davAuthErr(msg) { return /401|Unauthorized|认证|账号|密钥|password|credentials/i.test(String(msg || '')) }
+
+/* ---- 多状态 XML 解析：只抠 6 个字段，正则足矣（不引依赖；命名空间前缀 d:/D:/ns0:/裸标签都认） ---- */
+function davXmlText(blk, tag) {
+  const m = blk.match(new RegExp('<(?:[\\w.-]+:)?' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:[\\w.-]+:)?' + tag + '>', 'i'))
+  return m ? m[1].trim() : ''
+}
+function davHrefToPath(href, reqPath) {
+  let h = String(href || '').trim()
+  if (/^https?:\/\//i.test(h)) { try { h = new URL(h).pathname } catch (_) {} }
+  else if (h.charAt(0) !== '/') {          // 个别服务器给相对路径 → 按请求目录的父级拼
+    const parent = String(reqPath || '').replace(/\/+$/, '').replace(/\/[^/]*$/, '')
+    h = parent + '/' + h
+  }
+  try { h = decodeURIComponent(h) } catch (_) {}
+  return '/' + h.replace(/^\/+|\/+$/g, '')
+}
+function davParseMultistatus(xml, reqPath) {
+  const out = []
+  for (const blk of String(xml || '').split(/<\/(?:[\w.-]+:)?response>/i)) {
+    if (!/<(?:[\w.-]+:)?response[\s>]/i.test(blk)) continue
+    const href = davXmlText(blk, 'href')
+    if (!href) continue
+    const isDir = /<(?:[\w.-]+:)?collection\s*\/?>/i.test(blk)
+    let name = davXmlText(blk, 'displayname')
+    const p = davHrefToPath(href, reqPath)
+    if (!name) name = p.replace(/\/+$/, '').split('/').pop() || '/'
+    out.push({
+      path: p, name: String(name).replace(/&lt;|&gt;|&amp;|&quot;|&apos;/g, ch => ({ '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&apos;': "'" }[ch])),
+      isDir,
+      size: parseInt(davXmlText(blk, 'getcontentlength'), 10) || 0,
+      mtime: Date.parse(davXmlText(blk, 'getlastmodified')) || 0,
+      used: parseInt(davXmlText(blk, 'quota-used-bytes'), 10) || 0,
+      avail: parseInt(davXmlText(blk, 'quota-available-bytes'), 10) || 0
+    })
+  }
+  return out
+}
+const DAV_PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?>' +
+  '<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:resourcetype/><d:getcontentlength/>' +
+  '<d:getlastmodified/><d:quota-used-bytes/><d:quota-available-bytes/></d:prop></d:propfind>'
+
+/* 列一个目录的全部子项（PROPFIND Depth:1，带 10 分钟快照缓存）。
+ * 第一条返回的是目录本身（Depth:1 的约定），按 path 对齐剔除。 */
+async function davList(kind, p, force, n) {
+  /* 光鸭官方接口模式：不走 PROPFIND，走 get_file_list（返回 items 与 PROPFIND 同构，下游全部无感） */
+  if (kind === 'guangya' && gyIsApi(kind, n)) return gyApiList(p, force, n)
+  const inst = davInst(kind, n)
+  const key = inst + ' ' + String(p || '').replace(/^\/+|\/+$/g, '')
+  if (!force) {
+    const hit = DAV_SNAP.get(key)
+    if (hit && Date.now() - hit.t < DAV_SNAP_TTL) return hit.items
+  }
+  let rs
+  try {
+    rs = await davReq(kind, 'PROPFIND', p, { headers: { Depth: '1', 'Content-Type': 'application/xml; charset=utf-8' }, body: DAV_PROPFIND_BODY }, n)
+  } catch (e) {
+    DAV_AUTH[inst] = { ok: false, err: '连接失败：' + e.message }
+    throw new Error(davLabel(kind) + (parseInt(n, 10) > 1 ? '（账号 ' + parseInt(n, 10) + '）' : '') + ' 连接失败：' + e.message)
+  }
+  if (rs.status === 401) { DAV_AUTH[inst] = { ok: false, err: '账号或密钥不对（HTTP 401）' }; throw new Error(davLabel(kind) + ' 账号或密钥不对（HTTP 401）') }
+  if (rs.status === 404) throw new Error(davLabel(kind) + ' 目录不存在：/' + String(p || '').replace(/^\/+|\/+$/g, ''))
+  if (rs.status >= 400) { DAV_AUTH[inst] = { ok: false, err: 'HTTP ' + rs.status }; throw new Error(davLabel(kind) + ' 服务器返回 HTTP ' + rs.status + '（地址可能没写对，或不是 WebDAV 端点）') }
+  const self = '/' + String(p || '').replace(/^\/+|\/+$/g, '')
+  const items = davParseMultistatus(rs.text(), p).filter(x => x.path !== self)
+  DAV_AUTH[inst] = { ok: true, err: '' }
+  DAV_SNAP.set(key, { t: Date.now(), items })
+  return items
+}
+
+/* 递归遍历一个 WebDAV 媒体库根，产出与本地 / 115 walk 同构的条目：{ vpath, size, mtime, name } */
+async function davWalk(kind, root, onDir, force) {
+  const n = Math.max(1, parseInt(root && root.acct, 10) || 1)   // 账号号随 root 走
+  const pref = davPref(kind, n)
+  const files = []
+  const base = String(root.path || '').replace(/^\/+|\/+$/g, '')
+  const t0 = Date.now()
+  let dirs = 0, err0 = null
+  const rec = async (p, rel, depth) => {
+    if (files.length >= DAV_MAX_FILES || dirs >= DAV_MAX_DIRS) return
+    /* 扫描中途点了「停止扫描」→ 立即收手（每个子目录一次检查）。
+     * 之前只在大根循环处检查，一个根内部（光鸭整树可能上百目录）完全不理会取消，
+     * 用户按了停止要干等几分钟 —— 就是他看到的「停止没用」。 */
+    if (scWalkStopped()) return files
+    let list = []
+    try { list = await davList(kind, p, force, n) }
+    catch (e) { console.log('[' + kind + (n > 1 ? '@' + n : '') + '] 列目录失败 /' + p + '：' + e.message); if (!err0) err0 = e; return }
+    for (const f of list) {
+      if (!f.name || f.name.startsWith('.')) continue
+      const rp = rel ? rel + '/' + f.name : f.name
+      if (f.isDir) {
+        if (depth < 12) { dirs++; if (onDir) onDir(rp); await rec(f.path.replace(/^\/+/, ''), rp, depth + 1) }
+      } else if (VIDEO_EXT.includes(extOf(f.name))) {
+        files.push({ vpath: pref + rp, size: f.size, mtime: f.mtime, name: f.name })
+      }
+    }
+  }
+  await rec(base, base, 0)
+  console.log('[' + kind + (n > 1 ? '@' + n : '') + '] 遍历「' + (root.name || root.path || '/') + '」：' + files.length + ' 个视频 / ' + dirs + ' 个目录，用时 ' + (Date.now() - t0) + 'ms')
+  if (err0) {
+    if (!files.length) throw err0
+    files.err = err0.message
+  }
+  return files
+}
+
+/* 容量探测（PROPFIND 根目录 Depth:0 的 quota-*）：拿得到就上卡片容量条，拿不到就 null。
+ * 10 分钟缓存；纯展示，失败绝不影响扫描 / 播放。 */
+function davFmtBytes(b) {
+  b = Number(b) || 0
+  const u = [['TB', 1 << 40], ['GB', 1 << 30], ['MB', 1 << 20]]
+  for (const [s, d] of u) if (b >= d) return (b / d).toFixed(b >= d * 10 ? 1 : 2) + s
+  return Math.max(0, Math.round(b)) + 'B'
+}
+async function davQuota(kind, force, n) {
+  const inst = davInst(kind, n)
+  const hit = DAV_QUOTA[inst]
+  if (!force && hit && Date.now() - hit.t < DAV_SNAP_TTL) return hit.space
+  if (!davReady(kind, n)) return null
+  /* 光鸭官方接口模式：容量从 user/me 里尽力扫（没有就不显示，绝不影响其它功能） */
+  if (kind === 'guangya' && gyIsApi(kind, n)) {
+    try {
+      const u = await gyUserInfo(n, true)
+      DAV_QUOTA[inst] = { t: Date.now(), space: (u && u.space) || null }
+    } catch (_) { DAV_QUOTA[inst] = { t: Date.now(), space: null } }
+    return DAV_QUOTA[inst].space
+  }
+  try {
+    const rs = await davReq(kind, 'PROPFIND', '', { headers: { Depth: '0', 'Content-Type': 'application/xml; charset=utf-8' }, body: DAV_PROPFIND_BODY, timeout: 12000 }, n)
+    if (rs.status >= 400) { DAV_QUOTA[inst] = { t: Date.now(), space: null }; return null }
+    const one = davParseMultistatus(rs.text(), '')[0]
+    if (!one || !(one.used || one.avail)) { DAV_QUOTA[inst] = { t: Date.now(), space: null }; return null }
+    const used = Number(one.used) || 0
+    const total = used + (Number(one.avail) || 0)
+    const space = total > 0 ? {
+      used, total,
+      usedFmt: davFmtBytes(used), totalFmt: davFmtBytes(total), remainFmt: davFmtBytes(Math.max(0, total - used)),
+      percent: Math.min(100, Math.round(used / total * 1000) / 10)
+    } : null
+    DAV_QUOTA[inst] = { t: Date.now(), space }
+    return space
+  } catch (_) { return null }
+}
+const davQuotaCached = (kind, n) => { const h = DAV_QUOTA[davInst(kind, n)]; return (h && Date.now() - h.t < DAV_SNAP_TTL) ? h.space : null }
+
+/* 播放：GET + Range 原样转发（<video> 的拖动靠 Range，Accept-Ranges 透传即可） */
+async function davServe(req, res, rel) {
+  const sp = davSplitRel(rel)
+  if (!sp) { res.writeHead(404); return res.end('Not Found') }
+  const kind = sp.kind, n = sp.n
+  /* 光鸭官方接口模式：路径 → fileId → 官方下载直链 → 管道转发（与 WebDAV 的 GET 转发同一个出口体验） */
+  if (kind === 'guangya' && gyIsApi(kind, n)) return gyApiServe(req, res, sp.p, n)
+  if (!davReady(kind, n)) {
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end(davLabel(kind) + (n > 1 ? '（账号 ' + n + '）' : '') + ' 还没有配置服务器地址 / 账号 / 密钥，请到「添加影片 → 管理面板」补齐后再播放')
+  }
+  let rs
+  try {
+    rs = await davReq(kind, 'GET', sp.p, { headers: req.headers.range ? { Range: String(req.headers.range) } : {}, readBuf: false, timeout: 30000 }, n)
+  } catch (e) {
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end(davLabel(kind) + ' 取流失败：' + ((e && e.message) || e))
+  }
+  if (rs.status >= 400) {
+    try { rs.stream.destroy() } catch (_) {}
+    res.writeHead(rs.status === 401 ? 502 : rs.status, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end(rs.status === 401
+      ? davLabel(kind) + ' 账号或密钥不对（HTTP 401），请到管理面板重新填写'
+      : davLabel(kind) + ' 服务器返回 HTTP ' + rs.status + '（文件可能已被移动或删除）')
+  }
+  const h = {}
+  for (const k of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'])
+    if (rs.headers[k]) h[k] = rs.headers[k]
+  if (!h['content-type']) h['content-type'] = 'video/mp4'
+  if (!h['accept-ranges']) h['accept-ranges'] = 'bytes'
+  res.writeHead(rs.status === 206 ? 206 : 200, h)
+  rs.stream.pipe(res)
+  /* 取消/断开要回收上游连接，否则网盘侧连接越积越多 */
+  res.on('close', () => { try { rs.stream.destroy() } catch (_) {} })
+  req.on('aborted', () => { try { rs.stream.destroy() } catch (_) {} })
+}
+
+/* 从已扫描条目重建 DAV_MAP（启动 / 重扫时调用；WebDAV 没有 pickcode，留着 size/mtime 供详情页用） */
+function rebuildDavMap() {
+  DAV_MAP = new Map()
+  try {
+    for (const it of (DATA && DATA.items) || []) {
+      if (!it || !it.relVideo) continue
+      const sp = davSplitRel(it.relVideo)
+      if (!sp) continue
+      DAV_MAP.set(it.relVideo, { size: it.size || 0, mtime: it.mtime || 0, name: it.relVideo })
+      for (const f of (it.files || [])) {
+        if (f && f.relVideo && davSplitRel(f.relVideo)) DAV_MAP.set(f.relVideo, { size: f.size || 0, mtime: f.mtime || 0, name: f.relVideo })
+      }
+    }
+  } catch (_) {}
+}
+rebuildDavMap()
+
+/* ==================== 光鸭云盘 · 官方接口模式（短信验证码登录，2026-10-13） ====================
+ * 用户要「像 AList 那样的登录途径」—— 即在表单里直接登录拿 token，不用去客户端翻 WebDAV 密钥。
+ * 光鸭官方 C 端 API（网页版 guangyapan.com 同源；端点与公开的 guangya/guangyaclient 客户端一致）：
+ *   短信登录 = /v1/shield/captcha/init → /v1/auth/verification → …/verify → /v1/auth/signin
+ *              （4 步，拿 access_token + refresh_token；签名用一组 x-client-* 头）
+ *   列目录   = POST api.guangyapan.com/userres/v1/file/get_file_list { parentId, page, pageSize }
+ *              （parentId 为空 = 根目录；返回 data.list[]，fileName/fileSize 已证实，其余字段防御式兼容）
+ *   下载直链 = POST api.guangyapan.com/nd.bizuserres.s/v1/get_res_download_url { fileId }
+ *   用户信息 = POST account.guangyapan.com/v1/user/me（账号显示 + 尽力探容量）
+ * 与 WebDAV 模式共存：CFG.guangya.mode = 'api' | 'webdav'；relVideo 都是 gy:/<路径>，
+ * 列目录时顺手建 路径→fileId 映射（GY_IDS），播放时反查。Token 过期自动用 refresh_token 续。 */
+const GY_API_BASE = 'https://api.guangyapan.com'
+const GY_ACC_BASE = 'https://account.guangyapan.com'
+const GY_CLIENT_ID = 'aMe-8VSlkrbQXpUR'
+const GY_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
+const GY_DIDS = {}                       // acct -> 设备号（会话内固定；接口头的 did / x-device-id 都用它）
+const GY_IDS = new Map()                 // acct|网盘路径('Movies/MovieA') -> fileId（列目录时顺手建）
+/* 光鸭直链缓存：acct|fileId -> { url, exp }（get_res_download_url 有风控配额，别每条 Range 都打一次） */
+const GY_URL = new Map()
+const GY_SMS = { phone: '', captchaToken: '', verificationId: '', t: 0, acct: 1 }   // 短信登录中间态（10 分钟有效）；acct=登录目标账号
+const GY_USERS = {}                      // acct -> user/me 缓存 { t, user, space }
+function gyIsApi(kind, n) {
+  if (kind !== 'guangya') return false
+  const c = davCfg('guangya', n)
+  if (c.mode === 'api') return true
+  if (c.mode === 'webdav') return false
+  return !!(String(c.accessToken || '').trim() || String(c.refreshToken || '').trim())   // 有 token 默认走官方接口
+}
+const gyMask = s => String(s || '').replace(/[\s-]/g, '').replace(/^(\+?\d{1,3})?(\d{3})\d{4}(\d{4})$/, '$1$2****$3')
+/* 手机号规范化（2026-10-13：用户实测「登录失败：HTTP 400」）。
+ * 光鸭官方要求 username/phone_number **带国际区号**（官方客户端示例：+86 13800138000），
+ * 四步登录（init/send/verify/signin）必须用**同一个字符串** —— 少一个 +86 就在 signin 被 400 掉。
+ * 规则：已带 '+' 原样透传；大陆 11 位手机号自动补「+86 」；带 86 前缀的补回来；其余按纯数字加 '+'。 */
+function gyNormPhone(raw) {
+  const s = String(raw || '').trim()
+  if (!s) return ''
+  if (s.startsWith('+')) return s
+  const digits = s.replace(/\D/g, '')
+  if (/^1\d{10}$/.test(digits)) return '+86 ' + digits
+  if (/^86(1\d{10})$/.test(digits)) return '+86 ' + digits.slice(2)
+  if (digits.length >= 8) return '+' + digits
+  return ''
+}
+/* 设备号：**落盘持久**（AList 的 device_id 也是存进存储配置的）。
+ * 以前是纯会话内随机 → 每次重启 = 一台新设备，光鸭风控会重新认识你（加重验证/掉登录态）。
+ * 现在首启生成一次写进 server-config.json，之后一直复用。 */
+function gyDid(n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const c = davCfg('guangya', n)
+  if (c.deviceId) { GY_DIDS[n] = c.deviceId; return c.deviceId }
+  if (!GY_DIDS[n]) GY_DIDS[n] = crypto.createHash('md5').update(String(Math.random()) + String(Date.now()) + 'gy' + n).digest('hex')
+  c.deviceId = GY_DIDS[n]
+  try { writeCfg() } catch (_) {}
+  console.log('[guangya' + (n > 1 ? '@' + n : '') + '] 已生成并固定设备号 device_id=' + GY_DIDS[n])
+  return GY_DIDS[n]
+}
+/* W3C traceparent（官方客户端对每个请求都带，格式 00-<32hex>-<16hex>-01） */
+const gyTrace = () => '00-' + crypto.randomBytes(16).toString('hex') + '-' + crypto.randomBytes(8).toString('hex') + '-01'
+/* 官方接口走 global fetch（undici 不读系统代理，正好 —— 网盘不该走代理）
+ * 每个请求都带 traceparent（与官方客户端一致，缺了部分风控端点会 400）。 */
+async function gyFetch(url, { headers = {}, json = null, timeout = 20000 } = {}) {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), timeout)
+  try {
+    const h = Object.assign({ traceparent: gyTrace() }, headers)
+    const init = { method: json !== null ? 'POST' : 'GET', headers: h, signal: ctl.signal }
+    if (json !== null) { h['content-type'] = 'application/json'; init.body = JSON.stringify(json) }
+    const rsp = await fetch(url, init)
+    const text = await rsp.text()
+    let j = null
+    try { j = JSON.parse(text) } catch (_) {}
+    return { status: rsp.status, text, j }
+  } finally { clearTimeout(timer) }
+}
+/* 给用户看的失败详情：优先 message/msg，其次把原始响应体截一段贴在后面（便于诊断 400 这种无文案的失败） */
+function gyErrDetail(status, j, rawText) {
+  const d = gyUnwrap(j) || {}
+  const m = j && (j.message || j.msg || j.error_description || j.error) || d.message || d.msg || d.error || ''
+  if (m) return String(m)
+  const t = String(rawText || '').replace(/\s+/g, ' ').trim()
+  return 'HTTP ' + status + (t && t !== '{}' ? '：' + t.slice(0, 160) : '')
+}
+/* 响应解包：有的端点包在 data 里、有的裸给 —— 两边都认（guangya JS 客户端用 .data?，python 客户端直接取顶层） */
+const gyUnwrap = j => (j && typeof j === 'object' && j.data && typeof j.data === 'object') ? j.data : (j || {})
+function gyApiHeaders(n) {
+  const c = davCfg('guangya', n)
+  return {
+    accept: 'application/json, text/plain, */*',
+    authorization: 'Bearer ' + (c.accessToken || ''),
+    did: gyDid(n), dt: '4',
+    origin: 'https://www.guangyapan.com', referer: 'https://www.guangyapan.com/',
+    'user-agent': GY_UA
+  }
+}
+function gyAccHeaders(n, extra = {}) {
+  return Object.assign({
+    accept: '*/*',
+    origin: 'https://www.guangyapan.com', referer: 'https://www.guangyapan.com/',
+    'user-agent': GY_UA,
+    'x-client-id': GY_CLIENT_ID, 'x-client-version': '0.0.1',
+    'x-device-id': gyDid(n), 'x-device-model': 'chrome%2F147.0.0.0', 'x-device-name': 'PC-Chrome',
+    'x-device-sign': 'wdi10.' + gyDid(n) + crypto.randomBytes(16).toString('hex'),
+    'x-net-work-type': 'NONE', 'x-os-version': 'MacIntel', 'x-platform-version': '1',
+    'x-protocol-version': '301', 'x-provider-name': 'NONE', 'x-sdk-version': '9.0.2'
+  }, extra)
+}
+/* refresh_token 续期（过期前自动调 + 401 后兜底调） */
+async function gyRefresh(n) {
+  const c = davCfg('guangya', n)
+  const rt = String(c.refreshToken || '').trim()
+  if (!rt) throw new Error('登录已过期且没有 refresh_token，请重新用短信验证码登录')
+  const r = await gyFetch(GY_ACC_BASE + '/v1/auth/token', {
+    headers: gyAccHeaders(n, { 'x-action': '401' }),
+    json: { client_id: GY_CLIENT_ID, grant_type: 'refresh_token', refresh_token: rt }
+  })
+  const d = gyUnwrap(r.j) || {}
+  if (r.status !== 200 || !d.access_token) {
+    const m = '刷新登录状态失败（HTTP ' + r.status + (d.message || d.msg ? '：' + (d.message || d.msg) : '') + '），请重新登录'
+    DAV_AUTH[davInst('guangya', n)] = { ok: false, err: m }
+    throw new Error(m)
+  }
+  c.accessToken = d.access_token
+  if (d.expires_in) c.tokenExp = Date.now() / 1000 + Number(d.expires_in)
+  if (d.refresh_token) c.refreshToken = d.refresh_token
+  writeCfg()
+  console.log('[guangya' + (parseInt(n, 10) > 1 ? '@' + parseInt(n, 10) : '') + '] access_token 已用 refresh_token 续期')
+  return true
+}
+/* 带鉴权的 API 调用：token 快过期先续；401 再续一次重试 */
+async function gyApi(url, { json = null, timeout = 20000, retried = false } = {}, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const c = davCfg('guangya', n)
+  /* 登录凭据优先级（与 AList 一致）：access_token → refresh_token → 重新短信登录。
+   * 只有 refresh_token（用户「粘贴 Token」时只填了这个）就先换票，别白打一次 401。 */
+  if (!String(c.accessToken || '').trim() && String(c.refreshToken || '').trim()) {
+    await gyRefresh(n)
+  } else if (c.tokenExp && Date.now() / 1000 >= c.tokenExp - 30) {
+    await gyRefresh(n)
+  }
+  let r
+  try { r = await gyFetch(url, { headers: gyApiHeaders(n), json, timeout }) }
+  catch (e) { throw new Error('光鸭云盘连接失败：' + e.message) }
+  if (r.status === 401 && !retried && String(c.refreshToken || '').trim()) {
+    try { await gyRefresh(n) } catch (_) {}
+    return gyApi(url, { json, timeout, retried: true }, n)
+  }
+  if (r.status === 401) {
+    const m = '光鸭登录已过期' + (n > 1 ? '（账号 ' + n + '）' : '') + '（HTTP 401），请到管理面板重新登录'
+    DAV_AUTH[davInst('guangya', n)] = { ok: false, err: m }
+    throw new Error(m)
+  }
+  if (r.status >= 400) throw new Error('光鸭云盘接口返回 HTTP ' + r.status)
+  return r.j
+}
+/* 账号信息 + 尽力探容量（容量字段官方没文档，深度扫 capacity/space 类数字键，找不到就不显示） */
+function gySpaceScan(d, depth, acc) {
+  if (!d || typeof d !== 'object' || depth > 3) return
+  for (const k of Object.keys(d)) {
+    const v = d[k]
+    if (v && typeof v === 'object') { gySpaceScan(v, depth + 1, acc); continue }
+    if (typeof v !== 'number' || v <= 0) continue
+    if (/total|capacity|quota|space/i.test(k) && !/used|free|avail|remain/i.test(k)) acc.total = Math.max(acc.total || 0, v)
+    else if (/used/i.test(k)) acc.used = Math.max(acc.used || 0, v)
+    else if (/^(free|avail\w*|remain\w*)$/i.test(k)) acc.avail = Math.max(acc.avail || 0, v)
+  }
+}
+async function gyUserInfo(n, force, retried) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const cu = GY_USERS[n]
+  if (!force && cu && Date.now() - cu.t < 600000) return cu
+  if (!davReady('guangya', n) || !gyIsApi('guangya', n)) return null
+  const r = await gyFetch(GY_ACC_BASE + '/v1/user/me', {
+    headers: gyAccHeaders(n, { authorization: 'Bearer ' + (davCfg('guangya', n).accessToken || '') }), timeout: 15000
+  })
+  if (r.status === 401) {
+    /* 401 → 先续期；续期失败把真实原因抛出去（⚠ 不能吞掉异常再递归 —— 那=无限循环） */
+    if (retried) {
+      const m = '光鸭登录已过期（HTTP 401），请重新登录'
+      DAV_AUTH[davInst('guangya', n)] = { ok: false, err: m }
+      throw new Error(m)
+    }
+    await gyRefresh(n)
+    return gyUserInfo(n, true, true)
+  }
+  if (r.status >= 400) throw new Error('光鸭用户信息获取失败（HTTP ' + r.status + '）')
+  const d = gyUnwrap(r.j) || {}
+  const nm = gyMask(d.phone_number || d.phone || d.mobile || '') || String(d.nickname || d.nick_name || d.username || d.user_name || d.account || '').trim()
+  if (nm) davCfg('guangya', n).account = nm
+  const sp = {}
+  gySpaceScan(d, 0, sp)
+  let space = null
+  if (sp.total > 0) {
+    const used = sp.used || Math.max(0, sp.total - (sp.avail || 0))
+    space = {
+      used, total: sp.total,
+      usedFmt: davFmtBytes(used), totalFmt: davFmtBytes(sp.total), remainFmt: davFmtBytes(Math.max(0, sp.total - used)),
+      percent: Math.min(100, Math.round(used / sp.total * 1000) / 10)
+    }
+  }
+  GY_USERS[n] = { t: Date.now(), user: davCfg('guangya', n).account || '', space }
+  return GY_USERS[n]
+}
+/* 官方接口模式列目录：路径 → parentId 反查（GY_IDS）+ 分页拉全，产出与 PROPFIND 同构的 items。
+ * 目录类型判定官方无文档，多形态兼容 + 兜底「无扩展名且 size=0 视作目录」（媒体树里够准）。 */
+async function gyResolveId(rp, n) {
+  rp = String(rp || '').replace(/^\/+|\/+$/g, '')
+  if (!rp) return ''
+  const k = (Math.max(1, parseInt(n, 10) || 1)) + '|' + rp
+  if (GY_IDS.has(k)) return GY_IDS.get(k)
+  const segs = rp.split('/')
+  let cur = ''
+  for (let i = 0; i < segs.length; i++) {
+    const kk = (Math.max(1, parseInt(n, 10) || 1)) + '|' + segs.slice(0, i + 1).join('/')
+    if (!GY_IDS.has(kk)) await gyApiList(cur, true, n)      // 缺哪段就列哪段父目录
+    if (!GY_IDS.has(kk)) throw new Error('光鸭云盘里找不到目录：/' + segs.slice(0, i + 1).join('/'))
+    cur = segs.slice(0, i + 1).join('/')
+  }
+  return GY_IDS.get(k)
+}
+async function gyApiList(p, force, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const rp = String(p || '').replace(/^\/+|\/+$/g, '')
+  const key = davInst('guangya', n) + ' ' + rp
+  if (!force) {
+    const hit = DAV_SNAP.get(key)
+    if (hit && Date.now() - hit.t < DAV_SNAP_TTL) return hit.items
+  }
+  const parentId = await gyResolveId(rp, n)
+  const items = []
+  let page = 0
+  for (;;) {
+    const j = await gyApi(GY_API_BASE + '/userres/v1/file/get_file_list', {
+      json: { parentId, page, pageSize: 200, orderBy: 0, sortType: 0 }
+    }, n)
+    const d = gyUnwrap(j) || {}
+    const list = d.list || d.files || d.fileList || []
+    for (const f of list) {
+      if (!f || typeof f !== 'object') continue
+      const name = String(f.fileName || f.name || f.file_name || '').trim()
+      if (!name) continue
+      const id = String(f.fileId || f.fileID || f.id || '')
+      const rel = rp ? rp + '/' + name : name
+      if (id) GY_IDS.set(n + '|' + rel, id)
+      /* 目录判定（2026-10-15 抓包）：光鸭的 `dirType` 对**目录和文件都是 1**，不能拿来判；
+       * 真正的判据是 `resType`（2=目录 / 1=文件）。缺 resType 时才回退到老的那串猜测。 */
+      let isDir
+      if (f.resType === 2) isDir = true
+      else if (f.resType === 1) isDir = false
+      else isDir = f.isDir === true || f.is_dir === true || f.dir === true || f.dir === 1 ||
+        f.folder === true || f.folderFlag === 1 || f.type === 0 || f.fileType === 0
+      if (f.resType !== 1 && !isDir && !(Number(f.fileSize || f.size || 0) > 0) && !/\.[a-z0-9]{1,5}$/i.test(name)) isDir = true
+      /* 修改时间：光鸭实测字段是 `utime`（秒），老代码只认 updateTime/modifyTime/lastUpdateTime
+       * → mtime 恒为 0，增量扫描每次都当「新文件」。这里补上 utime / ctime 兜底。 */
+      let mtime = Number(f.updateTime || f.modifyTime || f.lastUpdateTime || f.utime || f.ctime || 0) || 0
+      if (mtime && mtime < 1e12) mtime *= 1000        // 秒 → 毫秒
+      items.push({ path: '/' + rel, name, isDir: !!isDir, size: Number(f.fileSize || f.size || 0) || 0, mtime })
+    }
+    if (list.length < 200 || page > 100) break
+    page++
+  }
+  DAV_AUTH[davInst('guangya', n)] = { ok: true, err: '' }
+  DAV_SNAP.set(key, { t: Date.now(), items })
+  return items
+}
+/* 官方接口模式播放：路径 → fileId → get_res_download_url → fetch 直链（带 Range）管道转发 */
+async function gyApiServe(req, res, p, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const rp = String(p || '').replace(/^\/+|\/+$/g, '')
+  if (!davReady('guangya', n)) {
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('光鸭网盘还没有登录，请到「媒体源 → 光鸭网盘」用短信验证码登录后再播放')
+  }
+  const fileId = await gyResolveId(rp, n).catch(() => '')
+  if (!fileId) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('光鸭云盘里找不到这个文件：/' + rp)
+  }
+  /* 直链缓存（2026-10-15）：get_res_download_url 每次调用都算一次风控配额，而直链本身
+   * 有效期 urlDuration（实测 6 小时）。按 acct|fileId 缓存，取 min(urlDuration, 30min) 保守过期，
+   * 拖动进度条时就不会反复打接口。403/过期时清缓存重取一次。 */
+  const gk = n + '|' + fileId
+  const ghit = GY_URL.get(gk)
+  let url = (ghit && ghit.exp > Date.now()) ? ghit.url : ''
+  if (!url) {
+    try {
+      const j = await gyApi(GY_API_BASE + '/nd.bizuserres.s/v1/get_res_download_url', { json: { fileId } }, n)
+      const d = gyUnwrap(j) || {}
+      /* ⚠ 字段名实测是 **signedURL**（2026-10-15 抓包确证）—— 以前只认 url/download_url/downloadUrl/link，
+       * 一个都对不上 → 永远「没有返回下载直链」，光鸭片源全部 502 播不了。 */
+      url = d.url || d.signedURL || d.signedUrl || d.download_url || d.downloadUrl || d.link || ''
+      if (url) {
+        const ttl = Math.min(Math.max(60, Number(d.urlDuration) || 21600), 1800) * 1000
+        GY_URL.set(gk, { url, exp: Date.now() + ttl })
+        if (GY_URL.size > 64) GY_URL.clear()
+      }
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+      return res.end('光鸭网盘取下载直链失败：' + e.message)
+    }
+  }
+  if (!url) {
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('光鸭网盘没有返回下载直链（文件可能已被删除或风控限制）')
+  }
+  let rsp
+  /* 取流：直链过期/被拒（401/403/404）时丢掉缓存重取一次（最多两轮，避免死循环） */
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const h = { 'user-agent': GY_UA }
+      if (req.headers.range) h.range = String(req.headers.range)
+      rsp = await fetch(url, { headers: h, redirect: 'follow' })
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+      return res.end('光鸭网盘取流失败：' + e.message)
+    }
+    const hard = rsp.status === 401 || rsp.status === 403 || rsp.status === 404
+    if (rsp.status < 400) break
+    if (hard && attempt === 0) {
+      /* 丢缓存、重新要一条新直链，再来一轮 */
+      try { if (rsp.body) rsp.body.cancel().catch(() => {}) } catch (_) {}
+      GY_URL.delete(gk)
+      try {
+        const j = await gyApi(GY_API_BASE + '/nd.bizuserres.s/v1/get_res_download_url', { json: { fileId } }, n)
+        const d = gyUnwrap(j) || {}
+        const u2 = d.url || d.signedURL || d.signedUrl || d.download_url || d.downloadUrl || d.link || ''
+        if (u2 && u2 !== url) {
+          url = u2
+          const ttl = Math.min(Math.max(60, Number(d.urlDuration) || 21600), 1800) * 1000
+          GY_URL.set(gk, { url, exp: Date.now() + ttl })
+          continue
+        }
+      } catch (_) {}
+    }
+    res.writeHead(hard ? 502 : rsp.status, { 'Content-Type': 'text/plain; charset=utf-8' })
+    return res.end('光鸭网盘直链返回 HTTP ' + rsp.status + '（链接可能已过期，重试一次；反复出现就重新登录）')
+  }
+  const h = {}
+  for (const k of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'])
+    if (rsp.headers.get(k)) h[k] = rsp.headers.get(k)
+  if (!h['content-type']) h['content-type'] = 'video/mp4'
+  if (!h['accept-ranges']) h['accept-ranges'] = 'bytes'
+  res.writeHead(rsp.status === 206 ? 206 : 200, h)
+  const { Readable } = require('stream')
+  const node = Readable.fromWeb(rsp.body)
+  node.pipe(res)
+  const kill = () => { try { node.destroy() } catch (_) {} }
+  res.on('close', kill)
+  req.on('aborted', kill)
+}
+
+/* WebDAV 媒体库根的收录统计（与 libStats / v115Stats 同形）。n = 账号号 */
+function davStats(kind, n) {
+  n = Math.max(1, parseInt(n, 10) || 1)
+  const items = (DATA && DATA.items) || []
+  const pref = davPref(kind, n)
+  return davRoots(kind, n).map(r => {
+    const base = pref + String(r.path || '').replace(/^\/+|\/+$/g, '')
+    const bp = base === pref ? pref : base + '/'
+    let videos = 0, ok = 0, fail = 0, cover = 0
+    for (const it of items) {
+      const rv = (it && it.relVideo) ? String(it.relVideo) : ''
+      if (rv.indexOf(pref) !== 0) continue
+      if (!(rv === base || rv.indexOf(bp) === 0)) continue
+      videos++
+      if (it.pending) fail++; else ok++
+      if (it.relPoster || it.relFanart) cover++
+    }
+    return { kind: davLabel(kind), acct: n, path: r.path || '', name: r.name || r.path || (davLabel(kind) + ' 目录'), videos, ok, fail, cover }
+  })
+}
+
+/* 在 WebDAV / 光鸭里按番号找视频（「📂 匹配文件」用），返回结构与 v115FindByCode 同构 */
+async function davFindAllByCode(ccode, force) {
+  const out = []
+  DAV_FIND_NOTE = ''
+  if (!ccode) return out
+  for (const kind of DAV_KINDS) {
+    for (const n of davAcctList(kind)) {
+      if (!davReady(kind, n)) continue
+      const inst = davInst(kind, n)
+      if (DAV_AUTH[inst] && DAV_AUTH[inst].ok === false) { DAV_FIND_NOTE = davLabel(kind) + (n > 1 ? '（账号 ' + n + '）' : '') + '：' + DAV_AUTH[inst].err; continue }
+      for (const root0 of davRoots(kind, n)) {
+        const root = Object.assign({}, root0, { acct: n })
+        let files = []
+        try { files = await davWalk(kind, root, null, force !== false) }
+        catch (e) {
+          console.log('[' + kind + (n > 1 ? '@' + n : '') + '] 按番号查找：遍历「' + (root.name || root.path) + '」失败：' + e.message)
+          if (!DAV_FIND_NOTE) DAV_FIND_NOTE = davLabel(kind) + ' 读取失败：' + ((e && e.message) || '未知错误')
+          continue
+        }
+        if (files.err && !DAV_FIND_NOTE) DAV_FIND_NOTE = davLabel(kind) + ' 部分目录读取失败（结果可能不全）：' + files.err
+        for (const f of files) {
+          const bn = bare(baseOf(f.name))
+          const dn = bare(path.basename(path.dirname(f.vpath)))
+          let pc = ''
+          try { pc = bare(parseName(f.name).code) } catch (_) {}
+          if (pc === ccode || (ccode.length >= 3 && (bn.includes(ccode) || dn.includes(ccode)))) {
+            out.push({
+              relVideo: f.vpath,
+              file: f.name,
+              dir: f.vpath.split('/').slice(1, -1).join('/'),
+              [kind]: true,
+              size: f.size || 0
+            })
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+/* ======== WebDAV / 光鸭 模块结束 ======== */
+
 /* 命名噪声：站点/广告域名、方括号标注、@ # 分隔符 —— 4k688.com@UZU-040 → UZU-040；
  * 169bbs.com@START-280_[4K] → START-280；madoubt.com 326388.xyz HEYZO-3901 → HEYZO-3901。
  * 只在常规模式全部匹配不上时才启用（原来这种情况会退化成「前 18 个字符」的垃圾番号）。 */
@@ -853,6 +3464,89 @@ const parseCodeFrom = base => {
   if (m) return { code: m[1].toUpperCase(), title: (m[2] || '').trim() || m[1] }
   return null
 }
+/* 嵌入式番号提取（照 mdc-ng 的做法：番号常被噪声包裹，要在「去噪后的整串」里搜索，
+ * 而不是要求整串就是番号）。三种常规写法按优先级匹配：
+ *   ① 横杠式  GOJU-317 / GL-014 / STARS-238 / ABC-123 / SONE-248 / MIDE-786
+ *   ② 日期式  092126-001（无码厂 carib/1pondo…）
+ *   ③ 无横杠  STARS238 / HEYZO3902（字母前缀 + 数字）
+ * 前缀限定 [A-Za-z]{2,6}（纯数字 2048 不会误中），数字 2~5 位（番号位数）；
+ * 后缀的 B/(4K)/.restored/-www.xxx 等噪声由调用方先 stripNameNoise 清掉，这里只认番号本体。 */
+const RE_EMBED_DASH = /([A-Za-z]{2,6})-(\d{2,5})/
+const RE_EMBED_DATE = /(\d{6})[-_](\d{2,4})/
+const RE_EMBED_NODASH = /([A-Za-z]{2,6})(\d{3,7})/
+/* mdc-ng 对齐：番号只取【基础码】；破解 / 碟片 / 字幕作为【独立属性】剥离，绝不拼进 code。
+ * 理由：基础码（GOJU-317 / GL-014）在 JavDB 上能正常刮到，而 -U / -cdN 形式的「完整码」常 404；
+ * 且 mdc-ng 的 number_parser 正是先剥网站标识→画质→字幕，再提取基础番号。
+ *   uncensored: restored/uncensored/uncut/leaked/decensored/无修正 等，或番号数字后紧贴 U
+ *   cd:          数字后紧贴 B/C/D（B=2、D=4；C 当字幕不当碟）
+ *   subtitle:    数字后紧贴 C（中字） */
+const SUFFIX_UNC = /(restored|uncensored|uncut|leaked|decensored|de-?censored|無修正|无修正)/i
+/* 显式碟标（mdc-ng 也作独立属性）：ABC-123-CD2 / -disc2 / -part3 / -vol2 / .CD1 。
+ * 边界用 [-_. ] 限定，避免误中 MCD-123（cd 前无分隔符）或 CD-R（后接字母非数字）。 */
+const RE_DISC_EXPLICIT = /(?:^|[-_. ])(?:cd|disc|part|vol)[-_. ]?(\d{1,2})(?![a-z0-9])/i
+function detectAttrs(code, ctx) {
+  const a = { uncensored: false, cd: 0, subtitle: false }
+  if (SUFFIX_UNC.test(ctx || '')) a.uncensored = true
+  /* 番号数字后紧贴的碟标/字幕/破解字母：GL-014B（碟2）/ SSIS-001C（字幕）/ GOJU-317U（破解）/ GL-014D（碟4） */
+  const m = (ctx || '').match(/(?:^|[^A-Za-z0-9])([A-Za-z]{2,6})-?(\d{2,5})([A-DU])(?![A-Za-z0-9])/)
+  if (m && (m[1] + '-' + m[2]).toUpperCase() === String(code).toUpperCase()) {
+    const L = m[3].toUpperCase()
+    if (L === 'B') a.cd = 2
+    else if (L === 'C') a.subtitle = true
+    else if (L === 'D') a.cd = 4
+    else if (L === 'U') a.uncensored = true
+  }
+  /* 显式碟标（优先级高于紧贴字母，二者同时出现时以显式数字为准） */
+  const dm = (ctx || '').match(RE_DISC_EXPLICIT)
+  if (dm) { const n = parseInt(dm[1], 10); if (n >= 1 && n <= 9) a.cd = n }
+  return a
+}
+/* mdc-ng 式 studio 专属规则：覆盖通用正则漏掉 / 误判的厂牌前缀。
+ * 顺序即优先级（先定义先匹配）。带横杠的厂牌名（S-CUTE / E-BODY…）必须显式列出，
+ * 否则通用正则会把番号误成 BODY-123 / AREA-123 之类。 */
+const STUDIO_RULES = [
+  { re: /(^|[^a-z0-9])fc2[-_ ]?ppv[-_ ]?(\d{5,7})(?![a-z0-9])/i, fmt: m => 'FC2-PPV-' + m[2] },
+  { re: /(^|[^a-z0-9])xxx[-_ ]?av[-_ ]?(\d{3,6})(?![a-z0-9])/i, fmt: m => 'xxx-av-' + m[2] },
+  { re: /(^|[^a-z0-9])([nk]\d{3,4})(?![a-z0-9])/i, fmt: m => m[2] },                                       // Tokyo Hot n1234 / k1234（小写保留）
+  { re: /(^|[^a-z0-9])x[-_ ]?art[.\-_ ]?(\d{2})[.\-_ ]?(\d{2})[.\-_ ]?(\d{2})(?![a-z0-9])/i, fmt: m => 'x-art-' + m[2] + '-' + m[3] + '-' + m[4] },
+  { re: /(^|[^a-z0-9])hey[-_ ]?douga[-_ ]?(\d{3,5})[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'HEYDOUGA-' + m[2] + '-' + m[3] },  // HeyDouga 两段式番号
+  { re: /(^|[^a-z0-9])s[-_ ]?cute[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'S-CUTE-' + m[2] },              // S-CUTE（厂牌名含横杠）
+  { re: /(^|[^a-z0-9])e[-_ ]?body[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'E-BODY-' + m[2] },              // E-BODY
+  { re: /(^|[^a-z0-9])g[-_ ]?area[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'G-AREA-' + m[2] },              // G-AREA
+  { re: /(^|[^a-z0-9])t[-_ ]?cup[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'T-CUP-' + m[2] },                // T-CUP
+  { re: /(^|[^a-z0-9])m[-_ ]?solo[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'M-SOLO-' + m[2] },              // M-SOLO
+  { re: /(^|[^a-z0-9])k[-_ ]?cup[-_ ]?(\d{2,4})(?![a-z0-9])/i, fmt: m => 'K-CUP-' + m[2] },                // K-CUP
+  { re: /(^|[^a-z0-9])carib(?:bean)?(?:com)?[-_ ]?(\d{3,4})(?![a-z0-9])/i, fmt: m => 'CARIB-' + m[2] },    // caribbeancom / carib
+  { re: /(^|[^a-z0-9])(?:1pondo?|1pon)[-_ ]?(\d{3,6})(?![a-z0-9])/i, fmt: m => '1PON-' + m[2] },           // 1pondo / 1pon
+  { re: /(^|[^a-z0-9])gana[-_ ]?(\d{3,4})(?![a-z0-9])/i, fmt: m => 'GANA-' + m[2] },                       // GANA
+]
+const studioCode = s => {
+  if (!s) return null
+  for (const r of STUDIO_RULES) { const m = s.match(r.re); if (m) return r.fmt(m) }
+  return null
+}
+const extractEmbeddedCode = s => {
+  if (!s) return null
+  let m = s.match(RE_EMBED_DASH); if (m) return (m[1] + '-' + m[2]).toUpperCase()
+  m = s.match(RE_EMBED_DATE); if (m) return m[1] + '-' + m[2]
+  m = s.match(RE_EMBED_NODASH); if (m) return (m[1] + '-' + m[2]).toUpperCase()
+  return null
+}
+/* 严格「干净番号」判定：只认三种规范形态（与 parseCodeFrom 接受的范围一致）。
+ * 不能复用 impValidCode——它只要求「含字母且含数字」，垃圾串 2048-HK-GOJU-317-R 也会误判通过。
+ * 这个判定用来识别「旧解析器误判出来的垃圾 code」，好在复用时重新识别。 */
+const isCleanCode = c => {
+  c = String(c || '').toUpperCase()
+  return /^([A-Z0-9]{2,10})-(\d{2,7})$/.test(c) ||
+         /^\d{6}[-_](\d{2,4})$/.test(c) ||
+         /^[A-Z0-9]{2,6}(\d{3,7})$/.test(c) ||
+         /^([A-Z0-9]{2,10})-(\d{2,7})(-U)?(-CD[1-9])?$/i.test(c) ||   // 带破解 -U / 碟片 -cdN 后缀
+         /^[A-Z0-9]{2,6}(\d{3,7})(-U)?(-CD[1-9])?$/i.test(c)
+}
+const withAttrs = (code, title, ctx) => {
+  const a = detectAttrs(code, ctx)
+  return { code, title, uncensored: a.uncensored, cd: a.cd, subtitle: a.subtitle }
+}
 const parseName = name => {
   const raw = baseOf(name)
   const base = raw.replace(/[._]+/g, ' ').trim()
@@ -860,18 +3554,28 @@ const parseName = name => {
    * 必须在摊平 . _ 之前做，否则 082926_001-1PON 的下划线会被吃掉、番号解析失败。 */
   const junked = stripNameJunk(raw)
   const jd = junked.match(RE_DATE_CODE)
-  if (jd) return { code: jd[1] + '-' + jd[2], title: junked.replace(/\s+/g, ' ') }
+  if (jd) return withAttrs(jd[1] + '-' + jd[2], junked.replace(/\s+/g, ' '), junked)
   /* ② 常规番号：先去噪声再解析，否则「hhd800.com@HEYZO-3902」里的域名数字会被当成番号（HHD-800）。
    * 没有噪声时 clean 与 base 相同，行为与原逻辑一致。 */
   const clean = stripNameNoise(raw).replace(/[._]+/g, ' ').trim()
   if (clean && clean !== base) {
+    const st = studioCode(clean) || studioCode(base)   // mdc-ng 式 studio 专属规则（FC2-PPV / xxx-av / Tokyo Hot / x-art）
+    if (st) return withAttrs(st, base, clean)
     const hit0 = parseCodeFrom(clean)
-    if (hit0) return hit0
+    if (hit0) return withAttrs(hit0.code, hit0.title, clean)
+    /* 番号被噪声包裹（2048.hk@GOJU-317.restored / GL-014B(4K)-www.52iv.net）→
+     * 在去噪串里搜嵌入式番号，而不是回退成垃圾串 */
+    const emb = extractEmbeddedCode(clean)
+    if (emb) return withAttrs(emb, (clean.replace(emb, '').replace(/\s+/g, ' ').trim() || base), clean)
   }
+  const st2 = studioCode(base)
+  if (st2) return withAttrs(st2, base, base)
   const hit = parseCodeFrom(base)
-  if (hit) return hit
-  if (clean && clean !== base) return { code: clean.slice(0, 18), title: clean }
-  return { code: base.slice(0, 18), title: base }
+  if (hit) return withAttrs(hit.code, hit.title, base)
+  const emb2 = extractEmbeddedCode(base)
+  if (emb2) return withAttrs(emb2, (base.replace(emb2, '').replace(/\s+/g, ' ').trim() || base), base)
+  /* 真·无番号：返回空 code（而非垃圾串），老老实实进「识别失败待处理」让用户在卡片里手填 */
+  return { code: '', title: base, uncensored: false, cd: 0, subtitle: false }
 }
 
 /* ---------- NFO 解析（Kodi 格式，正则版） ---------- */
@@ -1104,6 +3808,68 @@ async function repairSplitCovers() {
 }
 
 /* ---------- 扫描 ---------- */
+/* ---------- 扫描稳定性/加速工具（2026-10-09） ----------
+ * 背景：媒体库走 115 云盘等网络挂载，readdir/readFile/stat/open 在云盘休眠或抖动时会
+ * 挂住数秒到数十秒，扫描期间任何一个单点 I/O 不返回，整条扫描就永久卡死（用户只能重启）。
+ * 三件套解决：
+ *   1) ioTimeout  —— 每个单点 I/O 套超时，超时降级为 null/fallback 继续，绝不阻塞整条扫描；
+ *   2) poolMap     —— 有界并发（网盘并发读不能太高，否则雪崩），把串行 match 变成流水线；
+ *   3) IMGSZ_CACHE —— 图片宽高按「路径+size+mtime」缓存，避免每次重扫都 open+read 头 64KB。 */
+
+/* 超时兜底：promise 超时返回 fallback（默认 null），并对 late rejection 吞掉防 unhandledRejection。
+ * 云盘挂载的 open/read/readdir 拿不到真实错误码，超时是最可靠的降级信号。 */
+function ioTimeout(promise, ms, fallback = null) {
+  return new Promise(resolve => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolve(fallback)          // 超时：降级，不抛错，让调用方用 fallback 继续
+    }, ms)
+    Promise.resolve(promise).then(
+      v => { if (!settled) { settled = true; clearTimeout(timer); resolve(v) } },
+      () => { if (!settled) { settled = true; clearTimeout(timer); resolve(fallback) } }  // 错误也降级为 fallback
+    )
+  })
+}
+/* 有界并发池：concurrency 个 worker 消费 items，逐个 await mapper(items[i], i)。
+ * 用于 match 阶段（每部影片一组网盘读）。池大小固定，避免打爆网盘句柄。 */
+async function poolMap(items, mapper, concurrency = 6) {
+  const arr = Array.from(items)
+  const out = new Array(arr.length)
+  let idx = 0
+  const workers = []
+  const n = Math.max(1, Math.min(concurrency, arr.length))
+  for (let w = 0; w < n; w++) {
+    workers.push((async () => {
+      while (true) {
+        const i = idx++
+        if (i >= arr.length) break
+        out[i] = await mapper(arr[i], i)
+      }
+    })())
+  }
+  await Promise.all(workers)
+  return out
+}
+/* 图片宽高缓存：fp -> {m: mtimeMs, s: size, w, h}。命中且 mtime/size 一致直接复用，不再 open+read。
+ * 存内存（扫描间复用）；网盘上 open 一张图可能 1-3s，重扫 1294 部能省下可观的等待。 */
+const IMGSZ_CACHE = new Map()
+const IMGSZ_CACHE_MAX = 4096   // 超出按插入顺序淘汰最早的，防止无限增长
+async function imgSizeCached(fp) {
+  let st = null
+  try { st = await ioTimeout(fsp.stat(fp), 4000, null) } catch (_) {}
+  const m = st ? st.mtimeMs : 0, s = st ? st.size : 0
+  const hit = IMGSZ_CACHE.get(fp)
+  if (hit && hit.m === m && hit.s === s) return hit
+  const r = await imgSizeAsync(fp)
+  if (r) {
+    if (IMGSZ_CACHE.size >= IMGSZ_CACHE_MAX) IMGSZ_CACHE.delete(IMGSZ_CACHE.keys().next().value)
+    IMGSZ_CACHE.set(fp, { m, s, w: r.w, h: r.h })
+  }
+  return r
+}
+
 function walk(dir, out = []) {
   let entries = []
   try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_) { return out }
@@ -1115,77 +3881,367 @@ function walk(dir, out = []) {
   }
   return out
 }
-/* 异步版（扫描专用）：网盘挂载上 readdir 也可能卡数秒，主线程不能停 */
-async function walkAsync(dir, out = []) {
-  let entries = []
-  try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch (_) { return out }
-  for (const e of entries) {
-    if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === '_trash') continue
-    const fp = path.join(dir, e.name)
-    if (e.isDirectory()) await walkAsync(fp, out)
-    else if (VIDEO_EXT.includes(extOf(e.name))) out.push(fp)
+/* 异步版（扫描专用）：网盘挂载上 readdir 也可能卡数秒，主线程不能停。
+ * 2026-09 之前是「两遍遍历」：walkAsync 只收视频、indexImgs 再收图片，同一棵目录树
+ * readdir 两遍 —— 网盘上 readdir 是最贵的一步，等于扫描时间白翻一倍。
+ * 现在合并成单遍：一次 readdir 同时分流「视频文件 / 图片 / NFO / extrafanart 子目录」，
+ * 产出 snapshot = { 视频绝对路径[], dirs: {目录绝对路径 -> {imgs[], nfos[], samples[]}} }，
+ * match 阶段直接查内存快照，不再二次读目录。
+ * 并发：同层子目录并发 readdir（限并发，防止网盘句柄雪崩）；readdir 套超时，
+ * 云盘卡住的目录降级为空后继续，不再永久阻塞整条扫描。
+ * onDir/onFile 是扫描进度与取消的回调（每处理一个目录/文件调一次）。 */
+const WALK_CONCURRENCY = 6        // 同层并发 readdir 数；网盘挂载不宜过高（FUSE 单通道，提高也无效）
+const WALK_TIMEOUT_MS = 30000    // 单个目录 readdir 超时（云盘冷目录可能很慢，超时跳过该目录）
+/* 目录级跳过：dircache 命中（目录 mtime 未变）时，直接复用上轮存下的目录快照，
+ * 整个 readdir 都不做 —— 这是重扫提速的唯一有效手段（网盘 readdir 冷读 ~200ms 且无法并发加速）。
+ * skipStat 决定是否走 stat 比对（顶层库目录强制 readdir，才能发现新增的子目录）。 */
+async function walkAsync(dir, out = [], onDir, onFile, snapshot = null, dircache = null, skipStat = false) {
+  /* 目录级缓存命中：mtime 未变 → 复用旧快照，跳过 readdir */
+  if (snapshot && dircache && !skipStat) {
+    const hit = dircache.get(dir)
+    if (hit && hit.m && hit.snap) {
+      try {
+        const st = await ioTimeout(fsp.stat(dir), 8000, null)
+        if (st && st.mtimeMs === hit.m) {
+          /* 命中：把上轮快照原样搬进本轮 snapshot，视频直接进 out */
+          if (onDir) onDir(dir)
+          const snap = hit.snap
+          snapshot.dirs.set(dir, snap)
+          for (const fn of (hit.videos || [])) { const fp = path.join(dir, fn); out.push(fp); if (onFile) onFile(fp) }
+          return out
+        }
+      } catch (_) {}
+    }
   }
+  const entries = await ioTimeout(fsp.readdir(dir, { withFileTypes: true }), WALK_TIMEOUT_MS, [])
+  if (onDir) onDir(dir)
+  const kids = []
+  let newSnap = null, myVideos = null
+  if (snapshot) {
+    /* 单遍：一次 readdir 同时分流「视频 / 图片 / NFO / extrafanart 子目录」，视频照收不误 */
+    const snap = { imgs: [], nfos: [], samples: [] }
+    newSnap = snap; myVideos = []
+    snapshot.dirs.set(dir, snap)
+    for (const e of entries) {
+      if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === '_trash') continue
+      const fp = path.join(dir, e.name)
+      if (e.isDirectory()) { if (e.name === 'extrafanart') { kids.push({ fp, fanart: true }) } else { kids.push({ fp, fanart: false }) } }
+      else {
+        const ex = extOf(e.name)
+        if (VIDEO_EXT.includes(ex)) { out.push(fp); myVideos.push(e.name); if (onFile) onFile(fp) }
+        else if (IMG_EXT.includes(ex)) snap.imgs.push(fp)
+        else if (ex === 'nfo') snap.nfos.push(fp)
+      }
+    }
+    /* 记下本目录的视频文件名 + mtime（供下次 dirCache 命中时完全跳过 readdir） */
+    if (dircache) {
+      try {
+        const st = await ioTimeout(fsp.stat(dir), 8000, null)
+        if (st) dircache.set(dir, { m: st.mtimeMs, videos: myVideos, snap })
+      } catch (_) {}
+    }
+  } else {
+    for (const e of entries) {
+      if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === '_trash') continue
+      const fp = path.join(dir, e.name)
+      if (e.isDirectory()) kids.push({ fp, fanart: false })
+      else if (VIDEO_EXT.includes(extOf(e.name))) { out.push(fp); if (onFile) onFile(fp) }
+    }
+  }
+  /* 同层并发下钻；fanart 子目录只收图片（剧照），不收视频也不递归更深 */
+  const fanartDirs = kids.filter(k => k.fanart)
+  const subDirs = kids.filter(k => !k.fanart)
+  if (snapshot && fanartDirs.length) {
+    for (const k of fanartDirs) {
+      const es = await ioTimeout(fsp.readdir(k.fp, { withFileTypes: true }), WALK_TIMEOUT_MS, [])
+      const parent = snapshot.dirs.get(dir)
+      for (const e of es) {
+        if (e.name.startsWith('.')) continue
+        if (e.isDirectory()) continue
+        if (IMG_EXT.includes(extOf(e.name))) parent.samples.push(path.join(k.fp, e.name))
+      }
+    }
+  }
+  await poolMap(subDirs, k => walkAsync(k.fp, out, onDir, onFile, snapshot, dircache), WALK_CONCURRENCY)
   return out
 }
 
-/* ---------- 扫描（后台异步 + 进度上报，前端轮询 /api/scan 显示进度条） ---------- */
-const SCAN = { running: false, phase: '', videos: 0, scanned: 0, matched: 0, okCount: 0, failCount: 0, startedAt: 0, finishedAt: 0, ms: 0, error: '', pending: false }
+/* ---------- 扫描（后台异步 + 进度上报 + 可随时彻底取消，前端轮询 /api/scan 显示进度条） ----------
+ * 取消语义：SCAN.cancel = true 是「请求取消」，scanAsync 在每个可中断点检查它，
+ * 抛 CANCELLED 走 catch 统一收尾（清队列、不落盘半成品 DATA、不触发自动刮削、不自动续跑 pending）。
+ * 这样取消后不留残根：队列里没轮到的番号不会被自动刮削，磁盘上的 scan-result.json 保持上一次完整结果。 */
+const SCAN_CANCELLED = '已取消'
+const SCAN = {
+  running: false, phase: '', videos: 0, scanned: 0, matched: 0, okCount: 0, failCount: 0,
+  startedAt: 0, finishedAt: 0, ms: 0, error: '', pending: false, cancel: false, cancelled: false,
+  dirs: 0, found: 0, libsTotal: 0, libsDone: 0, current: '',
+  dirsTotal: 0, videosTotal: 0,
+  pendingScope: null,   // 扫描期间又来了新的 rescan(scope)：扫完按这个 scope 续跑（null = 全量）
+  skippedSmall: 0   // 被「入库最小体积」挡掉的文件数（进度面板用来说明条目数为何少于视频数）
+}
+/* 扫描可中断点：取消时抛 SCAN_CANCELLED（区别于真错误），并且只在真正该中断时抛 */
+function scScanCheck() { if (SCAN.cancel) throw new Error(SCAN_CANCELLED) }
+/* 遍历递归内部的「该收手了」检查（网盘 walk 每进一个子目录问一次）。
+ * ⚠ 必须是「扫描中 && 已请求取消」两个条件同时成立 —— 不能只看 SCAN.cancel：
+ *   matchCode / 按番号搜索 / 预热这些**非扫描**调用方也走 davWalk / v115Walk，
+ *   扫描结束后残留的 cancel 标记会把它们的无辜遍历拦腰砍断（结果静默变少，极难排查）。 */
+function scWalkStopped() { return !!(SCAN.cancel && SCAN.running) }
+function scScanReset() {
+  SCAN.running = true; SCAN.error = ''; SCAN.cancel = false; SCAN.cancelled = false
+  SCAN.phase = 'walk'; SCAN.videos = 0; SCAN.scanned = 0; SCAN.matched = 0; SCAN.okCount = 0; SCAN.failCount = 0
+  SCAN.autoQueued = 0; SCAN.dirs = 0; SCAN.found = 0; SCAN.libsDone = 0; SCAN.current = ''
+  SCAN.dirsTotal = 0; SCAN.videosTotal = 0   // 上一轮的规模，用来在 walk 阶段给出「估算百分比」（walk 阶段真实分母还不存在）
+  SCAN.skippedSmall = 0
+  SCAN.libsTotal = LIBS.length
+  SCAN.startedAt = Date.now(); SCAN.finishedAt = 0
+}
+/* 请求取消（幂等）：不在扫描中也安全调用，返回当前状态让前端统一处理 */
+function scScanCancel() {
+  SCAN.pending = false          // 取消顺手撤掉「扫完自动再扫一遍」，否则取消后又自己跑起来
+  SCAN.cancel = true
+  if (!SCAN.running) SCAN.cancelled = true
+  return { ok: true, running: SCAN.running, cancelled: SCAN.cancelled, error: SCAN.error }
+}
 
-async function scanAsync() {
+/* ---------- 入库最小体积过滤（设置 → 刮削与整理） ----------
+ * 扫盘时小于该体积的视频文件直接不收进影片库，挡掉花絮 / sample / 预览片段这类。
+ * 单位 MB、1024 进制（与 magSizeMB 同口径）；空 / 0 / 非法 = 不过滤（默认，保持老行为）。
+ * ⚠ 判据必须是 size > 0 && size < min：115 / WebDAV 条目偶尔列目录拿不到体积（记 0），
+ *   若把 0 也算进去，那些条目会在配置一开就被整批误杀。 */
+function scanMinBytes() {
+  const mb = parseFloat(CFG.scanMinMb)
+  if (!isFinite(mb) || mb <= 0) return 0
+  return Math.round(mb * 1024 * 1024)
+}
+async function scanAsync(scope) {
+  /* 定向扫描（scope = { roots: [{ kind:'v115'|'guangya'|'webdav', root }] }）：
+   * 只 walk 收录进来的那几个网盘根，解析出条目后与既有结果合并落盘 —— 本地库与其它根一律不动。
+   * 「收录新目录」和「目录旁的 ⟳ 扫描按钮」都走这条路；scope 为空 = 老的全量重扫。 */
+  scope = (scope && Array.isArray(scope.roots) && scope.roots.length) ? scope : null
   const t0 = Date.now()
-  SCAN.running = true; SCAN.error = ''
-  SCAN.phase = 'walk'; SCAN.videos = 0; SCAN.scanned = 0; SCAN.matched = 0; SCAN.okCount = 0; SCAN.failCount = 0; SCAN.autoQueued = 0
-  SCAN.startedAt = t0; SCAN.finishedAt = 0
+  scScanReset()
+  /* 本轮扫描全程复用这一个快照：扫描是长任务，中途改设置不该让前后半程判据不一致 */
+  const minB = scanMinBytes()
   const yieldLoop = () => new Promise(r => setImmediate(r))
   try {
-    // 遍历所有媒体库（库之间去重，防止嵌套重复收录）；rel 仍相对挂载根，/media/ 直出不变
+    /* 单遍遍历（walk+index 合并）：一次 readdir 同时收集视频与目录媒体快照，
+     * 目录树只读一遍、每个目录只 readdir 一次（原来 walkAsync + indexImgs 各读一遍，白翻一倍时间）。
+     * 同层子目录并发下钻，readdir 有超时兜底 —— 云盘卡住的目录跳过而非整条卡死。 */
     const seen = new Set()
     const videos = []
-    for (const lib of LIBS) for (const v of await walkAsync(lib)) if (!seen.has(v)) { seen.add(v); videos.push(v) }
-    SCAN.videos = videos.length
-    SCAN.phase = 'index'
-    await yieldLoop()
-    const items = []
-    const dataRoot = readMediaPathFile() || MEDIA_ROOT   // 渐进落盘用的 root（与扫描结束时的最终值一致）
-    // 目录 → 图片索引（异步：网盘上 readdir 不能阻塞主线程）
-    const dirImgs = {}
-    async function indexImgs(dir) {
-      let entries = []
-      try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch (_) { return }
-      for (const e of entries) {
-        if (e.name.startsWith('.')) continue
-        const fp = path.join(dir, e.name)
-        if (e.isDirectory()) await indexImgs(fp)
-        else if (IMG_EXT.includes(extOf(e.name))) (dirImgs[dir] = dirImgs[dir] || []).push(fp)
+    const snapshot = { dirs: new Map() }
+    /* 目录级缓存：上轮存下的「目录 mtime + 完整快照」，本轮 mtime 未变的目录直接复用、不 readdir。
+     * 这是重扫提速的关键（网盘 readdir 冷读 ~200ms 且 FUSE 单通道无法并发加速）。 */
+    const dircache = loadDirCache()
+    const dircacheOn = dircache.size > 0
+    if (dircacheOn) console.log(`[scan] 载入目录缓存 ${dircache.size} 个目录（mtime 未变将跳过 readdir）`)
+    const newDircache = new Map()
+    /* walk 阶段（遍历目录）天然没有分母：目录总数要等这遍扫完才知道 → 进度条只能显示 0%。
+     * 用「上一轮的规模」当估算分母，就能给出平滑推进的百分比（walk 占整次扫描耗时的大头，
+     * 没有它整条进度条前半程是死的）。首轮无缓存时 dirsTotal 仍为 0，前端退回不确定态样式。 */
+    try {
+      const _prev = JSON.parse(fs.readFileSync(scanResultPath(), 'utf8'))
+      if (_prev && typeof _prev === 'object') {
+        SCAN.dirsTotal = Number(_prev.dirsTotal) || (Array.isArray(_prev.dirCache) ? 0 : Object.keys(_prev.dirCache || {}).length)
+        SCAN.videosTotal = Number(_prev.videosTotal) || (Array.isArray(_prev.items) ? _prev.items.length : 0)
+      }
+    } catch (_) {}
+    /* 两个来源的「纳入计数」提升到定向/全量分叉之前：定向扫描也走同一份统计，
+     * 扫完的 [115] / [dav] 纳入日志两种模式都打（测试 _tdav 靠它断言）。 */
+    let v115Count = 0
+    let davCount = 0
+    /* ---- 定向扫描：只 walk 指定的那几个网盘根（收录新目录 / 目录旁 ⟳ 按钮触发）----
+     * 产出与全量 walk 完全同构的条目，V115_MAP / DAV_MAP 做**合并**而不是重建
+     * （全量扫会把两个 MAP 清空重填；定向扫时其它根的条目还在用，动不得）。 */
+    if (scope) {
+      for (const sr of scope.roots) {
+        if (SCAN.cancel) throw new Error(SCAN_CANCELLED)
+        const nm = (sr.root && (sr.root.name || sr.root.path || sr.root.cid)) || '?'
+        try {
+          if (sr.kind === 'v115') {
+            SCAN.current = '115：' + nm
+            /* force=true：定向扫描是用户点名动作，要拿最新列表，不吃 10 分钟列目录快照 */
+            for (const f of await v115Walk(sr.root, () => { SCAN.dirs++ }, true)) {
+              V115_MAP.set(f.vpath, { pick: f.pick, size: f.size, mtime: f.mtime, name: f.name })
+              if (seen.has(f.vpath)) continue
+              seen.add(f.vpath); videos.push(f.vpath); v115Count++
+              SCAN.found++; if (SCAN.found % 32 === 0) SCAN.videos = SCAN.found
+            }
+          } else if (sr.kind === 'guangya' || sr.kind === 'webdav') {
+            SCAN.current = davLabel(sr.kind) + '：' + nm
+            for (const f of await davWalk(sr.kind, sr.root, () => { SCAN.dirs++ }, true)) {
+              DAV_MAP.set(f.vpath, { size: f.size, mtime: f.mtime, name: f.name })
+              if (seen.has(f.vpath)) continue
+              seen.add(f.vpath); videos.push(f.vpath); davCount++
+              SCAN.found++; if (SCAN.found % 32 === 0) SCAN.videos = SCAN.found
+            }
+          } else { console.log('[scan] 定向扫描不支持的来源：' + sr.kind) }
+        } catch (e) {
+          console.log('[scan] 定向扫描「' + nm + '」失败：' + e.message)
+          if (e && e.v115Blocked) { console.log('[115] 已进冷却，本次定向扫描停止'); break }
+        }
+        await yieldLoop()
+      }
+      console.log('[scan] 定向扫描：' + scope.roots.length + ' 个根，发现 ' + videos.length + ' 个视频文件（其余来源不重扫）')
+    }
+    if (!scope) for (let li = 0; li < LIBS.length; li++) {
+      const lib = LIBS[li]
+      SCAN.libsDone = li; SCAN.current = path.basename(lib) || lib
+      /* 顶层库目录强制 readdir（skipStat=true）：必须列出子目录才能发现新增的影片目录 */
+      for (const v of await walkAsync(lib, [], () => {
+        SCAN.dirs++
+        if (SCAN.cancel) throw new Error(SCAN_CANCELLED)
+      }, () => { SCAN.found++; if (SCAN.found % 32 === 0) SCAN.videos = SCAN.found }, snapshot, newDircache, true)) {
+        if (seen.has(v)) continue
+        seen.add(v); videos.push(v)
+      }
+      SCAN.libsDone = li + 1
+      await yieldLoop()
+    }
+    /* ---- 115 网盘来源：不是磁盘，走 API 列目录，产出与本地 walk 同构的条目 ----
+     * vpath 统一是 `115:/<115内路径>`，进 videos[] 之后下游（番号解析 / 刮削 / 入库 / 详情页）
+     * 全部复用同一套逻辑；只有「读文件」（stat / 取流）需要按前缀分流，见 matchOne 与 /media 路由。 */
+    /* V115_MAP 全量扫每轮重建（pick 映射必须跟本轮条目一致），定向扫**保留**（其它根还在用）；
+     * V115_SNAP 故意不重置 —— 它带 10 分钟有效期，多次扫描之间复用列目录结果，
+     * 避免每次重扫都重打整棵网盘树（115 有 WAF 限速） */
+    if (!scope) {
+      V115_MAP = new Map()
+      /* 多账号（2026-10-14）：每个账号各遍各的根（root.acct 带账号号，v115Walk 据此定前缀/Cookie）。
+       * ⚠ 每个账号内用 v115WalkRoots()：嵌套的根只走最外层的那个（请求量减半，见函数注释） */
+      for (const n115 of v115AcctList()) {
+        if (!v115Ready(n115)) continue
+        const allRoots = v115Roots(n115)
+        const wroots = v115WalkRoots(allRoots)
+        if (wroots.length < allRoots.length) {
+          console.log('[115' + (n115 > 1 ? '@' + n115 : '') + '] 遍历时跳过了 ' + (allRoots.length - wroots.length) + ' 个被包含的根目录（避免重复请求同一棵子树）')
+        }
+        for (const root0 of wroots) {
+          if (SCAN.cancel) throw new Error(SCAN_CANCELLED)
+          const root = Object.assign({}, root0, { acct: n115 })
+          SCAN.current = '115' + (n115 > 1 ? '@' + n115 : '') + '：' + (root.name || root.path || root.cid)
+          try {
+            for (const f of await v115Walk(root, () => { SCAN.dirs++ })) {
+              V115_MAP.set(f.vpath, { pick: f.pick, size: f.size, mtime: f.mtime, name: f.name })
+              if (seen.has(f.vpath)) continue
+              seen.add(f.vpath); videos.push(f.vpath); v115Count++
+              SCAN.found++; if (SCAN.found % 32 === 0) SCAN.videos = SCAN.found
+            }
+          } catch (e) {
+            console.log('[115' + (n115 > 1 ? '@' + n115 : '') + '] 媒体库「' + (root.name || root.cid) + '」遍历失败：' + e.message)
+            /* 被 WAF 拦了就收手：继续遍历剩下的目录只会喂满拦截，越喂冷却越久 */
+            if (e && e.v115Blocked) { console.log('[115] 已进冷却，本次扫描跳过后面的网盘目录（本地文件继续）'); break }
+          }
+          await yieldLoop()
+        }
       }
     }
-    for (const lib of LIBS) { await indexImgs(lib); await yieldLoop() }
+    if (v115Count) console.log('[115] 本次扫描纳入 ' + v115Count + ' 个网盘视频文件')
+    /* ---- WebDAV / 光鸭网盘来源：标准协议 PROPFIND 遍历，产出与本地/115 walk 同构的条目 ----
+     * vpath 统一是 `dav:/<路径>` / `gy:/<路径>`，下游（番号解析/刮削/入库/详情页）全部复用同一套逻辑；
+     * 只有「读文件」（取流）需要按前缀分流，见 matchOne 与 /media 路由（davServe 直接 Range 转发）。 */
+    if (!scope) {
+      /* 全量扫才重建 DAV_MAP；定向扫要**保留**它（其它根的映射还在用，见定向扫描块注释） */
+      DAV_MAP = new Map()
+      for (const davKind of DAV_KINDS) {
+        for (const ndv of davAcctList(davKind)) {
+          if (!davReady(davKind, ndv)) continue
+          for (const root0 of davRoots(davKind, ndv)) {
+            if (SCAN.cancel) throw new Error(SCAN_CANCELLED)
+            const root = Object.assign({}, root0, { acct: ndv })
+            SCAN.current = davLabel(davKind) + (ndv > 1 ? '@' + ndv : '') + '：' + (root.name || root.path)
+            try {
+              for (const f of await davWalk(davKind, root, () => { SCAN.dirs++ })) {
+                DAV_MAP.set(f.vpath, { size: f.size, mtime: f.mtime, name: f.name })
+                if (seen.has(f.vpath)) continue
+                seen.add(f.vpath); videos.push(f.vpath); davCount++
+                SCAN.found++; if (SCAN.found % 32 === 0) SCAN.videos = SCAN.found
+              }
+            } catch (e) {
+              console.log('[' + davKind + (ndv > 1 ? '@' + ndv : '') + '] 媒体库「' + (root.name || root.path) + '」遍历失败：' + e.message)
+              /* 账号不对就别把另外几个根也打一遍：同一份凭据，只会得到同一堆 401 */
+              if (davAuthErr(e && e.message)) { console.log('[' + davKind + (ndv > 1 ? '@' + ndv : '') + '] 凭据无效，本次扫描跳过该来源剩余目录'); break }
+            }
+            await yieldLoop()
+          }
+        }
+      }
+    }
+    if (davCount) console.log('[dav] 本次扫描纳入 ' + davCount + ' 个 WebDAV/光鸭 视频文件')
+    /* 本轮实际 readdir 过的目录才进 newDircache；命中复用的目录沿用旧记录（mtime 未变，记录继续有效） */
+    for (const [k, v] of dircache) if (!newDircache.has(k)) newDircache.set(k, v)
+    DIRCACHE = newDircache
+    SCAN.videos = videos.length
+    SCAN.found = videos.length
+    scScanCheck()
+    const items = []
+    const dataRoot = readMediaPathFile() || MEDIA_ROOT   // 渐进落盘用的 root（与扫描结束时的最终值一致）
+    /* 重扫期间保留旧条目：scanAsync 从空 items[] 开始逐步 push，每 16 部直接挂进 DATA，
+     * 导致重扫头几秒 DATA.items 只含新扫到的几十部 → 前端 LIB 被覆写为部分列表，旧影片全消失。
+     * 现在先快照旧条目，渐进落盘时新条目按番号覆盖旧条目、没扫到的旧条目保留，
+     * 用户重扫期间切页面回来看到的 LIB 始终包含原来已有的影片。
+     * ★ 增量扫描复用：_priorMap 同时是「未变影片直接复用上次结果」的来源（见 matchOne）。 */
+    const _priorMap = new Map()
+    if (DATA && Array.isArray(DATA.items)) {
+      for (const it of DATA.items) _priorMap.set(bare(it.code), it)
+    }
+    /* 复用上次磁盘扫描结果（含指纹），用于增量：指纹未变的影片跳过全部网盘 I/O。
+     * 内存 DATA 已被用户手动编辑/刮削覆盖的条目不参与复用（以 _priorMap 里的现值为准）。 */
+    const _savedMap = new Map()
+    try {
+      const saved = loadScanResult()
+      if (saved && Array.isArray(saved.items)) {
+        for (const it of saved.items) { if (it && it.relVideo) _savedMap.set(it.relVideo, it) }
+      }
+    } catch (_) {}
+    /* 定向扫描：既有条目原样保留进 items（本轮只解析 scope 根下的文件），
+     * 但**排除**本轮 walk 到的那些 relVideo —— 它们走下面的增量流水线
+     * （指纹没变 → 复用、变了 → 重 match），否则既进 seed 又进 items 就是重复条目。 */
+    const _scopedSet = scope ? new Set(videos) : null
+    if (_scopedSet) {
+      for (const [rv, it] of _savedMap) if (!_scopedSet.has(rv)) items.push(it)
+      console.log('[scan] 定向扫描：保留既有条目 ' + items.length + ' 个')
+    }
+
+    /* 图片索引改由 walk 阶段的 snapshot 提供（单遍遍历），此处不再二次 readdir 整棵目录树。
+     * 保留 dirImgs 形参与取值路径，matchOne 直接查 snapshot.dirs。 */
+    scScanCheck()
 
     SCAN.phase = 'match'
     PROBE_TASKS.clear(); VPROBE_OFF = false; PROBE_SLOW = 0   // 每次扫描重试熔断（网盘可能已恢复）
     const MANUAL_CODES = loadManualCodes()   // 手动指定的番号覆盖（relVideo → code），重扫后仍生效
-    let i = 0
-    for (const vp of videos) {
-      const dir = path.dirname(vp)
+
+    /* 单部影片的完整解析（一次 match）。所有网盘读都走目录快照 + 缓存 + 超时，
+     * 不再对同目录重复 readdir：图片/NFO/剧照都来自 walk 阶段的 snapshot.dirs。 */
+    const rel = fp => path.relative(MEDIA_ROOT, fp).split(path.sep).join('/')
+    async function matchOne(vp) {
+      const is115 = v115Rel(vp)
+      const isDav = davRel(vp)
+      const dir = (is115 || isDav) ? '' : path.dirname(vp)   // 网盘条目没有本地目录（图片/NFO 走全库同番号回退）
       const p = parseName(vp)
-      const relVideo = path.relative(MEDIA_ROOT, vp).split(path.sep).join('/')
+      /* 网盘条目的 relVideo 就是 vpath 本身 —— path.relative 会把 'gy:/…' / 'dav:/…'
+       * 当成「非盘符根的相对路径」按 cwd 去解析，拼出 ..\..\ 垃圾（播放/续扫全对不上） */
+      const relVideo = (is115 || isDav) ? vp : path.relative(MEDIA_ROOT, vp).split(path.sep).join('/')
       const manualCode = MANUAL_CODES[relVideo]
       const code = norm(manualCode || p.code), ccode = bare(code)
       const dn = bare(path.basename(dir))
       const codeIn = fp => bare(baseOf(fp)).includes(ccode) || dn.includes(ccode)
-      const imgs = (dirImgs[dir] || []).slice().sort((a, b) => codeIn(b) - codeIn(a))
+      /* 目录快照取图片；本目录没有再全库找同番号图片（沿用旧行为） */
+      const dsnap = snapshot.dirs.get(dir) || { imgs: [] }
+      const imgs = dsnap.imgs.slice().sort((a, b) => codeIn(b) - codeIn(a))
       if (!imgs.length)
-        Object.values(dirImgs).forEach(list => list.forEach(x => { if (codeIn(x) && !imgs.includes(x)) imgs.push(x) }))
+        for (const [, s] of snapshot.dirs) for (const x of s.imgs) { if (codeIn(x) && !imgs.includes(x)) imgs.push(x) }
       let fan = imgs.find(x => { const n = norm(path.basename(x)); return n.includes('FANART') || n.includes('THUMB') })
       let post = imgs.find(x => { const n = norm(path.basename(x)); return n.includes('POSTER') || n.includes('COVER') })
       if (!fan && !post) {
-        for (const im of imgs) { const s = await imgSizeAsync(im); if (s && s.w > s.h) { fan = im; break } }
-        if (!fan) for (const im of imgs) { const s = await imgSizeAsync(im); if (s && s.w <= s.h) { post = im; break } }
+        /* 横竖判定走缓存（IMGSZ_CACHE 按 mtime+size 命中就不再 open+read），仍串行但通常直接命中 */
+        for (const im of imgs) { const s = await imgSizeCached(im); if (s && s.w > s.h) { fan = im; break } }
+        if (!fan) for (const im of imgs) { const s = await imgSizeCached(im); if (s && s.w <= s.h) { post = im; break } }
       }
-      const nfos = (await fsp.readdir(dir).catch(() => [])).filter(x => extOf(x) === 'nfo').map(x => path.join(dir, x))
+      /* NFO：直接用目录快照（原来每部都 readdir(dir)，同目录几十部 = 几十次重复 readdir） */
+      const nfos = dsnap.nfos || []
       const nfoFile = nfos.find(x => bare(baseOf(x)).includes(ccode)) || (nfos.length === 1 ? nfos[0] : null)
       let meta = {}
-      if (nfoFile) { try { meta = parseNfoText(await fsp.readFile(nfoFile, 'utf8')) } catch (_) {} }
+      if (nfoFile) { try { meta = parseNfoText(await ioTimeout(fsp.readFile(nfoFile, 'utf8'), 15000, '')) } catch (_) {} }
       // 类别（NFO genre）：滤掉清晰度/番号/演员名/厂商这类噪音，保留真正的影片类别
       const G_JUNK = /^(1080P?|720P?|2160P?|4K|2K|60FPS|HD|高清|高畫質|中字|中文字幕|字幕|内嵌字幕|內嵌字幕|無碼|无码|無碼流出|无码流出|有碼|有码|流出|破解|首发|首發|漢化|汉化|H26[45]|HEVC|AVC\d*|HVC\d*|MP4|MKV|AVI|WMV)$/i
       const seenG = new Set()
@@ -1200,41 +4256,140 @@ async function scanAsync() {
         if (meta.studio && (g === meta.studio || g.includes(meta.studio))) return false
         seenG.add(g); return true
       }).slice(0, 12)
-      // 剧照：目录内 extrafanart（javbus 刮削惯例）
-      let samples = []
-      try {
-        samples = (await fsp.readdir(path.join(dir, 'extrafanart')).catch(() => []))
-          .filter(x => IMG_EXT.includes(extOf(x)))
-          .map(x => path.join(dir, 'extrafanart', x))
-      } catch (_) {}
-      const rel = fp => path.relative(MEDIA_ROOT, fp).split(path.sep).join('/')
-      let st = {}; try { st = await fsp.stat(vp) } catch (_) {}
+      // 剧照：目录内 extrafanart（javbus 刮削惯例）—— 已在 walk 阶段收集进快照
+      const samples = dsnap.samples || []
+      /* stat 优先用增量阶段已取好的结果（stMap），没有再单独 stat（带超时）
+       * 115 条目：磁盘上没有对应文件，stat 只能取列目录时记下的 size/mtime */
+      let st = stMap.get(vp) || null
+      if (!st && is115) { const m = V115_MAP.get(vp); st = m ? { size: m.size || 0, mtimeMs: m.mtime || 0 } : null }
+      if (!st && isDav) { const m = DAV_MAP.get(vp); st = m ? { size: m.size || 0, mtimeMs: m.mtime || 0 } : null }
+      if (!st && !is115 && !isDav) { try { st = await ioTimeout(fsp.stat(vp), 8000, null) } catch (_) {} }
+      /* 体积过滤点：walk 阶段只 readdir、拿不到体积，走到这里 st 已经在手
+       * （本地是刚 stat 的、115 来自列目录），判一次零额外 I/O。
+       * 放这里而不是 walk 里，就是为了不给网盘挂载额外加一次 stat —— 那是最贵的一步。 */
+      if (minB > 0 && st && st.size > 0 && st.size < minB) { SCAN.skippedSmall++; return null }
       const it = {
         code, title: meta.title || p.title,
+        /* mdc-ng 对齐：破解/碟片/字幕作为独立属性（不污染 code）。-U→uncensored，B/C/D→cd，C→subtitle */
+        uncensored: !!p.uncensored, cd: p.cd || 0, subtitle: !!p.subtitle,
         plot: meta.plot || '', year: meta.year || '', studio: meta.studio || '',
         actors: meta.actors || [], genres,
         relVideo,
+        /* 115 条目的取流凭据：写进条目（落 scan-result.json），播放时靠它换直链 */
+        pick: is115 ? ((V115_MAP.get(vp) || {}).pick || '') : undefined,
         relFanart: fan ? rel(fan) : null,
         relPoster: post ? rel(post) : null,
         relSamples: samples.map(rel),
-        size: st.size || 0, mtime: st.mtimeMs || 0
+        size: (st && st.size) || 0, mtime: (st && st.mtimeMs) || 0,
+        /* 指纹：供下次重扫做增量（size+mtime 变了就重新 match，没变直接复用） */
+        fp: ((st && st.size) || 0) + ':' + ((st && st.mtimeMs) || 0)
       }
       if (it.relFanart || it.relPoster) SCAN.matched++
-      const pv = await probeKick(it.relVideo)
+      /* 115 文件不落本地盘，无法解析 moov 取分辨率 → 跳过探测（标签退化为按文件名判定） */
+      const pv = is115 ? null : await probeKick(it.relVideo)
       it.tags = videoTagsOf(baseOf(vp) + ' ' + (meta.title || '') + ' ' + (meta.genres || []).join(' '), pv ? pv.w : 0, pv ? pv.h : 0)
       enrichFromCache(it)   // 缓存里的刮削元数据回填（补空字段 + scraped 标记）
       // 识别失败待处理：没有 nfo 标题、缓存里也没刮到元数据的视频（标题只是文件名解析结果）
       it.pending = !it.scraped && !it.scrapeTitle && !(meta.title || '').trim()
-      if (it.pending) SCAN.failCount++; else SCAN.okCount++   // 成功 = 识别出番号且刮到过元数据；失败 = 落进「识别失败待处理」
-      items.push(it)
-      SCAN.scanned = ++i
-      /* 渐进落盘：每 16 部把已扫到的条目挂进 DATA → /data.json 立即可见，
-       * 前端边扫边把海报墙铺出来，不用等整个目录走完（网盘挂载的 walk 可能要几十分钟）。 */
-      if ((i & 15) === 0) DATA = { root: dataRoot, generated: Date.now(), items }
-      if ((i & 15) === 0) await yieldLoop()   // 让出事件循环，/api/scan 才能实时响应
+      if (it.pending) SCAN.failCount++; else SCAN.okCount++
+      return it
     }
-    items.sort((a, b) => b.mtime - a.mtime)
+
+    /* 增量调度：指纹（size+mtime）未变且 relVideo 命中的影片 → 直接复用上次 item，跳过全部网盘 I/O。
+     * 复用时 enrichFromCache 重跑一次，保证离线缓存里新刮的元数据能生效（与全量一致）。
+     * 指纹比对所需的 stat 本身也是网盘 I/O，故并发执行（限流），并把 stat 结果 stMap 传给
+     * matchOne 复用，避免未命中项 stat 两次。 */
+    let reused = 0, rematched = 0
+    const todo = []      // 需要完整 match 的影片绝对路径
+    const stMap = new Map()   // vp -> stat 结果（增量比对 + matchOne 共用，避免重复 stat）
+    const STAT_CONCURRENCY = 8
+    await poolMap(videos, async (vp) => {
+      const is115 = v115Rel(vp)
+      const isDav = davRel(vp)
+      /* 网盘条目的 relVideo 就是 vpath 本身（path.relative 对 'gy:/…' 会拼出垃圾，见 matchOne 注释） */
+      const relVideo = (is115 || isDav) ? vp : path.relative(MEDIA_ROOT, vp).split(path.sep).join('/')
+      const saved = _savedMap.get(relVideo)
+      let st = null
+      if (is115) {
+        /* 115 条目：size/mtime 来自列目录结果，不必也不该去 stat（磁盘上根本没这个文件） */
+        const m = V115_MAP.get(vp)
+        st = m ? { size: m.size || 0, mtimeMs: m.mtime || 0 } : null
+      } else if (isDav) {
+        /* 光鸭/WebDAV 条目同理：size/mtime 取列目录结果（DAV_MAP），不去 stat 虚拟路径 */
+        const m = DAV_MAP.get(vp)
+        st = m ? { size: m.size || 0, mtimeMs: m.mtime || 0 } : null
+      } else {
+        try { st = await ioTimeout(fsp.stat(vp), 8000, null) } catch (_) {}
+      }
+      stMap.set(vp, st)
+      const fp = ((st && st.size) || 0) + ':' + ((st && st.mtimeMs) || 0)
+      if (saved && saved.fp && saved.fp === fp && saved.code) {
+        try {
+          /* 复用上次结果，保留 fp（落盘需要，下轮增量比对也靠它）；快照已由 walk 阶段拿到，零额外网盘 I/O */
+          const reuse = { ...saved }
+          reuse.fp = fp
+          enrichFromCache(reuse)         // 新刮的元数据立即生效
+          /* 复用阶段顺手「番号再识别」：旧解析器曾把噪声文件名误判成垃圾 code
+           * （如 2048.hk@GOJU-317.restored → "2048 hk GOJU-317 r"），导致这类待处理项永远刮不到。
+           * 趁复用一次性纠正：旧 code 不干净、但能从文件名捞出干净番号、且用户没手填过时 → 改正并清掉
+           * 旧刮削标记，后续自动刮削队列会用新番号重新刮。手动指定过的番号（MANUAL_CODES）不动。 */
+          if (!MANUAL_CODES[relVideo] && !isCleanCode(reuse.code)) {
+            try {
+              const dvp = (is115 || isDav) ? vp : (MEDIA_ROOT ? path.join(MEDIA_ROOT, relVideo) : relVideo)
+              const derived = parseName(dvp).code
+              if (derived && isCleanCode(derived) && norm(derived) !== norm(reuse.code || '')) {
+                reuse.code = norm(derived)
+                reuse.scraped = false; reuse.scrapeTitle = ''
+                reuse.pending = !(reuse.title || '').trim()
+              }
+            } catch (_) {}
+          }
+          reuse.pending = !reuse.scraped && !reuse.scrapeTitle && !(reuse.title || '').trim() ? true : reuse.pending
+          /* 复用件也要重判体积：上次入库时阈值可能更松，这轮收紧了就得挡掉。
+           * size 早已在复用件里（fp 就是 size:mtime），零额外 I/O。 */
+          if (minB > 0 && reuse.size > 0 && reuse.size < minB) { SCAN.skippedSmall++; SCAN.scanned = reused + rematched; return }
+          items.push(reuse); reused++
+          /* ⚠ 复用件也必须计入 scanned。原来只在 matchOne 之后累加，于是「全量命中缓存」
+           * （todo 为 0、增量扫描的常态）时 scanned 恒为 0 → 进度条卡在 0% 直到扫完才跳100。
+           * 这正是用户看到的「百分比不动」。 */
+          SCAN.scanned = reused + rematched
+          return
+        } catch (_) { /* 复用出错就退回完整 match */ }
+      }
+      todo.push(vp)
+    }, STAT_CONCURRENCY)
+    flushProgress()   // 复用件先进 DATA，前端立刻能看到大部分影片（不等 rematch）
+    if (reused || todo.length)
+      console.log(`[scan] 增量：复用未变 ${reused} 部，需重新解析 ${todo.length} 部`)
+
+    /* 待匹配项并发执行（限并发，防网盘句柄雪崩）；取消时立刻停。
+     * flushProgress 复用渐进落盘逻辑：每完成 16 部把 items 挂进 DATA，前端边扫边看。 */
+    function flushProgress() {
+      const merged = new Map(_priorMap)
+      for (const it of items) merged.set(bare(it.code), it)
+      DATA = { root: dataRoot, generated: Date.now(), items: [...merged.values()] }
+    }
+    const MATCH_CONCURRENCY = 6
+    await poolMap(todo, async (vp, idx) => {
+      if (SCAN.cancel) throw new Error(SCAN_CANCELLED)   // 取消检查：抛出会被上层 catch 收尾
+      SCAN.current = path.basename(vp)
+      const it = await matchOne(vp)
+      /* rematched 先加：它表示「处理过的视频数」，要和 SCAN.videos（分母）对齐，
+       * 被体积过滤掉的文件也算处理过 —— 否则进度条会停在 100% 之前不动。 */
+      rematched++
+      SCAN.scanned = reused + rematched
+      if (!it) return   // 体积过滤命中：这个文件不收进影片库（matchOne 返回 null）
+      /* ⚠ 必须入列！这行丢了 = 匹配结果全被扔掉，新文件永远进不了影片库
+       * （旧库全靠「指纹未变→复用」那条路撑着，所以一直没暴露 —— 2026-10-14 定向扫描实测抓到）。 */
+      items.push(it)
+      /* 渐进落盘节奏：每 64 部刷一次（原来 16）。配合前端稳定 lid（libStableLid），
+       * 扫描期海报墙只做「增量追加」，不重排不换色不闪跳 —— 节奏放缓进一步减少可见抖动。 */
+      if (items.length % 64 === 0) { flushProgress(); await yieldLoop() }
+    }, MATCH_CONCURRENCY)
+    SCAN.scanned = items.length
+    scScanCheck()
     console.log(`[scan] ${items.length} 个影片，封面匹配 ${items.filter(x => x.relFanart || x.relPoster).length}，耗时 ${Date.now() - t0}ms`)
+    if (SCAN.skippedSmall) console.log(`[scan] 入库最小体积过滤：跳过 ${SCAN.skippedSmall} 个文件（阈值 ${CFG.scanMinMb} MB）`)
     /* 离线缓存兜底展示：还没配置媒体库（或扫到 0 部）时，用离线缓存里的条目做纯在线展示
      * （首次部署没挂媒体也能看到示例影片/已刮削条目，详情页在线播放、演员、系列都可用）。
      * 配上自己的媒体库并扫出内容后，这些条目自动让位。 */
@@ -1242,46 +4397,85 @@ async function scanAsync() {
       items.push(...bootOfflineCache())
       if (items.length) console.log('[scan] 未配置媒体库/扫到 0 部 → 展示离线缓存条目 ' + items.length + ' 部（示例与已刮削数据，纯在线浏览）')
     }
-    /* 扫描完成 → 自动刮削新番号（设置页可关，默认开）：本轮「识别失败待处理」且能解析出番号的，
-     * 复用订阅自动入库的队列逐部刮（用户手动刮削优先）；一次最多 200 部防刷站。
-     * 缓存里已有离线数据的（之前刮过）不算新番号，直接跳过。 */
-    if (CFG.autoScrapeNew !== false) {
-      const codeOk = c => /^\d{6}-\d{2,4}$/.test(c) || (/[A-Z]/.test(c) && /\d/.test(c))
-      const fresh = []
-      for (const it of items) {
-        if (!it.pending || !it.code) continue
-        const code = String(it.code).toUpperCase()
-        if (!codeOk(code) || fresh.includes(code)) continue
-        try { const m = readMovieCache(code); if (m && m.scraped) continue } catch (_) {}
-        fresh.push(code)
-        if (fresh.length >= 200) break
-      }
-      if (fresh.length) {
-        SCAN.autoQueued = fresh.length
-        autoIngestQueue(fresh, '扫描')
-        console.log('[scan] 自动刮削：' + fresh.length + ' 个新番号已排队（设置 → 自动化 可关）')
-      }
-    }
+    /* 扫描完成 / 启动恢复后，把「还没刮过」的影片排队进后台刮削队列（设置页可关，默认开）。
+     * 抽成函数，扫描完成和 app 启动恢复两条路径都调用（见文件底部 boot 段）。两类「还没刮过」：
+     *   ① 识别失败待处理（无 nfo 标题）且番号可解析；② 有 nfo 标题但**没有海报图**的
+     *   （relPoster/webPoster 都没有）—— 海报墙封面空缺的大头。缓存里已刮过的（m.scraped）
+     *   不算，直接跳过。⚠ 回填口径见 enrichFromCache：只补空字段，本地 nfo 标题/简介不覆盖。 */
+    autoQueueMissingCovers(items, '扫描')
     // root 显示用户配置的真实路径：容器里 MEDIA_ROOT 是挂载点（如 /media），
     // 对用户没意义，优先读 media-path.txt 里写的宿主机完整路径
-    DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items }
+    /* 保留旧网盘条目：Cookie 失效/风控导致遍历失败时，不删除已有 115/光鸭/WebDAV 条目。
+     * 这样换 Cookie 后无需重扫即可恢复显示，避免反复扫盘触发 115 风控。
+     * 本地文件不保留（本轮没扫到 = 确实被删/移走了）。 */
+    const finalItems = items.slice()
+    const seenRels = new Set(items.map(it => it.relVideo).filter(Boolean))
+    for (const [rv, it] of _savedMap) {
+      if (seenRels.has(rv)) continue
+      if (v115Rel(rv) || davRel(rv)) {
+        finalItems.push(it)
+      }
+    }
+    if (finalItems.length > items.length) {
+      console.log('[scan] 保留旧网盘条目 ' + (finalItems.length - items.length) + ' 个（未在本轮遍历中命中，Cookie/风控导致）')
+    }
+    finalItems.sort((a, b) => b.mtime - a.mtime)
+    DATA = { root: readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: finalItems }
     saveScanResult()   // 落盘：容器重建/更新后重启不必重扫云盘也能立刻显示影片库
     vprobeFlush()   // 分辨率探测结果落盘，重扫不重复解析
+    /* 用 DIRCACHE.size 而不是 SCAN.dirs：目录缓存命中的目录不会触发 onDir 回调，
+     * SCAN.dirs 只统计「本轮真readdir 过的」，会随缓存命中率上升而缩水，
+     * 拿它当下一轮的分母会让估算百分比虚高。 */
+    saveDirCache(DIRCACHE, { dirs: DIRCACHE.size, videos: SCAN.videos })   // 目录级缓存落盘：下次重扫 mtime 未变的目录可跳过 readdir；顺带记下本轮规模供下次估算进度
   } catch (e) {
-    SCAN.error = e.message
-    console.log('[scan] error:', e.message)
+    /* 取消不是错误：不写半成品 DATA、不落盘、不排自动刮削、不续跑 pending。
+     * 磁盘上的 scan-result.json 与内存 DATA 保持「上一次完整结果」，取消是无残留的。 */
+    if (e && e.message === SCAN_CANCELLED) {
+      SCAN.cancelled = true; SCAN.error = ''
+      console.log(`[scan] 已取消（已处理 ${SCAN.scanned}/${SCAN.videos}，用时 ${Date.now() - t0}ms），保留上一次扫描结果`)
+    } else {
+      SCAN.error = e.message
+      console.log('[scan] error:', e.message)
+    }
   }
   SCAN.ms = Date.now() - t0
-  SCAN.phase = 'done'
+  SCAN.phase = SCAN.cancelled ? 'cancelled' : 'done'
   SCAN.finishedAt = Date.now()
   SCAN.running = false
-  schedulePreviews()   // 扫描完成 → 给新建档的实体影片安排悬停预览生成（低负担串行）
-  /* 扫描中又有人添加/删除了媒体库 → 立刻按新列表再扫一遍（否则改动要等下次手动重扫） */
-  if (SCAN.pending) { SCAN.pending = false; setTimeout(() => { if (!SCAN.running) scanAsync() }, 250) }
+  SCAN.current = ''
+  if (!SCAN.cancelled) schedulePreviews()   // 扫描完成 → 给新建档的实体影片安排悬停预览生成（低负担串行）
+  /* 扫描中又有人添加/删除了媒体库 → 立刻按新列表再扫一遍（否则改动要等下次手动重扫）。
+   * ⚠ 用户点了取消就不许自己再跑起来（scScanCancel 已把 pending 清掉，这里再兜一层）。 */
+  if (SCAN.pending && !SCAN.cancelled) { SCAN.pending = false; const _ps = SCAN.pendingScope; SCAN.pendingScope = null; setTimeout(() => { if (!SCAN.running) scanAsync(_ps) }, 250) }
+  /* 扫描完了再补网盘片源的分辨率（并发 2 慢慢跑，不阻塞界面）：
+   * 云盘条目磁盘上没文件，扫描时探不了，只能等拿到条目清单后走本机代理逐个 ffprobe。 */
+  if (!SCAN.cancelled) setTimeout(() => { resBackfillRun('扫描后').catch(() => {}) }, 3000)
 }
 
 /* ---------- HTTP ---------- */
 let DATA = null
+
+/* MEDIA_ROOT 动态基准统一：原生模式下媒体根会随已配置库变化（commonAncestor(LIBS)），
+ * 但已扫描出的 relVideo / relPoster 是相对「扫描时的根」存的。一旦两者层级不一致
+ * （比如库从「/a/b」缩到「/a/b/c」或反之、或换过媒体库父目录），所有 relVideo 解码都会
+ * 多/少一层目录 → 封面与视频全部打不开，看起来像「文件不显示 / 媒体库逻辑坏掉」。
+ * 这里让 MEDIA_ROOT 永远 = 已扫数据根（DATA.root）与当前库的共同祖先，覆盖所有 relVideo 的真实基准：
+ * 不重扫也能正确解析历史条目，加/删库、重扫后基准也保持一致。 */
+function recomputeMediaRoot() {
+  if (!NATIVE) return
+  const roots = LIBS.map(String)
+  /* DATA.root 来自 scan-result.json，同样要过形态校验：脏基准一旦混进来，
+   * 运行时的 MEDIA_ROOT 会被悄悄带偏（表格里所有 relVideo 解码错位），而且全程无日志。 */
+  const dr = saneRoot(DATA && DATA.root)
+  /* 除了形态合法，还得真的包住当前所有库（hintFits）—— 否则跨盘提示会把媒体根拽回 SystemDrive，
+   * 库内文件的 relVideo 变成跨盘绝对路径，播放/封面被路径校验挡掉（见 hintFits 注释）。 */
+  if (dr && hintFits(dr, LIBS)) roots.push(dr)
+  else if (DATA && DATA.root) console.log('[media] 忽略不可用的已扫数据根 ' + JSON.stringify(String(DATA.root)) +
+    (!dr ? '（路径形态非法）' : '（不包含已配置的媒体库，会带偏媒体根）'))
+  const ca = roots.length ? commonAncestor(roots)
+    : (process.env.JP_MEDIA_ROOT || (process.platform === 'win32' ? 'C:\\' : '/'))
+  if (ca) MEDIA_ROOT = ca
+}
 
 /* ---------- 扫描结果落盘 / 恢复 ----------
  * 扫描结果过去只在内存里：容器重建（每次发版）或重启后影片库会「空掉」，
@@ -1289,14 +4483,64 @@ let DATA = null
  * cache/scan-result.json，启动时直接恢复 —— 云盘目录树不用重走一遍。
  * 只存条目（含 relVideo/files 播放信息），不存图片二进制；文件被删/改名由重扫纠正。 */
 function scanResultPath() { return path.join(cacheDir(), 'scan-result.json') }
+/* ---------- 目录级扫描缓存（v0.3.10，网盘重扫加速的关键） ----------
+ * 实测（CloudDrive/115 挂载）：单个子目录 readdir 冷读约 200ms，且 FUSE 挂载是单通道串行的，
+ * 提高 Node 并发度**毫无收益**（并发 6 与并发 24 实测同为 ~204ms/目录）。
+ * 所以重扫 1294 部的 walk 阶段要 ~280s 是硬成本 —— 除非**根本不去 readdir 那些没变过的目录**。
+ * 方案：上轮扫描把「每个目录的 mtime + 该目录的视频文件列表」存进 scan-result.dirCache；
+ * 本轮 walk 时对每个子目录先 stat（远快于 readdir），mtime 未变就直接复用旧文件列表，
+ * 跳过 readdir + 跳过快照构建 + 跳过逐文件 stat（条目本身带指纹可复用）。
+ * mtime 变了的目录才真正 readdir 并重解析。
+ * 风险控制：mtime 相同但内容变了的极端情况（手动改文件名不改目录 mtime）会漏检，
+ * 用户手动重扫两次即可纠正；正常新增/删除文件都会更新目录 mtime。 */
+let DIRCACHE = new Map()      // 目录绝对路径 -> { m: mtimeMs, files: [文件名...] }
+function loadDirCache() {
+  try {
+    const d = JSON.parse(fs.readFileSync(scanResultPath(), 'utf8'))
+    const dc = d && d.dirCache
+    const m = new Map()
+    if (dc && typeof dc === 'object') for (const k of Object.keys(dc)) {
+      const v = dc[k]
+      if (v && typeof v.m === 'number' && Array.isArray(v.videos) && v.snap) m.set(k, v)
+    }
+    return m
+  } catch (_) { return new Map() }
+}
+function saveDirCache(dc, totals) {
+  if (!dc || !dc.size) return
+  try {
+    const fp = scanResultPath()
+    const d = JSON.parse(fs.readFileSync(fp, 'utf8'))
+    const obj = {}
+    for (const [k, v] of dc) obj[k] = v
+    d.dirCache = obj
+    /* 记下本轮规模：下一轮walk 阶段要靠它当估算分母，否则遍历时进度条恒为 0% */
+    if (totals && typeof totals === 'object') {
+      d.dirsTotal = Number(totals.dirs) || 0
+      d.videosTotal = Number(totals.videos) || 0
+    }
+    const t = fp + '.tmp'
+    fs.writeFileSync(t, JSON.stringify(d))
+    fs.renameSync(t, fp)
+  } catch (e) { console.log('[scan] 目录缓存落盘失败：' + e.message) }
+}
 function saveScanResult() {
   try {
     if (!DATA || !Array.isArray(DATA.items) || !DATA.items.length) return
     fs.mkdirSync(path.dirname(scanResultPath()), { recursive: true })
-    fs.writeFileSync(scanResultPath(), JSON.stringify({
+    /* ⚠ 必须 temp + rename（原子替换），不能直接覆盖写整库索引。
+     * 这个函数在刮削流程里被高频调用（每刮完一部一次、每 30 条 netres 一次），
+     * 索引是好几百 KB 的 JSON；直接覆盖写时若进程被杀 / 断电 / 磁盘满，
+     * scan-result.json 就是**半截文件** → 下次启动 loadScanResult() 解析失败返回 null
+     * → 影片库一片空白，用户只能整盘重扫。同文件的 saveDirCache() 早就是原子写了，
+     * 这里漏掉了。rename 在同分区上是原子的，最坏情况也只是丢掉这一次的更新。 */
+    const fp = scanResultPath()
+    const t = fp + '.tmp'
+    fs.writeFileSync(t, JSON.stringify({
       root: DATA.root, generated: DATA.generated, savedAt: Date.now(),
       libraries: Array.isArray(CFG.libraries) ? CFG.libraries : [], items: DATA.items
     }))
+    fs.renameSync(t, fp)
   } catch (e) { console.log('[scan] 结果落盘失败：' + e.message) }
 }
 function loadScanResult() {
@@ -1341,8 +4585,12 @@ async function previewPump() {
   try {
     const fp = safeMediaPath(st.rel)
     if (!fp) { st.status = 'error'; return }
+    /* 没 ffmpeg 就别试：execFile 每失败一次都是一次进程启动 + 一次媒体路径探测，
+     * 在 CloudDrive/FUSE 上这些都要排队，会把正在播的视频拖卡。*/
+    if (FFMPEG_OK === false) { st.status = 'error'; return }
     st.dur = await new Promise(resolve => {
-      execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', fp], { timeout: 30000 }, (e, so) => {
+      execFile(ffBin('ffprobe'), ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', fp], { timeout: 30000 }, (e, so) => {
+        if (e && e.code === 'ENOENT') FFMPEG_OK = false
         try { resolve(parseFloat(JSON.parse(so).format.duration) || 0) } catch (_) { resolve(0) }
       })
     })
@@ -1357,7 +4605,7 @@ async function previewPump() {
       if (fs.existsSync(out) && fs.statSync(out).size > 500) continue
       const at = (i + 0.5) / st.total * st.dur
       await new Promise(resolve => {
-        execFile('ffmpeg', ['-ss', at.toFixed(1), '-i', fp, '-frames:v', '1', '-vf', 'scale=168:-2', '-q:v', '7', '-y', out],
+        execFile(ffBin('ffmpeg'), ['-ss', at.toFixed(1), '-i', fp, '-frames:v', '1', '-vf', 'scale=168:-2', '-q:v', '7', '-y', out],
           { timeout: 45000 }, e => { if (e) { try { fs.unlinkSync(out) } catch (_) {} } resolve() })
       })
     }
@@ -1375,14 +4623,1351 @@ function previewPrune() {   // 缓存上限 80 部，超出删最旧
   } catch (_) {}
 }
 
-function rescan() {
-  if (SCAN.running) { SCAN.pending = true; return }   // 已在扫描中 → 记一笔，扫完自动再扫
-  scanAsync()
+function rescan(scope) {
+  SCAN.cancel = false; SCAN.cancelled = false   // 新一轮扫描清掉上次的取消标记
+  if (SCAN.running) { SCAN.pending = true; SCAN.pendingScope = scope || null; return }   // 已在扫描中 → 记一笔，扫完自动再扫
+  scanAsync(scope)
 }
+/* ---------- 媒体源统计（/api/sources/media，2026-10-13） ----------
+ * ⚠ 不能叫 /api/sources —— 那个已被「刮削站点列表」占用（外层路由拦截，handleActorApi 摸不到）。
+ * 「媒体源」卡片的数据源：本地存储 / 115 网盘各一张卡，统计各自名下的影片数、封面数、
+ * 预览视频数、视频段数（成/败）与缓存占用。归属：relVideo 以 115:/ 开头 = 115，其余 = 本地。
+ * 目录体量递归 stat 有成本（cache 约 100~300MB、上千文件），结果缓存 60s；写操作后前端带 ?fresh=1 绕过。 */
+function srcDirSize(dir, depth) {
+  let n = 0
+  try {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fp = path.join(dir, e.name)
+      if (e.isDirectory()) { if (depth > 0) n += srcDirSize(fp, depth - 1) }
+      else { try { n += fs.statSync(fp).size } catch (_) {} }
+    }
+  } catch (_) {}
+  return n
+}
+
+/* ---------- 目录统计记忆（2026-10-15 性能）----------
+ * 重建 sourcesPayload 要逐部遍历 1050 部影片的 images/（**实测 744ms**），但图片目录只在刮削入库
+ * 时才变化 —— 用目录 mtime 当失效判据：mtime 没变直接复用上次的「条目数 / 占用」，变了才重算。
+ * 记忆落盘（cache/src-dirmemo.json），重启后依然有效；否则每次开 app 的第一次重建都要重走一遍。 */
+const SRC_MEMO_PATH = () => path.join(cacheDir(), 'src-dirmemo.json')
+const SRC_DIR_MEMO = new Map()      // 绝对路径 -> { mt, count, bytes }
+let SRC_MEMO_DIRTY = false
+let SRC_MEMO_TIMER = null
+function srcMemoLoad() {
+  try {
+    const j = JSON.parse(fs.readFileSync(SRC_MEMO_PATH(), 'utf8'))
+    if (j && j.v === 1 && j.d && typeof j.d === 'object') for (const k in j.d) SRC_DIR_MEMO.set(k, j.d[k])
+  } catch (_) {}
+}
+function srcMemoSaveSoon() {
+  if (SRC_MEMO_TIMER) return
+  SRC_MEMO_TIMER = setTimeout(() => {
+    SRC_MEMO_TIMER = null
+    if (!SRC_MEMO_DIRTY) return
+    SRC_MEMO_DIRTY = false
+    try {
+      const d = {}
+      for (const [k, v] of SRC_DIR_MEMO) d[k] = v
+      fs.mkdirSync(path.dirname(SRC_MEMO_PATH()), { recursive: true })
+      fs.writeFileSync(SRC_MEMO_PATH(), JSON.stringify({ v: 1, d }))
+    } catch (_) {}
+  }, 3000)
+  if (SRC_MEMO_TIMER.unref) SRC_MEMO_TIMER.unref()
+}
+/* 目录「条目数（不含 . 开头）+ 占用」：mtime 相同直接命中记忆；目录不存在记 0 */
+function srcDirStat(dir, depth) {
+  let mt = 0
+  try { mt = fs.statSync(dir).mtimeMs } catch (_) { return { mt: 0, count: 0, bytes: 0 } }
+  const hit = SRC_DIR_MEMO.get(dir)
+  if (hit && hit.mt === mt) return hit
+  let count = 0, bytes = 0
+  try {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fp = path.join(dir, e.name)
+      if (!/^\./.test(e.name)) count++          // 条目数：与原实现一致，不计 . 开头（images/ 里只有 .DS_Store 时算「没封面」）
+      if (e.isDirectory()) { if (depth > 0) bytes += srcDirSize(fp, depth - 1) }
+      else { try { bytes += fs.statSync(fp).size } catch (_) {} }   // 占用：与 srcDirSize 完全一致（含 . 开头的文件）
+    }
+  } catch (_) {}
+  const rec = { mt, count, bytes }
+  SRC_DIR_MEMO.set(dir, rec)
+  SRC_MEMO_DIRTY = true
+  srcMemoSaveSoon()
+  return rec
+}
+
+/* ---------- 整个 cache 目录的占用：后台异步维护（2026-10-15 性能）----------
+ * srcDirSize(cache, 4) 要遍历 2218 个番号目录（**实测 1806ms**），而且是同步跑 —— 会把 Node 事件循环
+ * 整整卡住两秒，这期间主页的 data.json、队列轮询等所有请求都在排队（用户感受就是「开软件要好久」）。
+ * 改成后台分片遍历（每 16 个目录让出一次事件循环），请求路径只读现成数字；10 分钟内不重复遍历。 */
+let SRC_TOTAL_BYTES = 0
+let SRC_TOTAL_AT = 0
+let SRC_TOTAL_BUSY = false
+const SRC_TOTAL_TTL = 10 * 60 * 1000
+async function srcTotalBytesRefresh() {
+  if (SRC_TOTAL_BUSY) return
+  SRC_TOTAL_BUSY = true
+  try {
+    let n = 0, i = 0
+    const stack = [[cacheDir(), 4]]
+    while (stack.length) {
+      const [d, dep] = stack.pop()
+      let ents
+      try { ents = fs.readdirSync(d, { withFileTypes: true }) } catch (_) { continue }
+      for (const e of ents) {
+        const fp = path.join(d, e.name)
+        if (e.isDirectory()) { if (dep > 0) stack.push([fp, dep - 1]) }
+        else { try { n += fs.statSync(fp).size } catch (_) {} }
+      }
+      if ((++i & 15) === 0) await new Promise(r => setImmediate(r))   // 让出事件循环，别卡住别的请求
+    }
+    SRC_TOTAL_BYTES = n
+    SRC_TOTAL_AT = Date.now()
+  } catch (_) {} finally { SRC_TOTAL_BUSY = false }
+}
+/* 请求路径只读数字：没算过 / 超过 10 分钟 / 用户点「刷新容量与统计」→ 顺手踢一次后台重算（**绝不同步等**） */
+function srcTotalBytes(force) {
+  if (force || !SRC_TOTAL_AT || Date.now() - SRC_TOTAL_AT > SRC_TOTAL_TTL) srcTotalBytesRefresh().catch(() => {})
+  return SRC_TOTAL_BYTES
+}
+
+const SRC_TTL = 60 * 1000
+let SRC_CACHE = { at: 0, data: null }
+let SRC_REBUILDING = false   // stale-while-revalidate 的后台重建去重旗标（2026-10-15）
+function sourcesPayload(forceTotal) {
+  const mroot = path.join(cacheDir(), 'movies')
+  /* 磁盘上的番号目录名 = 番号原样（只替换非法字符，保留连字符），但历史数据大小写/连字符可能有出入 → 两级索引 */
+  const dirs = {}
+  try { for (const d of fs.readdirSync(mroot)) { if (fs.statSync(path.join(mroot, d)).isDirectory()) dirs[d.toLowerCase()] = d } } catch (_) {}
+  const dirOf = code => {
+    const s = String(code || '').replace(/[^\w.-]/g, '_')
+    if (dirs[s.toLowerCase()]) return dirs[s.toLowerCase()]
+    const b = bare(s)
+    if (b) { for (const k in dirs) { if (bare(k) === b) return dirs[k] } }
+    return ''
+  }
+  const mk = () => ({ movies: 0, covers: { ok: 0, fail: 0 }, previews: { ok: 0, fail: 0 }, segs: { ok: 0, fail: 0 }, bytes: 0 })
+  /* 分**账号实例**聚合（2026-10-14 多账号）：键 = 'local' | 'pan115' | 'pan115@2' | 'webdav' | 'guangya@3' … */
+  const agg = { local: mk() }
+  const aggOf = key => { if (!agg[key]) agg[key] = mk(); return agg[key] }
+  let coversBytes = 0, previewBytes = 0
+  for (const it of ((DATA && DATA.items) || [])) {
+    if (!it || !it.code || !it.relVideo) continue     // 纯元数据条目（没有片源）不计入任何来源
+    const s115 = v115RelParse(it.relVideo)            // '115@2:/…' → { n:2, … }
+    const davK = davSplitRel(it.relVideo)             // 'dav:/…' → webdav，'gy@2:/…' → { kind:'guangya', n:2 }
+    const is115 = !!s115
+    const a = s115 ? aggOf('pan115' + (s115.n > 1 ? '@' + s115.n : ''))
+      : davK ? aggOf(davInst(davK.kind, davK.n)) : agg.local
+    a.movies++
+    const d = dirOf(it.code)
+    if (!d) { a.covers.fail++; a.previews.fail++; a.segs.fail += 6; continue }
+    const full = path.join(mroot, d)
+    /* mtime 记忆：目录没动就复用上次的「张数 / 占用」——原来每次重建都全量遍历，1050 部要 744ms */
+    const im = srcDirStat(path.join(full, 'images'), 1)
+    if (im.count > 0) {
+      a.covers.ok++
+      a.bytes += im.bytes; coversBytes += im.bytes
+    } else a.covers.fail++
+    /* 预览视频：本地抽帧 pv7.mp4，或 115 片源的线上预览片（点过卡片才有热缓存，没点过按「未知→失败」计） */
+    const hasPv = previewHas(d)
+    const ol = !hasPv && is115 ? pvOnlineCached(bare(it.code)) : null
+    const pvOk = hasPv || !!(ol && ol.url)
+    if (pvOk) {
+      a.previews.ok++; a.segs.ok += 6
+      if (hasPv) { try { const sz = fs.statSync(path.join(full, PREV_FILE)).size; a.bytes += sz; previewBytes += sz } catch (_) {} }
+    } else { a.previews.fail++; a.segs.fail += 6 }
+  }
+  /* 头部三个占用：封面 = 各番号 images/；预览视频 = 抽帧 mp4 + 进度条缩略图缓存；总 = 整个 cache 目录 */
+  try { previewBytes += srcDirSize(path.join(cacheDir(), 'previews'), 2) } catch (_) {}
+  const c115 = (CFG.pan115 && typeof CFG.pan115 === 'object') ? CFG.pan115 : {}
+  const sumAgg = () => {
+    const t = mk()
+    for (const k in agg) { t.movies += agg[k].movies; t.covers.ok += agg[k].covers.ok; t.covers.fail += agg[k].covers.fail; t.previews.ok += agg[k].previews.ok; t.previews.fail += agg[k].previews.fail; t.segs.ok += agg[k].segs.ok; t.segs.fail += agg[k].segs.fail }
+    return t
+  }
+  return {
+    ok: true, at: Date.now(),
+    totals: {
+      coversBytes, previewBytes,
+      bytes: srcTotalBytes(forceTotal),   // 后台分片维护（同步遍历整个 cache 实测 1806ms，会卡死事件循环）
+      movies: sumAgg().movies
+    },
+    sources: [
+      {
+        id: 'local', kind: 'local', name: (CFG.sourceNames && CFG.sourceNames.local) || '本地存储',
+        connected: LIBS.length > 0, dirs: LIBS.slice(),
+        /* 所在磁盘容量：可能挂了好几个目录、还分布在不同盘（D:\ 与 E:\）→ **每块盘各一条**，
+         * 同一块盘上的多个目录只算一次（2026-10-13 需求「每个磁盘各一条」）。
+         * disk 保留为第一块盘的（老前端 / 老断言兼容），disks 是新前端用的完整列表。 */
+        ...(() => {
+          const seen = {}, out = []
+          for (const p of LIBS) {
+            let root = ''
+            try { root = path.parse(p).root || String(p).slice(0, 3) } catch (_) { root = String(p).slice(0, 3) }
+            root = String(root || '').replace(/[\\/]+$/, '')
+            if (!root || seen[root.toLowerCase()]) continue
+            seen[root.toLowerCase()] = 1
+            try {
+              const st = fs.statfsSync(p)
+              const total = st.bsize * st.blocks, free = st.bsize * st.bavail
+              if (total > 0) out.push({ root, free, total })
+            } catch (_) {}      // 盘读不到（拔了 / 权限）就跳过，不画这块
+          }
+          const d0 = out[0]
+          return { disks: out, disk: d0 ? { free: d0.free, total: d0.total } : null }
+        })(),
+        stats: Object.assign({}, agg.local, { coversBytes: agg.local.bytes }),
+        /* 本地盘/NAS 掉线也是「源掉线」：目录读不到就标出来，恢复了自己翻绿（2026-10-15） */
+        health: srcHealthOf('local')
+      },
+      /* ---- 115：**每个账号一张卡**（2026-10-14 多账号）。
+       * acct=1 是老卡（id 'pan115'）， acct≥2 的卡 id 同为 'pan115' 但带 acct 号（前端用 key 区分）。
+       * ⚠ 账号 1 **恒出卡**（未配置时 connected=false、roots=[]）—— 这是老行为，前端卡片的「未连接 /
+       *   还没有收录网盘目录」提示都靠它；账号 ≥2 才要求真的存在（没建过不该凭空冒空卡）。 ---- */
+      ...(() => {
+        const out = []
+        const vlist = v115AcctListAll()
+        for (const n of vlist) {
+          const c = v115Cfg(n)
+          const hasCookie = !!String(c.cookie || '').trim()
+          const auth = v115AuthOf(n)
+          const inst = n > 1 ? 'pan115@' + n : 'pan115'
+          out.push({
+            id: 'pan115', acct: n, key: inst, kind: 'web',
+            name: (n > 1 ? (c.name || ('115 网盘 ' + n)) : (c.name || '115 网盘')),
+            added: true,
+            /* connected 用「网盘读得到」而不是「填了 Cookie」—— 半失效时卡片要自重（见 v115AuthNote 注释） */
+            connected: hasCookie && auth.ok !== false,
+            cookieOk: hasCookie && !v115BlockedNow(),
+            authOk: auth.ok, authNote: v115AuthNote(n),
+            blocked: v115BlockedNow() ? { remainMin: v115BlockRemain(), msg: V115_BLOCK_MSG } : null,
+            roots: v115Roots(n).map(r => Object.assign({}, r, { acct: n })),
+            /* 容量 / 会员 / 账号：只读 10 分钟缓存（v115UserInfo 自己会拉）；没有就 null + 后台补，绝不阻塞本接口。
+             * 账号 = /user/info 的脱敏手机号（如 198*****405），卡片上要跟会员状态一起显示（2026-10-13 需求）。 */
+            ...(() => {
+              const ui = v115UserCached(n)
+              return {
+                space: ui && ui.total ? { totalFmt: ui.totalFmt, usedFmt: ui.usedFmt, remainFmt: ui.remainFmt, percent: ui.percent } : null,
+                vip: ui ? ui.vip : null,
+                user: (ui && ui.user) || ''
+              }
+            })(),
+            stats: Object.assign({}, agg[inst] || mk(), { coversBytes: (agg[inst] || mk()).bytes }),
+            /* 卡片状态与健康表对齐（把 v115AuthOf 的结论镜像进来，不额外发请求） */
+            health: srcHealthMirror(inst, auth)
+          })
+        }
+        return out
+      })(),
+      /* WebDAV / 光鸭网盘：引擎同一个，配置与前缀两份（见 davCfg 注释）；**每账号一张卡**（2026-10-14）。
+       * 容量走 PROPFIND quota-*（多数服务器有；没有就 null，卡片自动不画条）。
+       * 账号 = 用户填的账号（一般是手机号/邮箱，本就脱敏不了也无需脱敏 —— 与 115 的处理一致直接亮出）。
+       * added = 「这个来源被添加过没有」—— 没添加（没配置）就**不出卡片**（2026-10-13 用户要求）。
+       * 光鸭官方接口模式（mode='api'）的账号 = user/me 缓存的脱敏手机号。 */
+      ...DAV_KINDS.flatMap(kind => {
+        /* 账号 1 恒出卡（哪怕没配置 → added=false），由前端决定隐不隐藏 —— 这是**老行为**，
+           不能因为「没配就不出卡」把账号 1 也吞掉：外界（前端老代码 / 测试）都依赖这张卡在。
+           账号 ≥2 才要求真的存在（不存在就是没建过，不该凭空冒出一张空卡）。 */
+        const dlist = davAcctListAll(kind)
+        return dlist.map(n => {
+          const c = davCfg(kind, n)
+          const ready = davReady(kind, n)
+          const isApi = kind === 'guangya' && gyIsApi(kind, n)
+          const auth = DAV_AUTH[davInst(kind, n)] || { ok: null, err: '' }
+          const q = davQuotaCached(kind, n)
+          return {
+            id: kind, acct: n, key: davInst(kind, n), kind: 'web',
+            name: (n > 1 ? (c.name || (DAV_DEFNAME[kind] + ' ' + n)) : (c.name || DAV_DEFNAME[kind])),
+            added: ready,
+            mode: kind === 'guangya' ? (isApi ? 'api' : 'webdav') : 'webdav',
+            connected: ready && auth.ok !== false,
+            authOk: ready ? auth.ok : null,
+            authNote: !ready
+              ? (kind === 'guangya' && isApi ? '光鸭还没有登录' : '还没有填写服务器地址 / 账号 / 密钥')
+              : (auth.ok === false ? auth.err : ''),
+            roots: davRoots(kind, n).map(r => Object.assign({}, r, { acct: n })),
+            user: ready ? (isApi ? (c.account || '') : (c.user || '')) : '',
+            space: q && q.total ? { totalFmt: q.totalFmt, usedFmt: q.usedFmt, remainFmt: q.remainFmt, percent: q.percent } : null,
+            stats: Object.assign({}, agg[davInst(kind, n)] || mk(), { coversBytes: (agg[davInst(kind, n)] || mk()).bytes }),
+            health: srcHealthMirror(davInst(kind, n), auth)
+          }
+        })
+      })
+    ]
+  }
+}
+/* ================= 来源健康自检 / 自动恢复（2026-10-15） =================
+ * 要的是 Emby 那种体感：**源自己会好**。
+ *   ① 掉线（115 Cookie 过期、光鸭 Token 失效、WebDAV 连不上、本地盘被拔）→ 卡片立刻标出来并说原因；
+ *   ② 不用用户点任何东西，后台按退避自己复检，**一通就自动翻绿**；
+ *   ③ 用户改凭据（重贴 Cookie / 重填密钥 / 重登光鸭）→ **立刻**复检，几秒内出结果，不用等冷却；
+ *   ④ 恢复那一刻把被卡住的活儿一起解锁：清登录冷却、作废目录快照与统计缓存、让盯梢/扫描继续跑。
+ * 状态在这里集中维护一份（SRC_HEALTH），卡片 / 设置页 / 诊断都读它，不会再出现「这边红了那边还绿」。
+ * ⚠ 复检只对**已配置**的源发请求，且掉线时是退避的（60s→120s→5min→10min），不会拿死凭据空打。 */
+const SRC_HEALTH = {}          // key -> 状态；key 与 sourcesPayload 的卡片 key 同构：'local' | 'pan115' | 'pan115@2' | 'webdav' | 'guangya@2'
+const SRC_HEALTH_GAP = { auth: [60, 120, 300, 600], net: [45, 90, 180, 600] }   // 复检间隔（秒），先密后疏
+let SRC_HEALTH_BUSY = false
+function srcHealthOf(key) {
+  if (!SRC_HEALTH[key]) SRC_HEALTH[key] = { key, state: 'unknown', err: '', since: 0, at: 0, nextAt: 0, tries: 0, probes: 0, recovers: 0 }
+  return SRC_HEALTH[key]
+}
+function srcHealthGap(h, state) {
+  const arr = SRC_HEALTH_GAP[state === 'auth' ? 'auth' : 'net']
+  return arr[Math.min(Math.max(0, (h.tries || 0) - 1), arr.length - 1)] * 1000
+}
+/* quiet=true：只改状态不触发缓存重算（sourcesPayload 内部同步镜像时用它，避免自己把自己刷没了） */
+function srcHealthSet(key, state, err, quiet) {
+  const h = srcHealthOf(key)
+  const prev = h.state
+  h.state = state; h.err = String(err || ''); h.at = Date.now()
+  if (state === 'ok') {
+    if (prev !== 'ok' && prev !== 'unknown') {
+      h.recovers++
+      console.log('[health] ' + key + ' 已自动恢复 ✓（掉线 ' + Math.round((Date.now() - (h.since || Date.now())) / 1000) + 's' + (prev === 'auth' ? '，之前是登录失效' : '') + '）')
+    }
+    h.tries = 0; h.nextAt = 0
+    if (prev !== 'ok') srcHealthUnlock(key)     // 恢复 → 解锁被这次掉线卡住的东西
+  } else {
+    if (prev === 'ok' || prev === 'unknown') { h.since = Date.now(); h.tries = 0 }
+    h.tries++
+    /* unknown（还没配置 / 还没探过）也要有下一次：不然用户在外面把 Cookie 贴好了，
+     * 这边永远等不到「自动恢复」。间隔固定 5 分钟，代价极小（这类请求本地就返回，不出网）。 */
+    h.nextAt = state === 'unknown' ? Date.now() + 5 * 60 * 1000 : Date.now() + srcHealthGap(h, state)
+    if (prev !== state && state !== 'unknown') console.log('[health] ' + key + ' → ' + state + '：' + h.err + '（' + Math.round((h.nextAt - Date.now()) / 1000) + 's 后自动复检）')
+  }
+  if (!quiet) SRC_CACHE = { at: 0, data: null }   // 卡片/统计立刻重算，不用等 60s 缓存
+  return h
+}
+/* 115 登录失效会进「暂停请求」冷却（15~120 分钟）—— 源自己恢复了（用户在别处重新登录 / Cookie 又活了）
+ * 就必须把这个冷却一起撤掉，否则界面绿了、实际操作还是被本地挡着，看着像没恢复。 */
+function srcHealthUnlock(key) {
+  const m = /^pan115(?:@(\d+))?$/.exec(key)
+  if (m) {
+    const n = Math.max(1, parseInt(m[1] || '1', 10) || 1)
+    try { v115CookieChanged(n) } catch (_) {}
+    try { v115MarkAuth(true, '', n) } catch (_) {}
+    try { if (typeof w115Reschedule === 'function') w115Reschedule(5000) } catch (_) {}
+    return
+  }
+  if (/^(webdav|guangya)(@\d+)?$/.test(key)) {
+    try { DAV_AUTH[key] = { ok: true, err: '' } } catch (_) {}
+  }
+}
+/* 把别处判出来的结论（v115MarkAuth / DAV_AUTH）镜像进健康表 —— 不重复发请求，只同步状态 */
+function srcHealthMirror(key, auth) {
+  if (!auth) return srcHealthOf(key)
+  if (auth.ok === false) return srcHealthSet(key, /登录|未登录|过期|失效|401|密钥|Token|token/i.test(String(auth.err || '')) ? 'auth' : 'net', auth.err, true)
+  if (auth.ok === true) return srcHealthSet(key, 'ok', '', true)
+  return srcHealthOf(key)
+}
+/* 已配置来源清单（种子）：只给这些 key 建状态，没添加的源不占条目也不发请求 */
+function srcHealthKeys() {
+  const keys = ['local']
+  try { for (const n of v115AcctListAll()) keys.push(n > 1 ? 'pan115@' + n : 'pan115') } catch (_) {}
+  try { for (const kind of DAV_KINDS) for (const n of davAcctListAll(kind)) keys.push(davInst(kind, n)) } catch (_) {}
+  return keys
+}
+/* 115 的连通性探针：只列根目录 1 条，**一个请求**，不分页不递归（v115List 会翻完整页，太重） */
+async function v115Ping(n) {
+  const j = await v115Json('/files?cid=0&show_dir=1&limit=1&offset=0&o=user_ptime&asc=0&format=json', { probe: true, timeout: 15000 }, n)
+  v115MarkAuth(true, '', n)
+  return j
+}
+/* WebDAV / 光鸭的连通性探针：根目录 PROPFIND Depth 0（与 davQuota 同一条路，只读一层） */
+async function davPing(kind, n) {
+  const inst = davInst(kind, n)
+  if (kind === 'guangya' && gyIsApi(kind, n)) {
+    /* 官方接口模式不走 WebDAV：拿一次 user/me 当心跳（失败会抛，交给上层判定） */
+    await gyUserInfo(n, true)
+    DAV_AUTH[inst] = { ok: true, err: '' }
+    return true
+  }
+  const rs = await davReq(kind, 'PROPFIND', '', { headers: { Depth: '0', 'Content-Type': 'application/xml; charset=utf-8' }, body: DAV_PROPFIND_BODY, timeout: 12000 }, n)
+  if (rs.status === 401) { DAV_AUTH[inst] = { ok: false, err: '账号或密钥不对（HTTP 401）' }; throw new Error(DAV_DEFNAME[kind] + ' 账号或密钥不对（HTTP 401）') }
+  if (rs.status === 403) { DAV_AUTH[inst] = { ok: false, err: '没有访问权限（HTTP 403）' }; throw new Error(DAV_DEFNAME[kind] + ' 没有访问权限（HTTP 403）') }
+  if (rs.status >= 400) { DAV_AUTH[inst] = { ok: false, err: 'HTTP ' + rs.status }; throw new Error(DAV_DEFNAME[kind] + ' 服务器返回 HTTP ' + rs.status) }
+  DAV_AUTH[inst] = { ok: true, err: '' }
+  return true
+}
+/* 本地存储：目录还在不在（移动硬盘拔了 / NAS 断线都会读不到） */
+function localPing() {
+  if (!LIBS.length) return { ok: true, err: '' }
+  let miss = 0
+  for (const p of LIBS) { try { if (!fs.existsSync(p)) miss++ } catch (_) { miss++ } }
+  return miss ? { ok: false, err: miss + ' / ' + LIBS.length + ' 个媒体目录读不到（盘被拔了或 NAS 断了）' } : { ok: true, err: '' }
+}
+async function srcHealthProbe(key) {
+  const h = srcHealthOf(key)
+  h.probes++
+  try {
+    if (key === 'local') {
+      const r = localPing()
+      return srcHealthSet(key, r.ok ? 'ok' : 'net', r.err)
+    }
+    const m = /^pan115(?:@(\d+))?$/.exec(key)
+    if (m) {
+      const n = Math.max(1, parseInt(m[1] || '1', 10) || 1)
+      if (!v115Ready(n)) return srcHealthSet(key, 'unknown', '还没有配置 Cookie')
+      try { await v115Ping(n); return srcHealthSet(key, 'ok', '') }
+      catch (e) {
+        const msg = String((e && e.message) || e || '')
+        /* 登录类失败单独成类：文案要直接告诉用户「去哪重贴 Cookie」，而不是笼统的「连不上」 */
+        return srcHealthSet(key, v115AuthErr(msg) || /990001|登录|未登录/.test(msg) ? 'auth' : 'net', msg)
+      }
+    }
+    const d = /^(webdav|guangya)(?:@(\d+))?$/.exec(key)
+    if (d) {
+      const kind = d[1], n = Math.max(1, parseInt(d[2] || '1', 10) || 1)
+      if (!davReady(kind, n)) return srcHealthSet(key, 'unknown', '还没有配置')
+      try { await davPing(kind, n); return srcHealthSet(key, 'ok', '') }
+      catch (e) {
+        const msg = String((e && e.message) || e || '')
+        return srcHealthSet(key, davAuthErr(msg) || /过期|失效|登录|token/i.test(msg) ? 'auth' : 'net', msg)
+      }
+    }
+    return srcHealthSet(key, 'unknown', '未知来源')
+  } catch (e) {
+    return srcHealthSet(key, 'net', String((e && e.message) || e || ''))
+  }
+}
+/* 立刻复检（不等待、不阻塞调用方）：改完凭据 / 点了「重连」都走这里 */
+function srcHealthProbeNow(key) {
+  srcHealthOf(key).nextAt = 0
+  setTimeout(() => { srcHealthProbe(key).catch(() => {}) }, 30)
+}
+/* 巡检：每 30s 看一眼有没有到点的复检任务。正常（ok）的源一个请求都不发。
+ * unknown 也走同一条路 —— 启动 30s 后顺手把各来源探一遍，卡片状态就准了，
+ * 之后只按 nextAt 到点才动（未配置的源 5 分钟一次，且不出网）。 */
+function srcHealthTick() {
+  if (SRC_HEALTH_BUSY) return
+  const now = Date.now()
+  const due = []
+  for (const k in SRC_HEALTH) {
+    const h = SRC_HEALTH[k]
+    if (h.state === 'ok') continue
+    if (h.nextAt && now < h.nextAt) continue
+    due.push(k)
+  }
+  if (!due.length) return
+  SRC_HEALTH_BUSY = true
+  ;(async () => {
+    for (const k of due) { try { await srcHealthProbe(k) } catch (_) {} }
+  })().then(() => { SRC_HEALTH_BUSY = false }, () => { SRC_HEALTH_BUSY = false })
+}
+setInterval(() => { try { srcHealthTick() } catch (_) {} }, 30000)
+/* 播种：把所有已配置来源登记进来（首轮巡检就把它们探一遍） */
+function srcHealthSeed() {
+  const keys = srcHealthKeys()
+  for (const k of keys) srcHealthOf(k)
+  return keys
+}
+
+/* ================= 网站（导航栏「网站」页：卡片式网址收藏，2026-10-15）=================
+ * 用户需求：导航栏加个「网站」模块，按分类筛、按常用排序，卡片式（图标 + 名称 + 一句话说明）。
+ * 数据落 cacheDir/sites.json（跟着「离线数据迁移」一起走，换目录不丢）。
+ * 图标不再是「猜 emoji」：服务端去站点取真实 favicon 并缓存到 cacheDir/site-icons/，
+ * 取不到就由前端画首字母色块 —— 断网也能看，第一次访问也只是一排色块，不影响使用。 */
+const SITE_CATS = ['番号库', '磁力', '导航', '视频', '直播', '动漫', '图片', '小说', '论坛', '资讯', '其他']
+const SITES_FILE = () => path.join(cacheDir(), 'sites.json')                  // 个人层（用户数据）
+const SITES_BUILTIN_FILE = () => path.join(UI_ROOT, 'sites-builtin.json')     // 内置站点库（软件自带）
+let SITES = null           // 合并视图：所有接口/前端看到的都是它
+let SITES_BUILTIN = null   // 内置库（只读）
+let SITES_BUILTIN_ICON = null   // host → 内置图标 data URI 的查表（/api/sites/icon 用，避免每次 188 次线性找）
+let SITES_MINE = null      // 个人层
+/* ⚠ 2026-10-15 改（用户要求「114 个都加上去，网站数据默认打包在软件里，不作为个人数据」）：
+ * 站点分两层存 ——
+ *   · **内置站点库** `sites-builtin.json`（跟 index.html 同目录，随安装包分发，137 个站点）。
+ *     只读，磁盘上属于「软件自带内容」，永远不会被写进用户目录。
+ *   · **个人层** `cacheDir/sites.json`（v2）：只存「用户自己做的事」——
+ *     list  = 用户新增的站点 + 用户改过的内置站点（覆盖副本，编辑一次才生成，不是一次性拷 137 条）
+ *     del   = 用户删掉的内置站 host 墓碑（不留墓碑的话，删了下一次启动它又冒出来）
+ *     stats = 每站使用痕迹：点击次数 hits / 上次点击 lastAt / 上次测速 net（按 host 记，不复制站点内容）
+ *   合并视图 = 内置库（用户改过的用个人版、删掉的跳过、顺序照内置）+ 个人新增（排末尾）。
+ *   好处：升级换新内置库立刻生效（没动过的站跟着更新），个人数据文件里也不再躺着一百多个网址。
+ *   旧的 v1 数据（整份列表都落盘）首次加载自动整理：与内置库一字不差的条目挪回内置，只留使用痕迹。 */
+function sitesBuiltinList() {
+  if (SITES_BUILTIN) return SITES_BUILTIN
+  SITES_BUILTIN = []
+  try {
+    const j = JSON.parse(fs.readFileSync(SITES_BUILTIN_FILE(), 'utf8'))
+    const raw = (j && Array.isArray(j.list)) ? j.list : (Array.isArray(j) ? j : [])
+    for (const x of raw) {
+      if (!x || !x.url) continue
+      const url = siteNormUrl(x.url)
+      if (!url) continue
+      /* 内置库也可以带图标（logo=data URI、bg=底色、useLogo=用程序画的矢量 logo）。
+       * 2026-10-15 加：作者本人改过图标 / 底色的站点也内置进来，装完就有图，不依赖联网去抓。
+       * ⚠ 图标本体**不放进 /api/sites 的响应**：188 张 data URI 合计 4MB，而网站页每 4 秒就轮询一次，
+       *   塞进去等于每 4 秒搬 4MB。所以这里存成 builtinLogo（仅服务端内存），对外只给一个
+       *   builtinLogoAt 版本号，前端照老规矩走 /api/sites/icon 取图（浏览器自己缓存 7 天）。 */
+      const lg = String(x.logo || '').trim()
+      const logo = (lg && (/^https?:\/\//i.test(lg) || /^data:image\//i.test(lg))) ? lg.slice(0, 1200000) : ''
+      let bg = String(x.bg || '').trim().slice(0, 32)
+      if (bg && !/^transparent$/i.test(bg) && !/^#[0-9a-fA-F]{3,8}$/.test(bg)) bg = ''
+      let logoAt = 0
+      if (logo) {
+        let h = 0
+        for (let i = 0; i < logo.length; i += 11) h = (h * 31 + logo.charCodeAt(i)) | 0   // 采样算版本号，别遍历 30 万个字符
+        logoAt = Math.abs(h) || 1
+      }
+      SITES_BUILTIN.push({
+        id: String(x.id || ('b' + (SITES_BUILTIN.length + 1))),
+        name: String(x.name || '').slice(0, 40) || siteHostOf(url),
+        url: url,
+        cat: SITE_CATS.indexOf(x.cat) >= 0 ? x.cat : '其他',
+        desc: String(x.desc || '').slice(0, 120),
+        logo: '',                          // ← 对外（/api/sites）看到的用户自填图标，内置的放这儿保持空
+        builtinLogo: logo,                 // ← 内置图标本体：只在服务端内存 / /api/sites/icon 里用
+        builtinLogoAt: logoAt,
+        bg: bg, useLogo: x.useLogo ? 1 : 0, hits: 0
+      })
+    }
+    SITES_BUILTIN_ICON = null
+    console.log('[sites] 内置站点库：' + SITES_BUILTIN.length + ' 个站点（含内置图标 ' + SITES_BUILTIN.filter(x => x.builtinLogo).length + ' 个，' + SITES_BUILTIN_FILE() + '）')
+  } catch (e) { console.log('[sites] 内置站点库没读到（' + e.message + '），按空库启动') }
+  return SITES_BUILTIN
+}
+/* 「与内置库一字不差」的条目 = 本来就是软件自带的内容（不是用户自己写的）：
+ * 条目本身归回内置库，只把使用痕迹（点击数 / 上次测速）留在个人层。
+ * v1（整份列表落盘的时代）与 v2（现在）都要过这一道：
+ *   · v1 —— 一次性把一百多条整库副本从个人数据里清出去；
+ *   · v2 —— 让「作者后来把某个站补进内置库」这件事对老用户即时生效：
+ *           个人层里那份一模一样的老副本自动消失，不会把已经内置的内容又盖回去。
+ * 用户真改过（名称/分类/说明/网址/图标/底色 任一不同）的条目一律保留 —— 那是他的定制。 */
+function sitesMineTidy(list, stats) {
+  const byHost = {}
+  for (const b of sitesBuiltinList()) byHost[siteHostOf(b.url)] = b
+  const out = []
+  for (const x of list) {
+    if (!x || !x.url) continue
+    const url = siteNormUrl(x.url)
+    if (!url) continue
+    const host = siteHostOf(url)
+    const b = byHost[host]
+    /* ⚠ 两个坑：
+     * ① 内置图标在服务端存在 builtinLogo（不占 /api/sites 的体积），比的时候得带上它；
+     * ② 个人层字段为空 = 「用户在这项上没意见」，不是「用户把它改成了空」——
+     *    比如用户只改了名字、没碰图标，x.logo 就是空的，这时该沿用内置那枚图标，
+     *    不能因为「内置有图、个人层没图」就判成改过、白留一条副本在个人数据里。 */
+    const bLogo = b ? String(b.builtinLogo || b.logo || '') : ''
+    const same = b && String(x.name || '') === b.name && String(x.cat || '') === b.cat
+      && String(x.desc || '') === String(b.desc || '') && url === b.url
+      && (!x.logo || String(x.logo) === bLogo)
+      && (!x.bg || String(x.bg) === String(b.bg || ''))
+      && (!x.useLogo || b.useLogo)
+    if (same) {
+      const st = {}
+      if (x.hits) st.hits = x.hits
+      if (x.lastAt) st.lastAt = x.lastAt
+      if (x.net) st.net = x.net
+      if (Object.keys(st).length && !stats[host]) stats[host] = st
+      continue
+    }
+    out.push(Object.assign({}, x, { url: url }))
+  }
+  return out
+}
+/* 个人层：v2 结构；v1（整份列表落盘）读到就先整理一遍 */
+function sitesMineLoad() {
+  if (SITES_MINE) return SITES_MINE
+  let raw = null
+  try { raw = JSON.parse(fs.readFileSync(SITES_FILE(), 'utf8')) } catch (_) {}
+  if (raw && Array.isArray(raw.list)) {
+    const isV2 = raw.v === 2
+    const stats = (isV2 && raw.stats && typeof raw.stats === 'object' && !Array.isArray(raw.stats)) ? raw.stats : {}
+    const src = raw.list.filter(x => x && x.url && siteNormUrl(x.url))
+    const list = sitesMineTidy(src, stats)
+    SITES_MINE = {
+      v: 2,
+      list: list,
+      del: (isV2 && Array.isArray(raw.del)) ? raw.del.map(String) : [],
+      stats: stats
+    }
+    if (!isV2 || list.length !== src.length) {
+      console.log('[sites] 个人数据整理：' + src.length + ' 条 → ' + list.length + ' 条（其余 ' + (src.length - list.length) + ' 条与内置站点库一致，归入内置）')
+      sitesMineSave()
+    }
+    return SITES_MINE
+  }
+  SITES_MINE = { v: 2, list: [], del: [], stats: {} }
+  return SITES_MINE
+}
+function sitesMineSave() {
+  try {
+    fs.mkdirSync(cacheDir(), { recursive: true })
+    fs.writeFileSync(SITES_FILE(), JSON.stringify(SITES_MINE, null, 1))
+  } catch (e) { console.log('[sites] 个人数据落盘失败：' + e.message) }
+}
+/* 合并视图：内置库（用户改过的用个人版、删掉的跳过）+ 个人新增 */
+function sitesRebuild() {
+  const base = sitesBuiltinList()
+  const mine = sitesMineLoad()
+  const del = {}
+  for (const h of (mine.del || [])) del[h] = 1
+  const stats = mine.stats || {}
+  const used = {}
+  const out = []
+  const push = (x, builtin) => {
+    const host = siteHostOf(x.url)
+    const st = stats[host] || {}
+    const it = Object.assign({}, x)
+    it.host = host
+    it.builtin = builtin ? 1 : 0
+    it.hits = st.hits != null ? st.hits : (x.hits || 0)
+    it.lastAt = st.lastAt || x.lastAt || 0
+    if (st.net) it.net = st.net
+    out.push(it)
+  }
+  for (const b of base) {
+    const host = siteHostOf(b.url)
+    if (!host || del[host]) continue
+    let idx = -1
+    for (let i = 0; i < mine.list.length; i++) { if (!used[i] && siteHostOf(mine.list[i].url) === host) { idx = i; break } }
+    if (idx >= 0) {
+      used[idx] = 1
+      const m = mine.list[idx]
+      /* 用户只改了名字 / 说明，没动图标 → 那一格照样用内置图标（不然一改名图标就没了） */
+      if (!m.logo && !m.useLogo && b.builtinLogo) {
+        push(Object.assign({}, m, { builtinLogo: b.builtinLogo, builtinLogoAt: b.builtinLogoAt }), false)
+      } else push(m, false)
+      continue
+    }
+    push(b, true)
+  }
+  for (let i = 0; i < mine.list.length; i++) if (!used[i]) push(mine.list[i], false)
+  SITES = { v: 2, list: out }
+  return SITES
+}
+function sitesLoad() { return SITES || sitesRebuild() }
+/* 兼容旧调用名：写操作一律落个人层（内置库只读） */
+function sitesSave() { sitesMineSave() }
+/* 这条网址在内置库里吗（删/改内置站时要留墓碑） */
+function siteIsBuiltinHost(host) {
+  if (!host) return false
+  for (const b of sitesBuiltinList()) if (siteHostOf(b.url) === host) return true
+  return false
+}
+/* host → 内置图标（data URI）。程序自带，不落用户目录；被删掉的站不留在这里（删了就别再吐图）。 */
+function sitesBuiltinIconMap() {
+  if (SITES_BUILTIN_ICON) return SITES_BUILTIN_ICON
+  SITES_BUILTIN_ICON = {}
+  for (const b of sitesBuiltinList()) if (b.builtinLogo) SITES_BUILTIN_ICON[siteHostOf(b.url)] = b.builtinLogo
+  return SITES_BUILTIN_ICON
+}
+/* data URI → 二进制（给 <img> 用）。不是 data:image 就 null。 */
+function dataUriToBuf(s) {
+  const m = /^data:(image\/[\w.+-]+);base64,([\s\S]+)$/i.exec(String(s || '').trim())
+  if (!m) return null
+  try {
+    const buf = Buffer.from(m[2].replace(/\s+/g, ''), 'base64')
+    return buf.length ? { type: m[1].toLowerCase(), buf: buf } : null
+  } catch (_) { return null }
+}
+function siteNewId() { return 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) }
+/* 在个人层里找这条（合并视图的）站点对应的记录：
+ * 用户自己加的站必然有；内置站只有被改过才会有一条「覆盖副本」。 */
+function sitesMineEntry(it) {
+  if (!it) return null
+  const mine = sitesMineLoad()
+  const host = siteHostOf(it.url)
+  return mine.list.find(x => x.id === it.id)
+    || mine.list.find(x => siteHostOf(x.url) === host && x.cat === it.cat)
+    || mine.list.find(x => siteHostOf(x.url) === host)
+    || null
+}
+/* 网址归一化：没写协议就补 https://；去尾部斜杠；只认 http/https */
+function siteNormUrl(raw) {
+  let u = String(raw || '').trim()
+  if (!u) return ''
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '')
+  let o
+  try { o = new URL(u) } catch (_) { return '' }
+  if (!/^https?:$/.test(o.protocol) || !o.hostname) return ''
+  return o.href.replace(/\/+$/, '')
+}
+function siteHostOf(u) { try { return new URL(u).hostname.replace(/^www\./i, '') } catch (_) { return '' } }
+
+/* ---- 内嵌高清站点 logo（2026-10-15 需求：「每个网站把高清 logo 都内嵌在里面」）----
+ * 为什么不用 favicon：GitHub / JavBus / JavDB 这些站点国内根本连不上，抓 favicon 必然是
+ * 超时 → 卡片上一排灰块；而且真实 favicon 多半只有 16~32px，放大就糊。
+ * 所以改成**矢量 SVG 直接内嵌**（data URI，服务端现算）：任意尺寸都锐利 = 高清，
+ * 零网络请求 = 立刻出图、断网也在。已抓到的真实 favicon 依然优先（那是站点自己的脸），
+ * 内嵌 logo 负责「还没抓到 / 抓不到」的那段时间不再难看。 */
+/* 手调品牌表：域名 → { t: 字母标, c: [渐变起, 渐变止], g: 图形（可选，给了就不用字母） } */
+const SITE_LOGO_BRANDS = {
+  'airav.io':            { t: 'AV',  c: ['#7c3aed', '#4c1d95'] },
+  'avbase.net':          { t: 'AB',  c: ['#4f46e5', '#1e1b4b'] },
+  'avmoo.website':       { t: 'AM',  c: ['#0ea5e9', '#0f766e'] },
+  'avsox.click':         { t: 'AS',  c: ['#06b6d4', '#155e75'] },
+  'caribbeancom.com':    { t: 'CB',  c: ['#ef4444', '#7f1d1d'] },
+  'dmm.co.jp':           { t: 'DMM', c: ['#1d4ed8', '#0b1120'] },
+  'video.dmm.co.jp':     { t: 'FANZA', c: ['#e11d48', '#4c0519'] },
+  'adult.contents.fc2.com': { t: 'FC2', c: ['#ec4899', '#831843'] },
+  'fc2.com':             { t: 'FC2', c: ['#ec4899', '#831843'] },
+  'javten.com':          { t: 'J10', c: ['#f97316', '#7c2d12'] },
+  'freejavbt.com':       { t: 'FJ',  c: ['#22c55e', '#14532d'] },
+  'freejavbt.me':        { t: 'FJ',  c: ['#22c55e', '#14532d'] },
+  'hbox.jp':             { t: 'HB',  c: ['#f59e0b', '#78350f'] },
+  'jav321.com':          { t: '321', c: ['#3b82f6', '#1e3a8a'] },
+  'javbus.com':          { t: 'JB',  c: ['#dc2626', '#450a0a'], g: 'bus' },
+  'javdb.com':           { t: 'DB',  c: ['#b91c1c', '#1c1917'], g: 'db' },
+  'javlibrary.com':      { t: 'JL',  c: ['#a16207', '#292524'] },
+  'madou.club':          { t: 'MD',  c: ['#e11d48', '#4c0519'] },
+  'madouqu.com':         { t: 'MQ',  c: ['#f43f5e', '#500724'] },
+  'mgstage.com':         { t: 'MG',  c: ['#475569', '#0f172a'] },
+  'missav123.com':       { t: 'MA',  c: ['#f472b6', '#831843'], g: 'play' },
+  'missav.ws':           { t: 'MA',  c: ['#f472b6', '#831843'], g: 'play' },
+  '7mmtv.sx':            { t: 'MM',  c: ['#8b5cf6', '#3b0764'] },
+  'api.theporndb.net':   { t: 'DB',  c: ['#14b8a6', '#134e4a'] },
+  'theporndb.net':       { t: 'DB',  c: ['#14b8a6', '#134e4a'] },
+  'xchina.co':           { t: 'X',   c: ['#facc15', '#78350f'] },
+  'sukebei.nyaa.si':     { t: 'SK',  c: ['#334155', '#020617'], g: 'torii' },
+  'nyaa.si':             { t: 'N',   c: ['#4ade80', '#14532d'], g: 'torii' },
+  'nyaa.land':           { t: 'N',   c: ['#4ade80', '#14532d'], g: 'torii' },
+  '115.com':             { t: '115', c: ['#2563eb', '#0c1a3a'], g: 'cloud' },
+  'guangyapan.com':      { t: 'GY',  c: ['#fb923c', '#7c2d12'], g: 'cloud' },
+  'minnano-av.com':      { t: 'MN',  c: ['#f9a8d4', '#9d174d'] },
+  /* 用户从 iTab 备份里搬进来的那批，顺手指上牌子色 */
+  'jable.tv':            { t: 'JA',  c: ['#f97316', '#7f1d1d'], g: 'play' },
+  '123av.com':           { t: '123', c: ['#ef4444', '#701a75'], g: 'play' },
+  'netflav5.com':        { t: 'NF',  c: ['#dc2626', '#1f2937'], g: 'play' },
+  'jav.sb':              { t: 'SB',  c: ['#f43f5e', '#450a0a'], g: 'play' },
+  'njav.com':            { t: 'NJ',  c: ['#8b5cf6', '#2e1065'], g: 'play' },
+  't66y.com':            { t: 'CL',  c: ['#16a34a', '#052e16'] },
+  'sis001.com':          { t: 'SIS', c: ['#0ea5e9', '#0c4a6e'] },
+  'avscan.cc':           { t: 'AVS', c: ['#22d3ee', '#164e63'] },
+  'whos.tv':             { t: 'WHO', c: ['#a855f7', '#3b0764'] },
+  'pornpics.com':        { t: 'PP',  c: ['#f43f5e', '#4c0519'] },
+  'beeg.com':            { t: 'BG',  c: ['#f59e0b', '#1c1917'], g: 'play' },
+  'xvideos.com':         { t: 'XV',  c: ['#6b7280', '#111827'], g: 'play' },
+  'theporndb.net':       { t: 'DB',  c: ['#14b8a6', '#134e4a'] },
+  'jubt12.xyz':          { t: 'JU',  c: ['#22c55e', '#052e16'], g: 'magnet' },
+  'seju.life':           { t: 'SJ',  c: ['#ec4899', '#500724'], g: 'magnet' },
+  'torrentkitty.app':    { t: 'TK',  c: ['#38bdf8', '#0c4a6e'], g: 'magnet' },
+  '18mag.net':           { t: '18',  c: ['#8b5cf6', '#1e1b4b'], g: 'magnet' },
+  'bt1207so.top':        { t: 'BT',  c: ['#f97316', '#431407'], g: 'magnet' },
+  'openbtoo.cc':         { t: 'OB',  c: ['#10b981', '#064e3b'], g: 'magnet' },
+  'cn.torrentkitty.app': { t: 'TK',  c: ['#38bdf8', '#0c4a6e'], g: 'magnet' },
+  '155zy.com':           { t: '115', c: ['#2563eb', '#0c1a3a'], g: 'cloud' },
+  /* iTab 备份导入的那批（2026-10-15）*/
+  'javrate.com':         { t: 'JR',  c: ['#f59e0b', '#78350f'] },
+  'javbooks.com':        { t: 'JBS', c: ['#0ea5e9', '#0c4a6e'] },
+  'avgood.com':          { t: 'AG',  c: ['#22c55e', '#052e16'] },
+  'javcup.com':          { t: 'JC',  c: ['#a855f7', '#3b0764'] },
+  'manko.fun':           { t: 'MK',  c: ['#f472b6', '#831843'], g: 'play' },
+  'xeden.net':           { t: 'XD',  c: ['#ef4444', '#450a0a'], g: 'play' },
+  'omgjav.com':          { t: 'OMG', c: ['#f43f5e', '#4c0519'], g: 'play' },
+  'mythav.org':          { t: 'MY',  c: ['#8b5cf6', '#2e1065'], g: 'play' },
+  'missavt41.com':       { t: 'MA',  c: ['#f472b6', '#831843'], g: 'play' },
+  'fulleroticmovies.net': { t: '80S', c: ['#a16207', '#1c1917'], g: 'play' },
+  'bad.news':            { t: 'BN',  c: ['#475569', '#020617'] },
+  'mm18news.com':        { t: '18',  c: ['#f97316', '#431407'] },
+  'allmylinks.com':      { t: '169', c: ['#6366f1', '#312e81'] },
+  'avno1tw.com':         { t: 'AV1', c: ['#ec4899', '#500724'] },
+  'xsijishe.com':        { t: 'XS',  c: ['#06b6d4', '#164e63'] },
+  'everia.club':         { t: 'EV',  c: ['#d946ef', '#701a75'] },
+  'hecoq.uuss.uk':       { t: 'HQ',  c: ['#f59e0b', '#451a03'] },
+  'en.girlstop.info':    { t: 'GS',  c: ['#f43f5e', '#881337'] },
+  'nv-pu-sa.pages.dev':  { t: 'NP',  c: ['#ec4899', '#831843'] },
+  '134x.com':            { t: '134', c: ['#ef4444', '#7f1d1d'] },
+  '5xfeed.com':          { t: 'XF',  c: ['#0f172a', '#334155'] },
+  'myfans-douga.com':    { t: 'MF',  c: ['#f472b6', '#9d174d'] },
+  'bit.ly':              { t: 'bit', c: ['#334155', '#0f172a'] },
+  'pornhubdownloader.io': { t: 'DL', c: ['#f97316', '#1c1917'] },
+  'veil.ortlinde.com':   { t: 'SS',  c: ['#8b5cf6', '#1e1b4b'] },
+  '91bestporn.com':      { t: '91',  c: ['#dc2626', '#450a0a'] },
+  'hygcz4.uejqxl.com':   { t: 'GC',  c: ['#16a34a', '#052e16'] }
+}
+/* 没登记过的站点：按域名算一组稳定的渐变（同一域名永远同一颜色，不会每次进来都换色） */
+const SITE_LOGO_PALETTE = [
+  ['#ef4444', '#7f1d1d'], ['#f97316', '#7c2d12'], ['#f59e0b', '#78350f'], ['#22c55e', '#14532d'],
+  ['#10b981', '#064e3b'], ['#14b8a6', '#134e4a'], ['#06b6d4', '#155e75'], ['#3b82f6', '#1e3a8a'],
+  ['#6366f1', '#312e81'], ['#8b5cf6', '#3b0764'], ['#d946ef', '#701a75'], ['#ec4899', '#831843'],
+  ['#f43f5e', '#4c0519'], ['#64748b', '#0f172a'], ['#0ea5e9', '#0c4a6e']
+]
+/* 96×96 网格上的白色描边小图形（不加 fill，靠 stroke 走统一线宽） */
+const SITE_LOGO_GLYPHS = {
+  play:   '<circle cx="48" cy="48" r="21" fill="none" stroke="#fff" stroke-width="6"/><path d="M41.5 37.5 61 48l-19.5 10.5z" fill="#fff"/>',
+  magnet: '<path d="M33 27v21a15 15 0 0 0 30 0V27" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round"/><path d="M33 40h12M51 40h12" stroke="#fff" stroke-width="7" stroke-linecap="round"/>',
+  cloud:  '<path d="M33 69a12.5 12.5 0 0 1-1.2-24.9A17.5 17.5 0 0 1 65.5 40a12.5 12.5 0 0 1-.9 29z" fill="none" stroke="#fff" stroke-width="6" stroke-linejoin="round"/>',
+  torii:  '<path d="M24 31h48M30 42h36M38 31v39M58 31v39" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round"/>',
+  bus:    '<rect x="27" y="25" width="42" height="34" rx="7" fill="none" stroke="#fff" stroke-width="6"/><path d="M27 43h42M35 59v8M61 59v8" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round"/><circle cx="38" cy="40" r="3.2" fill="#fff"/><circle cx="58" cy="40" r="3.2" fill="#fff"/>',
+  db:     '<ellipse cx="48" cy="31" rx="20" ry="8" fill="none" stroke="#fff" stroke-width="6"/><path d="M28 31v34c0 4.4 9 8 20 8s20-3.6 20-8V31" fill="none" stroke="#fff" stroke-width="6"/><path d="M28 47c0 4.4 9 8 20 8s20-3.6 20-8" fill="none" stroke="#fff" stroke-width="5"/>'
+}
+const xmlEsc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]))
+/* 域名 → 字母标：去掉后缀与常见前缀，取头段前 2 个字母数字 */
+function siteLogoText(host, name) {
+  const h = String(host || '').toLowerCase()
+  let seg = h.split('.').filter(x => x !== 'www' && x !== 'api')[0] || ''
+  let t = seg.replace(/[^0-9a-z]/g, '')
+  if (!t || t.length < 2) t = String(name || host || '?').replace(/[^0-9a-zA-Z\u4e00-\u9fa5]/g, '')
+  if (!t) return '?'
+  return t.slice(0, 2).toUpperCase()
+}
+/* 生成内嵌 logo（data URI）。带缓存：同一域名只算一次。 */
+const SITE_LOGO_MEMO = {}
+function siteLogoUri(host, name) {
+  const h = String(host || '').toLowerCase()
+  if (!h) return ''
+  if (SITE_LOGO_MEMO[h]) return SITE_LOGO_MEMO[h]
+  const b = SITE_LOGO_BRANDS[h]
+  let c = b && b.c
+  if (!c) {
+    let n = 0
+    for (let i = 0; i < h.length; i++) n = (n * 31 + h.charCodeAt(i)) % 99991
+    c = SITE_LOGO_PALETTE[n % SITE_LOGO_PALETTE.length]
+  }
+  const glyph = b && b.g ? SITE_LOGO_GLYPHS[b.g] || '' : ''
+  const txt = (b && b.t) || siteLogoText(h, name)
+  const fs = txt.length >= 4 ? 24 : txt.length === 3 ? 29 : txt.length === 2 ? 36 : 46
+  const mark = glyph || ('<text x="48" y="50" text-anchor="middle" dominant-baseline="central" ' +
+    'font-family="Arial,Helvetica,Segoe UI,sans-serif" font-size="' + fs + '" font-weight="700" ' +
+    'fill="#fff" letter-spacing="0.5">' + xmlEsc(txt) + '</text>')
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img">' +
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">' +
+    '<stop offset="0" stop-color="' + c[0] + '"/><stop offset="1" stop-color="' + c[1] + '"/></linearGradient></defs>' +
+    '<rect width="96" height="96" rx="23" fill="url(#g)"/>' +
+    '<path d="M0 64Q48 34 96 64V73Q96 96 73 96H23Q0 96 0 73Z" fill="#ffffff" opacity=".10"/>' +
+    '<rect x="0.75" y="0.75" width="94.5" height="94.5" rx="22.4" fill="none" stroke="#ffffff" stroke-opacity=".22" stroke-width="1.5"/>' +
+    mark + '</svg>'
+  const uri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)
+  SITE_LOGO_MEMO[h] = uri
+  return uri
+}
+/* 这个域名是不是用的内嵌 logo（登记过品牌，或有自定义 logo 字段）→ 是的话就不用再去抓 favicon 了 */
+function siteHasLogo(x) {
+  if (x && x.logo) return true
+  return !!SITE_LOGO_BRANDS[siteHostOf(x && x.url)]
+}
+
+/* ---- 站点图标：取真实 favicon 并缓存（取不到就记 7 天负面缓存，别每次都去碰壁）---- */
+const SITE_ICON_DIR = () => path.join(cacheDir(), 'site-icons')
+/* 负面缓存两种时长：站点自己答了但没图标（7 天，不用再问）/ 网络没打通（3 小时，过会儿再试） */
+const SITE_ICON_MISS_MS = 7 * 24 * 3600 * 1000
+const SITE_ICON_NETMISS_MS = 3 * 3600 * 1000
+function siteIconKey(u) { try { const o = new URL(u); return crypto.createHash('md5').update(o.origin).digest('hex').slice(0, 16) } catch (_) { return '' } }
+/* 高清阈值：缓存文件名带质量分 {key}.q{score}.{ext}，≥ 此分才算「已经是原版高清」，不再重抓。
+ * 分数：头部原版 <img logo> 1500 · SVG 图标 1000+ · manifest/apple-touch 大图 ≤900 · favicon.ico 10 */
+const SITE_ICON_HQ = 700
+/* 「上次尝试抓取」的时间戳({key}.try)：同一天内不重复去抓同一个站 —— 老逻辑每次进网站页
+ * 都把低分的站重新排一遍队，配合 4 秒一次的前端轮询，等于对着 40 多个站无限重抓。 */
+const SITE_ICON_TRY_MS = 24 * 3600 * 1000
+function siteIconMarkTry(key) { siteIconBust(); try { fs.writeFileSync(path.join(SITE_ICON_DIR(), key + '.try'), String(Date.now())) } catch (_) {} }
+function siteIconTriedRecently(key) {
+  try { const st = fs.statSync(path.join(SITE_ICON_DIR(), key + '.try')); return Date.now() - st.mtimeMs < SITE_ICON_TRY_MS } catch (_) { return false }
+}
+/* 图标目录清单缓存 + key 索引（2026-10-15）。
+ * 起因：siteIconExisting() 原来每调用一次就 readdirSync 整个图标目录，然后**把整份文件名清单
+ * 逐个 startsWith 比一遍**；而 /api/sites 要为每个站点调一次它，前端又是每 4 秒轮询这个接口。
+ * 188 个站 × 200 个文件名 ⇒ 每次请求约 3.8 万次字符串比较 + 188 次 readdirSync。
+ * 实测（188 站 / 200 个图标文件）：中位 3.55ms，每 4 秒一轮，纯白烧 —— 而且离线数据目录可能在慢盘上。
+ * 做法：一次 readdir，把清单**预折叠成 key → best** 的 Map（语义与原来的循环逐条对齐），
+ * 之后每个站点就只是一次 Map.get。TTL 2 秒只是兜底；所有写图标的路径都会 siteIconBust() 立即失效，
+ * 所以「抓到新图标 → 前端下一轮就看到」这条链路不受影响。 */
+let SITE_ICON_LS = { at: 0, names: null, map: null }
+const SITE_ICON_LS_MS = 2000
+function siteIconBust() { SITE_ICON_LS = { at: 0, names: null, map: null } }
+function siteIconScan() {
+  const now = Date.now()
+  if (SITE_ICON_LS.names && now - SITE_ICON_LS.at < SITE_ICON_LS_MS) return SITE_ICON_LS
+  let names = null
+  try { names = fs.readdirSync(SITE_ICON_DIR()) } catch (_) { names = null }   // 目录不存在 = 读不了，返回 null
+  let map = null
+  if (names) {
+    map = new Map()
+    const dir = SITE_ICON_DIR()
+    for (const n of names) {
+      const dot = n.lastIndexOf('.')
+      if (dot <= 0) continue
+      const key = n.slice(0, dot)
+      if (!/^[0-9a-f]{16}$/.test(key)) continue              // 只认 siteIconKey() 产出的 16 位 md5 前缀
+      const tail = n.slice(dot + 1)
+      if (tail === 'try') continue                           // 尝试记录，不是图标
+      if (tail === 'miss' || tail === 'netmiss') {
+        const cur = map.get(key)
+        if (cur && !cur.miss) continue                       // 已经有真文件，负面标记不算数
+        const ttl = tail === 'netmiss' ? SITE_ICON_NETMISS_MS : SITE_ICON_MISS_MS
+        let st = {}
+        try { st = fs.statSync(path.join(dir, n)) } catch (_) {}
+        if (now - (st.mtimeMs || 0) < ttl) map.set(key, { miss: true })
+        continue
+      }
+      /* 文件名两种形态：新格式 key.q{分数}.{ext}，旧格式 key.{ext}（早期抓的低清 favicon，分数记 0） */
+      const qm = /^q(\d+)\./.exec(tail)
+      const q = qm ? (parseInt(qm[1], 10) || 0) : 0
+      const cur = map.get(key)
+      if (!cur || cur.miss || q > (cur.q || 0)) map.set(key, { file: path.join(dir, n), q })
+    }
+  }
+  SITE_ICON_LS = { at: now, names, map }
+  return SITE_ICON_LS
+}
+function siteIconNames() { return siteIconScan().names }
+function siteIconExisting(key) {
+  const m = siteIconScan().map
+  if (!m) return null
+  return m.get(key) || null
+}
+/* 抓图标：只走一次跳转、限时 6 秒、限 1.5MB。
+ * ⚠ 代理必须用 proxyUrl()：之前写成 `CFG.proxyEnabled && CFG.proxy`，而配置里通常只有 proxy
+ * 没有 proxyEnabled（默认=开）→ 被判成「关」→ 全部直连 → 墙外站全超时 ——
+ * 这就是「网站卡片没有原版 logo」的根因。另外图标抓取**不查 DIRECT_HOSTS 白名单**：
+ * 白名单是给刮削用的（那些源必须直连）；抓 logo 走代理即使国内站也由 clash 规则分流，不亏。 */
+function siteIconFetch(url, timeout) {
+  return new Promise((resolve, reject) => {
+    let u
+    try { u = new URL(url) } catch (_) { return reject(new Error('地址不合法')) }
+    if (!/^https?:$/.test(u.protocol)) return reject(new Error('协议不支持'))
+    const mod = u.protocol === 'http:' ? http : https
+    const pxy = proxyUrl()
+    const rq = mod.get({
+      hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443),
+      path: u.pathname + u.search,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36', Accept: 'text/html,image/*,*/*' },
+      ...(u.protocol === 'https:' && pxy ? { agent: tunnelAgent(pxy) } : {}),
+      timeout: timeout || 6000
+    }, rsp => {
+      if (rsp.statusCode >= 300 && rsp.statusCode < 400 && rsp.headers.location) {
+        rsp.resume()
+        let next = ''
+        try { next = new URL(rsp.headers.location, url).href } catch (_) {}
+        if (!next) return reject(new Error('跳转地址无效'))
+        return siteIconFetch(next, timeout).then(resolve, reject)
+      }
+      if (rsp.statusCode !== 200) { rsp.resume(); return reject(new Error('HTTP ' + rsp.statusCode)) }
+      const chunks = []; let n = 0
+      rsp.on('data', d => {
+        n += d.length
+        if (n > 1536 * 1024) { try { rq.destroy() } catch (_) {} ; return reject(new Error('内容过大')) }
+        chunks.push(d)
+      })
+      rsp.on('end', () => resolve({ buf: Buffer.concat(chunks), type: String(rsp.headers['content-type'] || '') }))
+      rsp.on('error', reject)
+    })
+    rq.on('error', reject)
+    rq.on('timeout', () => { try { rq.destroy(new Error('超时')) } catch (_) {} ; reject(new Error('超时')) })
+  })
+}
+const SITE_ICON_EXT = t => /svg/i.test(t) ? 'svg' : /png/i.test(t) ? 'png' : /webp/i.test(t) ? 'webp' : /gif/i.test(t) ? 'gif' : /x-icon|vnd\.microsoft\.icon|octet-stream/i.test(t) ? 'ico' : 'png'
+/* 首页 HTML 里找 <link rel="icon|shortcut icon|apple-touch-icon" href="…">
+ * —— 很多站点的 /favicon.ico 是 404，真正的图标写在 HTML 里。 */
+function siteIconFromHtml(html, base) {
+  const out = []
+  const re = /<link\b[^>]*\brel\s*=\s*["']?([^"'>]*icon[^"'>]*)["']?[^>]*>/gi
+  let m
+  while ((m = re.exec(String(html || '')))) {
+    const tag = m[0]
+    const h = (tag.match(/href\s*=\s*["']([^"']+)["']/i) || [])[1]
+    if (!h) continue
+    try { out.push(new URL(h, base).href) } catch (_) {}
+    if (out.length >= 4) break
+  }
+  return out
+}
+/* ---- 原版高清 logo（2026-10-15 需求：「我要他原版高清 logo」）----
+ * 之前只抓 /favicon.ico（16~32px，糊）且代理判断写反 → 墙外站全超时，卡片只剩内嵌字母标。
+ * 现在改成抓**站点自己的原版 logo**，按清晰度打分、从好到差试：
+ *   q1500  首页头部 <img …logo…>（站点自己摆在脑袋上的横标，就是用户截图里那种）
+ *   q1000+ <link rel=icon type=image/svg+xml> / mask-icon（矢量，无限清晰）
+ *   q≤900  manifest icons（512 很常见）· apple-touch-icon（规范默认 180px）· 标了 sizes 的 icon
+ *   q10    /favicon.ico（保底）
+ * 文件名 {key}.q{score}.{ext}：已有 ≥700（SITE_ICON_HQ）不再重抓；低于的会趁后台队列升级。 */
+/* 读图片真实宽高（PNG / GIF / JPEG / WEBP）—— 判断「这是不是一枚图标」用。
+ * 老逻辑只按「<img> 标签里带 logo 字样」猜，结果把首页那种 1200×630 的大横幅、
+ * 剧照、宣传图当成了 logo 缓存下来 → 用户看到的就是「图片是错的」。 */
+function siteIconDim(b, ext) {
+  try {
+    if (b.length > 24 && b.subarray(0, 4).toString('binary') === '\x89PNG') return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) }
+    if (b.length > 10 && b.subarray(0, 3).toString('binary') === 'GIF') return { w: b.readUInt16LE(6), h: b.readUInt16LE(8) }
+    if (b.length > 4 && b[0] === 0xff && b[1] === 0xd8) {                 // JPEG：扫 SOF 段
+      let i = 2
+      while (i + 9 < b.length) {
+        if (b[i] !== 0xff) { i++; continue }
+        const m = b[i + 1]
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { h: b.readUInt16BE(i + 5), w: b.readUInt16BE(i + 7) }
+        const len = b.readUInt16BE(i + 2)
+        if (len < 2) break
+        i += 2 + len
+      }
+      return null
+    }
+    if (b.length > 30 && b.subarray(8, 12).toString('binary') === 'WEBP') {
+      const t = b.subarray(12, 16).toString('binary')
+      if (t === 'VP8X') return { w: 1 + b.readUIntLE(24, 3), h: 1 + b.readUIntLE(27, 3) }
+      if (t === 'VP8 ') return { w: b.readUInt16LE(26) & 0x3fff, h: b.readUInt16LE(28) & 0x3fff }
+      if (t === 'VP8L') { const n = b.readUInt32LE(21); return { w: (n & 0x3fff) + 1, h: ((n >> 14) & 0x3fff) + 1 } }
+    }
+  } catch (_) {}
+  return null
+}
+/* 「长得像不像一枚图标 / logo」：太宽太扁 = 横幅，太大 = 封面 / 剧照，太小 = 糊 */
+function siteIconShapeOk(dim) {
+  if (!dim || !dim.w || !dim.h) return true                   // 认不出尺寸就不拦（SVG / ICO 走这里）
+  if (dim.w < 40 && dim.h < 40) return false                  // 16px 那种太小，还不如用内嵌矢量 logo
+  if (dim.w > 1000 || dim.h > 1000) return false              // 大图基本是主图 / 剧照
+  const ar = dim.w / dim.h
+  if (ar > 6.5 || ar < 0.16) return false                     // 超宽横幅 / 超窄竖条：不是 logo
+  return true
+}
+function siteIconSniff(buf, type) {
+  const h = buf.subarray(0, 12).toString('binary')
+  if (/svg/i.test(type) || h.includes('<svg')) return 'svg'
+  if (h.startsWith('\x89PNG')) return 'png'
+  if (h.startsWith('GIF8')) return 'gif'
+  if (h.startsWith('\xff\xd8\xff')) return 'jpg'
+  if (/webp/i.test(type) || h.slice(8, 12) === 'WEBP') return 'webp'
+  if (h.startsWith('\x00\x00\x01\x00') || /icon/i.test(type)) return 'ico'
+  return ''
+}
+function siteIconCandidates(html, base) {
+  const out = []
+  const push = (u, score, kind) => { try { if (!u || /^data:/i.test(u)) return; out.push({ url: new URL(u, base).href, score, kind }) } catch (_) {} }
+  let m
+  const imgRe = /<img\b[^>]*>/gi
+  while ((m = imgRe.exec(html))) {
+    const tag = m[0]
+    if (!/logo/i.test(tag)) continue
+    const src = (tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || [])[1]
+    if (src) push(src, 1500, 'logoimg')
+    if (out.filter(c => c.kind === 'logoimg').length >= 4) break
+  }
+  const linkRe = /<link\b[^>]*>/gi
+  while ((m = linkRe.exec(html))) {
+    const tag = m[0]
+    const rel = ((tag.match(/\brel\s*=\s*["']([^"']+)["']/i) || [])[1] || '').toLowerCase()
+    if (!/icon|manifest/.test(rel)) continue
+    const href = (tag.match(/\bhref\s*=\s*["']([^"']+)["']/i) || [])[1]
+    if (!href) continue
+    if (/manifest/.test(rel)) { push(href, -1, 'manifest'); continue }
+    const sizes = (tag.match(/\bsizes\s*=\s*["']([^"']+)["']/i) || [])[1] || ''
+    const type = (tag.match(/\btype\s*=\s*["']([^"']+)["']/i) || [])[1] || ''
+    const sm = /(\d+)\s*x\s*(\d+)/i.exec(sizes); const size = sm ? parseInt(sm[1]) : 0
+    if (/svg/.test(type) || /\.svg/i.test(href)) push(href, 1000 + (size || 400), 'svg')
+    else if (/apple-touch/.test(rel)) push(href, Math.max(size, 180), 'png')
+    else push(href, size || 16, 'icon')
+  }
+  return out.sort((a, b) => b.score - a.score)
+}
+/* 已缓存的这份图标是不是「垃圾」：老算法用「<img> 标签里带 logo 字样」猜出来的横幅 / 剧照 /
+ * 超大图 / JPEG 照片。是垃圾的话，新抓到的**哪怕分数更低也允许覆盖** —— 否则脏数据永远换不掉，
+ * 用户看到的就一直是「图片是错的」。 */
+function siteIconJunk(file) {
+  try {
+    const st = fs.statSync(file)
+    if (st.size > 600 * 1024) return true
+    const ext = (file.match(/\.(\w+)$/) || [])[1] || ''
+    if (/^jpe?g$/i.test(ext)) return true
+    if (/^(ico|svg)$/i.test(ext)) return false
+    const d = siteIconDim(fs.readFileSync(file), ext)
+    if (!d || !d.w || !d.h) return false
+    return !siteIconShapeOk(d)
+  } catch (_) { return false }
+}
+/* 取图标 → 返回 { buf, type } 或抛错；同时负责落盘缓存 / 负面标记。
+ *
+ * ⚠ 2026-10-15 大修（用户反馈「网站图片一直在刷新」+「很多图片都是错的」）：
+ * 老逻辑是「有缓存但分数 < 700 就重抓一次」，而 /api/sites/icon（每张卡的 <img> 都打它）
+ * 也在调这个函数 → 卡片每 4 秒重画一次 → 每张图都发起一次联网重抓 → 抓到什么就覆盖
+ * 什么（甚至抓到更差的 q10 favicon 把 q60 顶掉）→ mtime 变 → 前端判定「图变了」→ 再重画……
+ * 无限循环，图就一直闪、一直换。现在：
+ *   opts.cacheOnly  → 图片接口只读缓存，未命中立刻 404 并排进后台队列（绝不在请求里联网）
+ *   opts.upgrade    → 后台队列专用：允许联网，但**只升级不降级**（score 必须更高才覆盖）
+ *   opts.force      → 手动「重抓图标」：忽略 .try / 负面缓存
+ */
+async function siteIconEnsure(rawUrl, opts) {
+  const o = opts || {}
+  const u = siteNormUrl(rawUrl)
+  if (!u) throw new Error('网址不合法')
+  const key = siteIconKey(u)
+  if (!key) throw new Error('网址不合法')
+  const hit = siteIconExisting(key)
+  const oldQ = (hit && hit.file) ? (hit.q || 0) : 0
+  const readHit = () => {
+    try { return { buf: fs.readFileSync(hit.file), type: (hit.file.match(/\.(\w+)$/) || [])[1] || 'png' } } catch (_) { return null }
+  }
+  if (hit && hit.file && (o.cacheOnly || !o.upgrade || oldQ >= SITE_ICON_HQ)) {
+    const r = readHit()
+    if (r) return r
+  }
+  if (o.cacheOnly) {
+    /* 图片接口路径：没有缓存就立刻放弃，把它排进后台队列，下次轮询自然出现 */
+    try { siteIconWarm([{ url: u }]) } catch (_) {}
+    throw new Error('图标还没缓存好')
+  }
+  if (hit && hit.miss && !o.force) throw new Error('之前取不到（已缓存 7 天）')
+  const o2 = new URL(u)
+  const origin = o2.origin
+  siteIconMarkTry(key)                                   // 记一笔：24 小时内不再自动重试
+  let html = ''
+  try {
+    const page = await siteIconFetch(origin + '/', 10000)
+    if (/html|text/i.test(page.type || '')) html = page.buf.toString('utf8').slice(0, 500000)
+  } catch (_) {}
+  const cands = siteIconCandidates(html, origin)
+  const man = cands.find(c => c.kind === 'manifest')
+  if (man) {
+    try {
+      const r = await siteIconFetch(man.url, 8000)
+      const j = JSON.parse(r.buf.toString('utf8'))
+      const icons = (j.icons || []).map(i => ({ src: i.src, s: parseInt((/(\d+)/.exec(String(i.sizes || '')) || [])[1]) || 0 })).sort((a, b) => b.s - a.s)
+      if (icons[0] && icons[0].src) cands.push({ url: new URL(icons[0].src, man.url).href, score: Math.min(icons[0].s || 96, 900), kind: 'manifest' })
+    } catch (_) {}
+  }
+  /* icon.horse 排在**自己的 favicon 之后**（5 < 10）：它是聚合服务，遇到不认识的站会给
+   * 一张「域名首字母」的替代图 —— 那正是用户说的「图片是错的」。只有在站点自己什么都不给
+   * 的时候才用它兜一下。 */
+  cands.push({ url: origin + '/favicon.ico', score: 10, kind: 'ico' })
+  cands.push({ url: 'https://icon.horse/icon/' + o2.hostname, score: 5, kind: 'horse' })
+  cands.sort((a, b) => b.score - a.score)
+  let buf = null, ext = '', score = 0, answered = false, tried = 0
+  for (const c of cands) {
+    if (tried++ >= 8) break
+    try {
+      const r = await siteIconFetch(c.url, 8000)
+      answered = true
+      if (!r.buf || r.buf.length < 250) continue
+      const e2 = siteIconSniff(r.buf, r.type)
+      if (!e2) continue
+      if (e2 === 'svg') { if (r.buf.length > 300 * 1024) continue }
+      else {
+        if (r.buf.length > 600 * 1024) continue                       // logo 再大就是 banner 了
+        const dim = siteIconDim(r.buf, e2)
+        if (dim && !siteIconShapeOk(dim)) {
+          /* 形状不对：横幅 / 剧照 / 16px 糊图。
+           * 但「站点自己的 favicon.ico / 标了 sizes 的 icon」即使小也收 —— 那是它唯一的官方图标。 */
+          const official = (c.kind === 'ico' || c.kind === 'icon' || c.kind === 'png')
+          if (!official) continue
+          if (dim.w < 24 && dim.h < 24) continue
+          if (c.score < SITE_ICON_HQ && (dim.w > 1000 || dim.h > 1000)) continue
+        }
+        if (e2 === 'jpg' && c.score >= 1000) continue                 // logo 位给的是照片 → 不是 logo
+      }
+      buf = r.buf; ext = e2; score = c.score
+      break
+    } catch (e) { if (/HTTP \d/.test(String(e && e.message))) answered = true }   // 有 HTTP 应答 = 站点可达
+  }
+  try { fs.mkdirSync(SITE_ICON_DIR(), { recursive: true }) } catch (_) {}
+  siteIconBust()   // 这一趟无论如何都会动目录（删脏图 / 写负面标记 / 落新图），先把清单缓存作废
+  if (!buf) {
+    /* 没抓到更好的：已有旧文件就留着用；但旧文件本身是垃圾（横幅 / 照片 / 超大图）就删掉，
+     * 让卡片退回内嵌矢量 logo —— 留着一张 1.6MB 的剧照当「图标」才是真的难看。 */
+    if (hit && hit.file) {
+      if (siteIconJunk(hit.file)) { try { fs.unlinkSync(hit.file) } catch (_) {} }
+      else { const r = readHit(); if (r) return r }
+    }
+    /* 站点答了但没图标 → 7 天内不再问；纯粹连不上/超时 → 只记 3 小时，过会儿还会再试 */
+    try { fs.writeFileSync(path.join(SITE_ICON_DIR(), key + (answered ? '.miss' : '.netmiss')), '') } catch (_) {}
+    throw new Error(answered ? '这个站点没给可用的图标' : '连不上这个站点')
+  }
+  /* ⚠ 只升级不降级（但要能修脏数据）：抓到的比现有的差 → 留着旧的；
+   * 除非旧的本身是垃圾（横幅 / 剧照 / 超大图），那就必须换掉。 */
+  if (hit && hit.file && score <= oldQ && !siteIconJunk(hit.file)) { const r = readHit(); if (r) return r }
+  /* 抓到了更好的：清掉同 key 的旧图标（负面标记和 .try 留着）再落盘 */
+  let es = []; try { es = fs.readdirSync(SITE_ICON_DIR()) } catch (_) {}
+  for (const n of es) {
+    if (!n.startsWith(key + '.')) continue
+    if (n === key + '.try' || n === key + '.miss' || n === key + '.netmiss') continue
+    try { fs.unlinkSync(path.join(SITE_ICON_DIR(), n)) } catch (_) {}
+  }
+  try { fs.unlinkSync(path.join(SITE_ICON_DIR(), key + '.miss')) } catch (_) {}
+  try { fs.unlinkSync(path.join(SITE_ICON_DIR(), key + '.netmiss')) } catch (_) {}
+  try { fs.writeFileSync(path.join(SITE_ICON_DIR(), key + '.q' + score + '.' + ext), buf) } catch (_) {}
+  return { buf, type: ext }
+}
+/* 「🔍 获取图标」（2026-10-15 需求：像 iTab 新标签页那样，输入网址后列出候选图标挑）：
+ * 把站点用过的图标**并行**抓回来，统一转成 data URI 交给前端。
+ * 为什么转 data URI：候选图若只给浏览器地址，很多站有防盗链 / 需要 referer，列表里会一片破图；
+ * 而且用户选中后要把图存进配置里 —— data URI 正好能直接存，以后断网也在。 */
+async function siteIconCandidatesFor(rawUrl) {
+  const u = siteNormUrl(rawUrl)
+  if (!u) throw new Error('网址不对（要 http/https 的完整地址）')
+  const o = new URL(u)
+  const origin = o.origin
+  let html = ''
+  try {
+    const page = await siteIconFetch(origin + '/', 10000)
+    if (/html|text/i.test(page.type || '')) html = page.buf.toString('utf8').slice(0, 500000)
+  } catch (_) {}
+  const cands = siteIconCandidates(html, origin)
+  const man = cands.find(c => c.kind === 'manifest')
+  if (man) {
+    try {
+      const r = await siteIconFetch(man.url, 8000)
+      const j = JSON.parse(r.buf.toString('utf8'))
+      const icons = (j.icons || [])
+        .map(i => ({ src: i.src, s: parseInt((/(\d+)/.exec(String(i.sizes || '')) || [])[1]) || 0 }))
+        .sort((a, b) => b.s - a.s).slice(0, 3)
+      for (const ic of icons) if (ic.src) cands.push({ url: new URL(ic.src, man.url).href, score: Math.min(ic.s || 96, 900), kind: 'manifest' })
+    } catch (_) {}
+  }
+  /* icon.horse 放最后（给的是域名首字母替代图，只在站点自己什么都不给时才有意义） */
+  cands.push({ url: origin + '/favicon.ico', score: 10, kind: 'ico' })
+  cands.push({ url: 'https://icon.horse/icon/' + o.hostname, score: 4, kind: 'horse' })
+  const seen = new Set(), use = []
+  for (const c of cands.sort((a, b) => b.score - a.score)) {
+    if (!c.url || seen.has(c.url)) continue
+    seen.add(c.url); use.push(c)
+    if (use.length >= 12) break
+  }
+  const LABEL = { logoimg: '页面 logo', svg: '矢量', manifest: '应用图标', png: '站点图标', icon: '站点图标', ico: 'favicon', horse: '第三方' }
+  const got = await Promise.all(use.map(async c => {
+    try {
+      const r = await siteIconFetch(c.url, 8000)
+      if (!r.buf || r.buf.length < 100 || r.buf.length > 320 * 1024) return null
+      const e2 = siteIconSniff(r.buf, r.type)
+      if (!e2) return null
+      const dim = e2 === 'svg' ? null : siteIconDim(r.buf, e2)
+      const mime = e2 === 'svg' ? 'image/svg+xml' : e2 === 'ico' ? 'image/x-icon' : e2 === 'webp' ? 'image/webp'
+        : e2 === 'gif' ? 'image/gif' : e2 === 'jpg' ? 'image/jpeg' : 'image/png'
+      return {
+        url: c.url, kind: c.kind, score: c.score, label: LABEL[c.kind] || '图标',
+        w: dim ? dim.w : 0, h: dim ? dim.h : 0, bytes: r.buf.length,
+        transparent: e2 === 'svg',
+        data: 'data:' + mime + ';base64,' + r.buf.toString('base64')
+      }
+    } catch (_) { return null }
+  }))
+  /* 去掉内容完全相同的重复项（很多站 favicon.ico 和 <link icon> 是同一张图） */
+  const out = [], marks = new Set()
+  for (const it of got) {
+    if (!it) continue
+    const m = it.bytes + '|' + it.data.slice(0, 160)
+    if (marks.has(m)) continue
+    marks.add(m); out.push(it)
+  }
+  return out
+}
+/* 图标预热队列：进「网站」页时后台一个个去取（并发 1、间隔 1.2s），
+ * 取到一个是一次（缓存住），前端那 4 秒的轮询自己会把新图标画上去。
+ * 为什么不靠前端每张卡发一个 /api/sites/icon：25 个站点一次进页面就是 25 个并发请求，
+ * 被墙的站点还会各挂 6~8 秒，把页面的图片通道全堵住。
+ * 已有高清（≥SITE_ICON_HQ）或负面缓存内的不排队；**已有低清的会排队升级**。 */
+const SITE_ICON_Q = []
+let SITE_ICON_BUSY = false
+/* 本次运行里已经排过队的 key：低分图标**每次启动最多升一次**，
+ * 再配合 .try 的 24 小时闸门 → 同一个站在同一天不会被反复重抓。 */
+const SITE_ICON_UPGRADED = new Set()
+function siteIconWarm(list, force) {
+  for (const x of (list || [])) {
+    const key = siteIconKey(x.url)
+    if (!key) continue
+    if (SITE_ICON_Q.some(t => t.key === key)) continue
+    if (!force) {
+      const ex = siteIconExisting(key)
+      if (ex && ex.miss) continue                        // 负面缓存内（7 天 / 3 小时）
+      if (ex && (ex.q || 0) >= SITE_ICON_HQ) continue     // 已经是原版高清
+      if (ex && ex.file && siteIconTriedRecently(key)) continue   // 今天试过了
+      if (SITE_ICON_UPGRADED.has(key)) continue
+    }
+    SITE_ICON_UPGRADED.add(key)
+    SITE_ICON_Q.push({ key, url: x.url, force: !!force })
+  }
+  siteIconRun()
+}
+function siteIconRun() {
+  if (SITE_ICON_BUSY) return
+  const job = SITE_ICON_Q.shift()
+  if (!job) return
+  SITE_ICON_BUSY = true
+  const done = () => { SITE_ICON_BUSY = false; setTimeout(() => { try { siteIconRun() } catch (_) {} }, 1200) }
+  try { siteIconEnsure(job.url, { upgrade: true, force: job.force }).then(done, done) } catch (_) { done() }
+}
+
+/* ---- 一键测网络（2026-10-15 需求：「加个一键测试当前网络是否能访问的按钮」）----
+ * 判据刻意**不是**「HTTP 200」：很多站点对匿名请求回 403 / 401 / 302，这恰恰说明
+ * 网络是通的、只是站点不让匿名进 —— 标成红色会让用户误以为是自己的网有问题。
+ * 只有 DNS 解析不了 / 连接被拒 / 超时 / 证书错才算「连不上」。
+ * 并发 6、单个超时 6s；任务在后台跑，前端轮询读进度（73 个站最坏 ~75s，但有实时进度不难受）。 */
+const SITE_PROBE_TIMEOUT = 6000
+const SITE_PROBE_CONC = 6
+let SITE_PROBE = null
+function siteProbeErr(e) {
+  const m = String((e && e.message) || e || '')
+  if (/ENOTFOUND|EAI_AGAIN/i.test(m)) return '域名解析不了（被墙 / 网址写错）'
+  if (/ECONNREFUSED/i.test(m)) return '连接被拒绝'
+  if (/ECONNRESET|EPIPE|socket hang up/i.test(m)) return '连接被重置（多半被墙）'
+  if (/ETIMEDOUT|timeout|超时/i.test(m)) return '超时没应答'
+  if (/certificate|self.signed|SSL|TLS/i.test(m)) return '证书有问题'
+  return m || '连不上'
+}
+function siteProbeOne(rawUrl, timeout) {
+  return new Promise(resolve => {
+    const t0 = Date.now()
+    let u = null
+    try { u = new URL(siteNormUrl(rawUrl) || '') } catch (_) {}
+    if (!u) return resolve({ pass: false, ms: 0, err: '地址不合法' })
+    const mod = u.protocol === 'http:' ? http : https
+    const pxy = proxyUrl()
+    const tmo = timeout || SITE_PROBE_TIMEOUT
+    let fin = false
+    const done = r => { if (fin) return; fin = true; resolve(Object.assign({ ms: Date.now() - t0 }, r)) }
+    let rq = null
+    try {
+      rq = mod.get({
+        hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443),
+        path: (u.pathname + u.search) || '/',
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 JavPaco/1.0', Accept: 'text/html,*/*' },
+        ...(u.protocol === 'https:' && agentMaybe(u, pxy) ? { agent: agentMaybe(u, pxy) } : {}),
+        timeout: tmo
+      }, rsp => {
+        const code = rsp.statusCode || 0
+        try { rsp.destroy() } catch (_) {}
+        try { rq.destroy() } catch (_) {}
+        done({ pass: true, code })          // 拿到任何 HTTP 应答 = 网络可达
+      })
+    } catch (e) { return done({ pass: false, err: siteProbeErr(e) }) }
+    rq.on('error', e => done({ pass: false, err: siteProbeErr(e) }))
+    rq.on('timeout', () => {
+      try { rq.destroy() } catch (_) {}
+      done({ pass: false, err: '超时（' + Math.round(tmo / 1000) + ' 秒没应答）' })
+    })
+  })
+}
+/* 跑一轮：结果记进个人层的 stats（`net` 字段，跟 sites.json 一起落盘，重启后还知道上次结果）。
+ * ⚠ 2026-10-15：内置站点库是只读的，测试结果不能写回站点条目本身 —— 按 host 记进个人层。 */
+function siteProbeRun(ids) {
+  const s = sitesLoad()
+  const want = (ids && ids.length) ? ids : null
+  const list = s.list.filter(x => !want || want.indexOf(x.id) >= 0)
+  const task = { id: 'p' + Date.now().toString(36), at: Date.now(), running: true, total: list.length, done: 0, pass: 0, fail: 0, results: {} }
+  SITE_PROBE = task
+  let i = 0
+  const worker = async () => {
+    for (;;) {
+      const k = i++
+      if (k >= list.length) return
+      const it = list[k]
+      let r
+      try { r = await siteProbeOne(it.url, SITE_PROBE_TIMEOUT) } catch (_) { r = { pass: false, ms: 0, err: '测试异常' } }
+      task.done++
+      if (r.pass) task.pass++; else task.fail++
+      const rec = { ok: r.pass ? 1 : 0, code: r.code || 0, ms: r.ms, err: r.err || '', at: Date.now() }
+      task.results[it.id] = rec
+      it.net = rec
+      const h = it.host || siteHostOf(it.url)
+      if (h) { const mine = sitesMineLoad(); const st = mine.stats[h] || (mine.stats[h] = {}); st.net = rec }
+    }
+  }
+  const n = Math.max(1, Math.min(SITE_PROBE_CONC, list.length))
+  return Promise.all(Array.from({ length: n }, worker)).then(() => {
+    task.running = false
+    task.endedAt = Date.now()
+    try { sitesSave() } catch (_) {}
+    console.log('[sites] 网络测试完成：' + task.pass + ' 个可访问 / ' + task.fail + ' 个连不上（共 ' + task.total + '，耗时 ' + Math.round((task.endedAt - task.at) / 1000) + 's）')
+    return task
+  })
+}
+
+
 /* 每个媒体库的运行统计：收录了多少视频、识别成功多少、失败多少、有封面多少（设置页逐库显示） */
 function libStats() {
   const items = (DATA && DATA.items) || []
   const hostRoot = readMediaPathFile() || ''
+  /* rel 只用于统计匹配（relVideo 本来就是相对 MEDIA_ROOT 的）。
+   * ⚠ 显示路径不能用 rel 拼：原生 Windows 下 MEDIA_ROOT 是「多库公共祖先」（库为空时兜底 C:\），
+   * 加一个 D:\115\AV 会 rel 成 'D:\115\AV' 再 join 出 'C:\D:\115\AV' 这种怪路径。
+   * 容器/挂载部署（有 media-path.txt）才需要 hostPath 映射；原生 Windows 直接显示系统文件夹路径。 */
+  const nativeWin = process.platform === 'win32' && !hostRoot
   return LIBS.map(p => {
     const rel = path.relative(MEDIA_ROOT, p).split(path.sep).join('/')
     const pref = rel ? rel + '/' : ''
@@ -1395,7 +5980,7 @@ function libStats() {
       if (it.pending) fail++; else ok++
       if (it.relPoster || it.relFanart) cover++
     }
-    const hostPath = rel ? path.join(hostRoot || MEDIA_ROOT, rel) : (hostRoot || MEDIA_ROOT)
+    const hostPath = nativeWin ? p : (rel ? path.join(hostRoot || MEDIA_ROOT, rel) : (hostRoot || MEDIA_ROOT))
     return {
       path: p, rel, root: rel === '', hostPath,
       /* 名字优先用宿主机上的真实文件夹名（/media 在容器里没意义） */
@@ -1471,10 +6056,16 @@ function bootOfflineCache() {
   let restored = false
   try {
     if (saved && saved.items.length) {
+      /* 库 → 相对 MEDIA_ROOT 的前缀。⚠ 必须用 path.relative 归一，不能 String.replace：
+       * 配置里存的是原始字符串（可能是正斜杠 'D:/x/y'），MEDIA_ROOT 是反斜杠，纯替换会落空，
+       * 前缀变完整绝对路径 → 本地条目全部匹配失败被丢掉（2026-10-13 测试实测踩中）。 */
       const libs = (Array.isArray(CFG.libraries) ? CFG.libraries : [])
-        .map(p => String(p).replace(MEDIA_ROOT, '').replace(/^\/+/, '').replace(/\/+$/, ''))
+        .map(p => {
+          const rel = path.relative(MEDIA_ROOT, String(p)).split(path.sep).join('/')
+          return (rel === '' || rel === '..' || rel.startsWith('../')) ? '' : rel.replace(/^\/+/, '').replace(/\/+$/, '')
+        })
       const keep = saved.items.filter(it => it && it.relVideo &&
-        (!libs.length || libs.some(l => !l || it.relVideo === l || it.relVideo.startsWith(l + '/'))))
+        (v115Rel(it.relVideo) || !libs.length || libs.some(l => !l || it.relVideo === l || it.relVideo.startsWith(l + '/'))))
       const K = it => String((it && it.code) || (it && it.relVideo) || '').toUpperCase()
       const map = new Map()
       for (const it of offline) map.set(K(it), it)
@@ -1485,7 +6076,7 @@ function bootOfflineCache() {
         map.set(k, it)
       }
       const merged = [...map.values()].sort((a, b) => (b.mtime || 0) - (a.mtime || 0))
-      DATA = { root: saved.root || readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: merged }
+      DATA = { root: saneRoot(saved.root) || readMediaPathFile() || MEDIA_ROOT, generated: Date.now(), items: merged }
       schedulePreviews()   // 启动恢复扫描结果 → 给实体影片补生成悬停预览
       console.log('[scan] 启动恢复上次扫描结果：本地 ' + keep.length + ' 部 + 离线缓存 ' + offline.length + ' 部 → 共 ' + merged.length + ' 条' +
         (saved.savedAt ? '（结果存于 ' + new Date(saved.savedAt).toLocaleString('zh-CN') + '；要刷新请点重扫）' : ''))
@@ -1498,6 +6089,33 @@ function bootOfflineCache() {
     console.log('[scan] 启动不自动扫描：已载入离线缓存 ' + offline.length + ' 部做展示；媒体库扫描请在添加页添加/重扫触发')
   }
 }
+/* 启动即自动补刮缺封面影片：恢复上次扫描结果（无论本地还是离线兜底）后，把没海报图的番号
+ * 排队刮削。这样重启 app 后封面会自动补齐，不必每次都手动「重扫」或点进详情页。
+ * 延后 1.5s 触发，避免和启动期 IO / 预览生成抢资源；重复启动不会叠加（仅本进程一次）。 */
+if (DATA && DATA.items && DATA.items.length && CFG.autoScrapeNew !== false) {
+  setTimeout(() => { try { autoQueueMissingCovers(DATA.items, '启动') } catch (_) {} }, 1500)
+  /* 来源健康：把已配置的来源登记进自检表，30s 后的首轮巡检会把它们各探一次
+   * （卡片状态从启动就是准的；哪个源掉线/恢复了也全自动，不用手点）*/
+  try { srcHealthSeed() } catch (_) {}
+}
+/* 启动 25 秒后补一轮网盘片源分辨率（历史条目第一次拿分辨率靠它；之后有缓存，不再重复探测） */
+setTimeout(() => { resBackfillRun('启动').catch(() => {}) }, 25000)
+console.log('[115] 请求节奏：' + v115PaceOf() + '（基础间隔 ' + v115GapBase() + 'ms；网盘与推送共用一条串行队列，设置 → 115 推送 → 请求节奏 可调）')
+recomputeMediaRoot()   // 用已扫数据根统一媒体根基准，修正 relVideo 历史路径错位（库层级变更后不重扫也能正确解析）
+/* 115 播放凭据重建：从已恢复的扫描结果里把 relVideo → pickcode 填回内存表，
+ * 这样「重启后还没重扫」也能直接播放 115 上的片子 */
+rebuildV115Map()
+if (V115_MAP.size) console.log('[115] 已从扫描结果恢复 ' + V115_MAP.size + ' 个网盘文件的可播放索引')
+/* WebDAV / 光鸭：同样从已恢复的扫描结果重建 relVideo 索引（播放用不到凭据映射，
+ * 但 size/mtime 留着给详情页与统计；也是「重启后未重扫也能播」的保证 —— 播放只按路径转发） */
+rebuildDavMap()
+if (DAV_MAP.size) console.log('[dav] 已从扫描结果恢复 ' + DAV_MAP.size + ' 个 WebDAV/光鸭 文件的索引')
+/* 媒体源统计预热（2026-10-15）：sourcesPayload 要逐部遍历 images/（1050 部实测 744ms），
+ * 启动后先算一次，用户点进添加页时缓存已在、秒开（不是等到第一次请求才现算）。
+ * 目录统计记忆从磁盘读回 → 重启后第一次重建也只剩「每个目录一次 stat」，不再全量遍历。 */
+try { srcMemoLoad() } catch (_) {}
+srcTotalBytesRefresh().catch(() => {})   // 「整个 cache 占用」后台分片算（同步遍历要 1806ms、会卡死事件循环）
+setTimeout(() => { try { SRC_CACHE = { at: Date.now(), data: sourcesPayload() } } catch (_) {} }, 2000)
 
 function safeMediaPath(rel) {
   const fp = path.resolve(MEDIA_ROOT, rel)
@@ -1525,9 +6143,30 @@ function compressibleType(type) {
   return /text|json|javascript|svg|xml/.test(type)
 }
 
-/* 海报墙缩略图生成（ffmpeg，按需+并发去重+落盘缓存 cache/thumbs/，源图更新自动失效） */
+/* 海报墙缩略图生成（纯 JS / jpeg-js，不依赖 ffmpeg —— Mac/Win 原生版没有 ffmpeg 也能出小图；
+ * 按需+并发去重+落盘缓存 cache/thumbs/，源图更新自动失效。原图仍留给详情页。） */
+const jpegLib = require('jpeg-js')
 const THUMB_DIR = () => path.join(cacheDir(), 'thumbs')
 const thumbInFlight = new Map()   // key -> Promise<Buffer|null>
+/* 盒式降采样（区域均值），比逐点采样更干净，小图也不会糊边 */
+function downscaleRGBA(src, sw, sh, dw, dh) {
+  const dst = Buffer.alloc(dw * dh * 4)
+  const rx = sw / dw, ry = sh / dh
+  for (let y = 0; y < dh; y++) {
+    const sy0 = Math.floor(y * ry), sy1 = Math.max(sy0 + 1, Math.min(sh, Math.floor((y + 1) * ry)))
+    for (let x = 0; x < dw; x++) {
+      const sx0 = Math.floor(x * rx), sx1 = Math.max(sx0 + 1, Math.min(sw, Math.floor((x + 1) * rx)))
+      let r = 0, g = 0, b = 0, a = 0, n = 0
+      for (let sy = sy0; sy < sy1; sy++) {
+        let o = (sy * sw + sx0) * 4
+        for (let sx = sx0; sx < sx1; sx++, o += 4) { r += src[o]; g += src[o + 1]; b += src[o + 2]; a += src[o + 3]; n++ }
+      }
+      const di = (y * dw + x) * 4
+      dst[di] = r / n; dst[di + 1] = g / n; dst[di + 2] = b / n; dst[di + 3] = a / n
+    }
+  }
+  return dst
+}
 async function movieThumb(code, kind) {
   if (!/^[A-Za-z0-9._-]+$/.test(code) || !['poster', 'fanart'].includes(kind)) return null
   const src = path.join(cacheDir(), 'movies', code, 'images', kind + '.jpg')
@@ -1541,21 +6180,43 @@ async function movieThumb(code, kind) {
   let pr = thumbInFlight.get(key)
   if (!pr) {
     pr = new Promise(resolve => {
+      const done = buf => { thumbInFlight.delete(key); resolve(buf) }
       try { fs.mkdirSync(THUMB_DIR(), { recursive: true }) } catch (_) {}
-      const vf = kind === 'poster' ? 'scale=-2:720' : 'scale=960:-2'
-      execFile('ffmpeg', ['-i', src, '-frames:v', '1', '-vf', vf, '-q:v', '5', '-y', out], { timeout: 30000 }, e => {
-        thumbInFlight.delete(key)
-        if (e) { try { fs.unlinkSync(out) } catch (_) {}; return resolve(null) }
-        try { resolve(fs.readFileSync(out)) } catch (_) { resolve(null) }
-      })
+      // 限高 720（海报）/ 限宽 960（大图），不放大；纯 JS 缩放，无需 ffmpeg
+      let raw
+      try { raw = jpegLib.decode(fs.readFileSync(src), { useTArray: true, maxMemoryUsageInMB: 256 }) } catch (_) { return done(null) }
+      const sw = raw.width, sh = raw.height
+      let dw, dh
+      if (kind === 'poster') { dh = Math.min(720, sh); dw = Math.max(1, Math.round(sw * dh / sh / 2) * 2) }
+      else { dw = Math.min(960, sw); dh = Math.max(1, Math.round(sh * dw / sw / 2) * 2) }
+      try {
+        const srcData = Buffer.from(raw.data)
+        const data = (dw === sw && dh === sh) ? srcData : downscaleRGBA(srcData, sw, sh, dw, dh)
+        const enc = jpegLib.encode({ data, width: dw, height: dh }, 80)
+        fs.writeFileSync(out, enc.data)
+        return done(enc.data)
+      } catch (_) { try { fs.unlinkSync(out) } catch (_) {}; return done(null) }
     })
     thumbInFlight.set(key, pr)
   }
   return pr
 }
 
+/* ⚠️ 2026-10-10 修「播放器并发 Range 卡住」：stat 必须异步。
+ * 原来这里用 fs.statSync —— 对 14GB 的 CloudDrive/FUSE 文件，每次 Range 请求都要
+ * 同步 stat 一次，而 FUSE 的 stat 会阻塞 Node 整个事件循环。
+ * 播放器并发发多个 Range 时实测：单线程 0.29s，10 并发最慢 11.57s（慢 40 倍），
+ * 期间整个服务（含其他响应）全部停摆 → 表现为「播放器卡住不动」。
+ * 改成 fs.promises.stat 后事件循环不被占住，并发立刻恢复。 */
 function sendFile(req, res, fp) {
-  let st; try { st = fs.statSync(fp) } catch (_) { res.writeHead(404); return res.end('Not Found') }
+  fs.promises.stat(fp).then(st => {
+    try { sendFileWithStat(req, res, fp, st) } catch (e) {
+      try { res.writeHead(500) } catch (_) {}
+      res.end('Error: ' + e.message)
+    }
+  }).catch(() => { res.writeHead(404); res.end('Not Found') })
+}
+function sendFileWithStat(req, res, fp, st) {
   if (!st.isFile()) { res.writeHead(404); return res.end('Not Found') }
   const type = MIME[path.extname(fp).toLowerCase()] || 'application/octet-stream'
   /* 协商缓存：ETag = 大小 + mtime，内容没变直接回 304
@@ -1623,6 +6284,24 @@ function streamWith(res, rs) {
     try { if (!res.headersSent) res.writeHead(500) } catch (_) {}
     try { res.destroy() } catch (_) {}
   })
+  /* ⚠️ 2026-10-10 加读超时：网盘挂载偶发「连接还在但一个字节都不来」（占位文件回源慢/挂载抖动）。
+   * 没有超时的话这条连接会永久占着，播放器就一直等 → 卡住。
+   * 只在「开了头但迟迟没数据」时计时；正常传输每有数据就重新计时，不会误杀。*/
+  let idle = null
+  const IDLE_MS = 30000
+  const arm = () => {
+    if (idle) clearTimeout(idle)
+    idle = setTimeout(() => {
+      console.error('[stream] 读取超时（' + IDLE_MS / 1000 + 's 无数据），断开该连接')
+      try { rs.destroy(new Error('idle timeout')) } catch (_) {}
+      try { res.destroy() } catch (_) {}
+    }, IDLE_MS)
+    if (idle.unref) idle.unref()
+  }
+  rs.on('data', arm)
+  rs.on('end', () => { if (idle) { clearTimeout(idle); idle = null } })
+  rs.on('close', () => { if (idle) { clearTimeout(idle); idle = null } })
+  arm()
   rs.pipe(res)
 }
 
@@ -1707,6 +6386,12 @@ const mnDec = s => String(s || '')
 const mnStrip = s => mnDec(String(s || '').replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim()
 
 function json(res, obj) {
+  /* ⚠ 幂等保护：响应头一旦发出去就绝不能再 writeHead（否则抛 ERR_HTTP_HEADERS_SENT）。
+   * 而本文件里大量 `.catch(e => json(res, {ok:false,error:e.message}))` 是**异步**兜底 ——
+   * 很可能 handler 已经把 200 发出去了、之后才抛错，那时这个 catch 再调 json() 就会二次 writeHead。
+   * 该异常发生在 catch 块内部，没人接 → 变成未捕获异常，连接既不关闭也不返回，一直挂到超时。
+   * 在这里统一挡掉，比在几十个调用点各补一次 if (res.headersSent) 可靠得多。 */
+  if (res.headersSent) return
   const b = Buffer.from(JSON.stringify(obj))
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': b.length, 'Cache-Control': 'no-store' })
   res.end(b)
@@ -2015,14 +6700,27 @@ async function avatarBackfillOnce(trigger) {
     console.log('[avatar-backfill] %s 开始：本地缺 %d 张（另有 %d 个已知缺失跳过），relay 直连预取中…', trigger, todo.length, skipped)
     fs.mkdirSync(actorsDir, { recursive: true })
     let ptr = 0
+    /* 连续失败熔断：relay（GitHub）不可达时（国内常见），每张头像都要等满 12s 超时才失败，
+     * 2.4 万张就是好几小时的空转，还一直占着网络 —— 期间整个程序都会发闷。
+     * 连续失败 40 次基本可判定源站不通，直接结束本轮，下次启动 / 12 小时后再试。 */
+    let consecFail = 0, cut = false
     const worker = async () => {
       while (ptr < todo.length && CFG.autoAvatar !== false && AVA_BACKFILL_RUNNING) {
         const it = todo[ptr++]
+        let hit = false
         try {
           const b = await relayBuf('avatars/' + it.mnid + '.jpg', 12000)
-          if (isImgBuf(b)) { fs.writeFileSync(path.join(actorsDir, it.key + '.jpg'), b); AVA_BACKFILL_STATS.ok++; miss.delete(it.key) }
-          else { AVA_BACKFILL_STATS.fail++; miss.set(it.key, Date.now()) }
-        } catch (_) { AVA_BACKFILL_STATS.fail++; miss.set(it.key, Date.now()) }
+          if (isImgBuf(b)) { fs.writeFileSync(path.join(actorsDir, it.key + '.jpg'), b); AVA_BACKFILL_STATS.ok++; miss.delete(it.key); hit = true }
+        } catch (_) {}
+        if (hit) consecFail = 0
+        else {
+          AVA_BACKFILL_STATS.fail++; miss.set(it.key, Date.now()); consecFail++
+          if (consecFail >= 40 && !cut) {
+            cut = true
+            AVA_BACKFILL_RUNNING = false                 // 让所有 worker 退出循环
+            console.log('[avatar-backfill] %s 连续 %d 次失败，判定 relay 不可达 → 提前结束本轮（成功 %d 张）', trigger, consecFail, AVA_BACKFILL_STATS.ok)
+          }
+        }
         AVA_BACKFILL_STATS.done++
         if (AVA_BACKFILL_STATS.done % 500 === 0)
           console.log('[avatar-backfill] 进度 %d/%d (ok=%d fail=%d)', AVA_BACKFILL_STATS.done, AVA_BACKFILL_STATS.todo, AVA_BACKFILL_STATS.ok, AVA_BACKFILL_STATS.fail)
@@ -2113,6 +6811,44 @@ function writeExtraRoster(list) {
   const t = EXTRA_ROSTER + '.tmp'
   fs.writeFileSync(t, JSON.stringify(list, dropEmpty, 1))
   fs.renameSync(t, EXTRA_ROSTER)
+}
+/* ---------- 女优重名合并表 actor-merge.json ----------
+ * { 被合并名: 保留名 }。与 name-alias.json 同级放在项目目录，随项目一起备份；
+ * 每日名册同步只覆盖 actresses.json，冲不掉这张表；也绝不改 actresses.json 本身
+ * （那样下次同步就白合并了）。 */
+const MERGE_FILE = path.join(UI_ROOT, 'actor-merge.json')
+function readMerge() {
+  try {
+    const v = JSON.parse(fs.readFileSync(MERGE_FILE, 'utf8'))
+    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {}
+  } catch (_) { return {} }
+}
+function writeMerge(map) {
+  const t = MERGE_FILE + '.tmp'
+  fs.writeFileSync(t, JSON.stringify(map, null, 1))
+  fs.renameSync(t, MERGE_FILE)
+}
+/* 顺着合并链走到终点：B 已合并到 C 时，再合并 A→B 要记成 A→C */
+function mergeResolve(map, name) {
+  let cur = String(name || '')
+  for (let i = 0; i < 8; i++) {
+    const nxt = map[cur]
+    if (!nxt || nxt === cur) break
+    cur = nxt
+  }
+  return cur
+}
+/* 加一条合并；返回 false = 拒绝（同名 / 自我合并 / 会形成互相合并） */
+function mergeAdd(map, merged, keep) {
+  const d = String(merged || '').trim(), k0 = String(keep || '').trim()
+  if (!d || !k0 || d === k0) return false
+  const k = mergeResolve(map, k0)
+  if (k === d) return false                       // 反向已存在 → 会成环
+  map[d] = k
+  /* 原先「合并到 d」的条目要改指 k，否则它们指向一条已经被合并掉的名字 */
+  for (const key of Object.keys(map)) if (map[key] === d) map[key] = k
+  delete map[k]                                   // 保留名不能同时是被合并名
+  return true
 }
 /* 保存时共用的字段写回逻辑（内置名册 / 附加名册都走这里） */
 function applyActorFields(a, body) {
@@ -2648,6 +7384,110 @@ function resTagOf(w, h) {
   if (v >= 720) return '720P'
   return '480P'
 }
+/* ---------- 网盘片源分辨率探测（2026-10-15 新增） ----------
+ * 为什么需要：分辨率标签以前只能靠 ffprobe 读**本地文件**，而云盘条目（gy:/ 115:/ dav:/ …）
+ *   磁盘上根本没有文件 → tags 里永远没有 4K/1080P… → 界面不显示分辨率、
+ *   按分辨率筛选几乎全是空、按分辨率排序无从下手（本机实测 1079 部里 1050 部是光鸭网盘条目，
+ *   只有 41 部带分辨率，且多半是靠文件名里的「4K」猜的）。
+ * 做法：网盘条目走**本机代理** `http://127.0.0.1:PORT/media/<rel>`，ffprobe 只读 moov 头就退出
+ *   （实测 1.5s / 部，不下载整片）。结果落 data/cache/netres.json，按 rel 缓存，重扫不重复探测；
+ *   探测失败记负面缓存，7 天内不再试（免得每次扫描都空跑一遍）。
+ * 触发：扫描结束后 + 启动 30 秒后各跑一轮（resBackfillRun），并发 2，扫描中自动让路。
+ * 开关：设置 → 影片库 →「探测网盘片源分辨率」（CFG.probeNetRes，默认开）。 */
+const NETRES_FILE = () => { try { return path.join(cacheDir(), 'netres.json') } catch (_) { return '' } }
+let NETRES = null, NETRES_DIRTY = false, NETRES_RUN = false
+const NETRES_STATS = { at: 0, done: 0, ok: 0 }
+function netresCache() {
+  if (NETRES) return NETRES
+  NETRES = {}
+  try { const d = JSON.parse(fs.readFileSync(NETRES_FILE(), 'utf8')); if (d && typeof d === 'object') NETRES = d } catch (_) {}
+  return NETRES
+}
+function netresSave() {
+  try { const f = NETRES_FILE(); if (!f) return; fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(netresCache())) } catch (_) {}
+}
+const RES_TAGS = ['4K', '2K', '1080P', '720P', '480P']
+/* 云盘条目的 relVideo 前缀：gy: / 115: / 115@2: / dav: / webdav@2: / guangya@3: */
+const isNetRel = rel => /^(?:gy|dav|webdav(?:@\d+)?|guangya(?:@\d+)?|115(?:@\d+)?|online):/i.test(String(rel || ''))
+/* 与前端 mediaPath 同口径：media/ + 每段 encodeURIComponent */
+function mediaUrlOf(rel) { return 'http://127.0.0.1:' + PORT + '/media/' + String(rel).split('/').map(encodeURIComponent).join('/') }
+async function probeNetRes(rel) {
+  const cache = netresCache()
+  const hit = cache[rel]
+  if (hit && hit.w) return hit                                      // 已探到 → 直接复用
+  if (hit && hit.t && Date.now() - hit.t < 7 * 86400000) return null // 探过失败 → 7 天内不重试
+  const out = await new Promise(resolve => {
+    execFile(ffBin('ffprobe'),
+      ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', mediaUrlOf(rel)],
+      { timeout: 25000, windowsHide: true, maxBuffer: 1 << 20 },
+      (e, so) => resolve(e ? '' : String(so || '')))
+  })
+  const m = /(\d{2,5})\s*,\s*(\d{2,5})/.exec(out)
+  const e = { w: m ? parseInt(m[1], 10) : 0, h: m ? parseInt(m[2], 10) : 0, t: Date.now() }
+  cache[rel] = e
+  NETRES_DIRTY = true
+  return e.w ? e : null
+}
+/* 把探测到的分辨率写进条目标签（顺带**修正**按文件名猜出来的档位） */
+function applyResTag(it, w, h) {
+  const tag = resTagOf(w, h)
+  if (!tag) return false
+  const t = Array.isArray(it.tags) ? it.tags : (it.tags = [])
+  const old = t.filter(x => RES_TAGS.indexOf(x) >= 0)
+  if (old.length === 1 && old[0] === tag) return false
+  it.tags = t.filter(x => RES_TAGS.indexOf(x) < 0).concat(tag)
+  return true
+}
+async function resBackfillRun(via) {
+  if (NETRES_RUN || SCAN.running) return 0
+  if (CFG.probeNetRes === false) return 0
+  if (FFMPEG_OK === false) return 0
+  if (FFMPEG_OK === null) { probeFfmpeg(); return 0 }      // 还在探测 ffmpeg → 下一轮再来
+  if (!DATA || !Array.isArray(DATA.items) || !DATA.items.length) return 0
+  const cache = netresCache()
+  const todo = []
+  let applied = 0
+  for (const it of DATA.items) {
+    const rel = it.relVideo || ''
+    if (!rel || !isNetRel(rel)) continue
+    const c = cache[rel]
+    if (c && c.w) { if (applyResTag(it, c.w, c.h)) applied++; continue }
+    if (c && c.t && Date.now() - c.t < 7 * 86400000) continue
+    todo.push(it)
+  }
+  if (!todo.length) {
+    if (applied && !SCAN.running) { saveScanResult(); libSeqTouch() }
+    if (NETRES_DIRTY) { netresSave(); NETRES_DIRTY = false }
+    return applied
+  }
+  NETRES_RUN = true
+  const t0 = Date.now()
+  let idx = 0, done = 0, ok = 0
+  const worker = async () => {
+    for (;;) {
+      if (SCAN.running) return                 // 扫描起来了 → 立刻让路
+      const i = idx++
+      if (i >= todo.length) return
+      const it = todo[i]
+      try {
+        const r = await probeNetRes(it.relVideo)
+        if (r && r.w && applyResTag(it, r.w, r.h)) ok++
+      } catch (_) {}
+      done++
+      if (done % 30 === 0) { netresSave(); NETRES_DIRTY = false; if (!SCAN.running) { saveScanResult(); libSeqTouch() } }
+    }
+  }
+  try { await Promise.all([worker(), worker()]) } finally {
+    NETRES_RUN = false
+    netresSave(); NETRES_DIRTY = false
+    NETRES_STATS.at = Date.now(); NETRES_STATS.done = done; NETRES_STATS.ok = ok
+    if ((ok || applied) && !SCAN.running) { saveScanResult(); libSeqTouch() }
+    console.log('[res] 网盘分辨率补齐 ' + (ok + applied) + ' 部（本轮探 ' + done + ' 部，缓存共 ' + Object.keys(netresCache()).length +
+      ' 条，用时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's，via ' + via + '）')
+  }
+  return ok + applied
+}
+
 /* 有码/无码/破解/流出/中字：从文件名 + nfo 标题 + nfo 原始类别里识别；分辨率探测不到时回落文件名标注 */
 /* ---------- 影片类型识别（规则照抄 mdc-ng，见 pkg/core/src/parser/mod.rs 与前端 naming 配置） ----------
  * mdc-ng 的解析正则原文（用 python 从官方 mdc_ng_app 二进制里取出的字符串）：
@@ -2850,6 +7690,13 @@ function cacheStats() {
   const root = cacheDir()
   /* groups = 离线数据（刮削成果，可迁移可导回）；runtime = 运行缓存（服务运行中产生，可随时清掉自动重建） */
   const out = { ok: true, dir: root, groups: [], total: 0, runtime: { groups: [], total: 0 } }
+  /* 迁移提示：旧目录副本还在 → 前端给一个「删除旧目录副本」的按钮（见 cacheMigrate / cacheCleanupOld） */
+  try {
+    const mf = String(CFG.migrateFrom || '')
+    if (mf && fs.existsSync(mf) && path.resolve(mf) !== root) {
+      out.migratedFrom = { dir: mf, size: dirTally(mf).bytes, files: dirTally(mf).files }
+    }
+  } catch (_) {}
   const walk = (d, acc) => {
     let es = []
     try { es = fs.readdirSync(d, { withFileTypes: true }) } catch (_) { return }
@@ -2868,8 +7715,11 @@ function cacheStats() {
   const pv = { name: 'previews', folders: 0, files: 0, size: 0 }
   walk(path.join(root, 'previews'), pv)
   if (pv.folders || pv.files) { out.runtime.groups.push(pv); out.runtime.total += pv.size }
-  /* 运行缓存 ②：图片升级/候选探测中断残留的临时文件（movies 各目录下的隐藏文件） */
-  const tmp = { name: 'tmp', folders: 0, files: 0, size: 0 }
+  /* 运行缓存 ②：网站图标缓存 site-icons/（「网站」页的站点小图标，清掉后打开页面自动重取） */
+  const si = { name: 'sites', folders: 0, files: 0, size: 0 }
+  walk(path.join(root, 'site-icons'), si)
+  if (si.folders || si.files) { out.runtime.groups.push(si); out.runtime.total += si.size }
+  /* 运行缓存 ③：图片升级/候选探测中断残留的临时文件（movies 各目录下的隐藏文件） */  const tmp = { name: 'tmp', folders: 0, files: 0, size: 0 }
   const tmpWalk = d => {
     let es = []
     try { es = fs.readdirSync(d, { withFileTypes: true }) } catch (_) { return }
@@ -2886,6 +7736,101 @@ function cacheStats() {
 }
 
 /* 清理运行缓存：previews 缩略图 + 临时残留文件。离线数据（movies/actors）绝不动。 */
+function dirTally(root) {
+  const out = { files: 0, bytes: 0 }
+  const walk = d => {
+    let es = []
+    try { es = fs.readdirSync(d, { withFileTypes: true }) } catch (_) { return }
+    for (const e of es) {
+      const fp = path.join(d, e.name)
+      if (e.isDirectory()) walk(fp)
+      else { let st = {}; try { st = fs.statSync(fp) } catch (_) {}; out.files++; out.bytes += st.size || 0 }
+    }
+  }
+  walk(root)
+  return out
+}
+function entryTally(fp) {
+  try { const st = fs.statSync(fp); if (st.isFile()) return { files: 1, bytes: st.size } } catch (_) { return { files: 0, bytes: 0 } }
+  return dirTally(fp)
+}
+/* ---------- 离线数据「迁移」（2026-10-15） ----------
+ * 场景：离线数据一直堆在程序目录 / C 盘（默认就是项目内 cache/），用户想整体搬到别的盘或 NAS。
+ * 做法是**先复制、再逐项校验、最后才切配置**，任何一步不对就原样不动、一个字都不改：
+ *   ① 把当前离线数据目录下的东西全部复制到目标目录（目标已有内容 → 合并，同名覆盖）；
+ *   ② 逐项核对：目标里的文件数 / 总字节必须 ≥ 源（合并语义，所以是「不少于」而不是「相等」）；
+ *   ③ 校验通过 → CFG.cacheDir 切到新目录 + 写配置 + 作废所有内存缓存（路径常量已改成函数，会自动跟着走）；
+ *   ④ **原目录原样保留** —— 删副本是另一个动作（cacheCleanupOld），且只认这次记录下来的 from，
+ *      绝不会因为一个参数写错就把别的地方删了。
+ * 返回 { ok, from, to, copied, keptFrom }。 */
+async function cacheMigrate(target) {
+  const from = path.resolve(cacheDir())
+  const to = path.resolve(String(target || '').trim())
+  if (!to) return { ok: false, error: '请先填写目标目录（比如 D:\\JavPacoData 或 NAS 路径）' }
+  if (to === from) return { ok: false, error: '目标目录和当前「离线数据目录」是同一个，不用迁移' }
+  const inside = (parent, child) => { const r = path.relative(parent, child); return !!r && !r.startsWith('..') && !path.isAbsolute(r) }
+  if (inside(from, to)) return { ok: false, error: '目标目录不能是当前目录的子目录' }
+  if (inside(to, from)) return { ok: false, error: '目标目录不能是当前目录的上级目录' }
+  /* 防呆：当前「离线数据目录」如果就是程序目录本身，整体迁移会把程序一起搬走 → 直接拒绝 */
+  if (fs.existsSync(path.join(from, 'server-config.json'))) return { ok: false, error: '当前目录看起来是程序目录（里面有 server-config.json），不能整体迁移 —— 请在设置里指定一个专门的离线数据目录' }
+  if (SCAN && SCAN.running) return { ok: false, error: '正在扫描媒体库，等扫完再迁移（避免搬到写了一半的文件）' }
+  try { fs.mkdirSync(to, { recursive: true }) } catch (e) { return { ok: false, error: '创建目标目录失败：' + e.message } }
+  try { fs.accessSync(to, fs.constants.W_OK) } catch (_) { return { ok: false, error: '目标目录不可写（换一个位置，或检查权限）' } }
+
+  let entries = []
+  try { entries = fs.readdirSync(from, { withFileTypes: true }) } catch (_) { entries = [] }
+  if (!entries.length) return { ok: false, error: '当前目录里没有可迁移的内容' }
+  const copied = { items: 0, files: 0, bytes: 0 }
+  const fail = [], mismatch = []
+  for (const e of entries) {
+    const src = path.join(from, e.name), dst = path.join(to, e.name)
+    try {
+      if (e.isDirectory()) fs.cpSync(src, dst, { recursive: true, force: true })
+      else fs.copyFileSync(src, dst)
+    } catch (err) { fail.push(e.name + '（' + err.message + '）'); continue }
+    const a = entryTally(src), b = entryTally(dst)
+    if (b.files < a.files || b.bytes < a.bytes) { mismatch.push(e.name + '（源 ' + a.files + ' 个文件，目标只看到 ' + b.files + ' 个）'); continue }
+    copied.items++; copied.files += a.files; copied.bytes += a.bytes
+  }
+  if (fail.length) return { ok: false, error: '复制失败：' + fail.slice(0, 3).join('；') + '（原目录未做任何改动）' }
+  if (mismatch.length) return { ok: false, error: '校验没通过：' + mismatch.slice(0, 3).join('；') + '（原目录未做任何改动，请检查目标盘空间/权限后重试）' }
+
+  CFG.cacheDir = to
+  CFG.migrateFrom = from          // 记下「从哪搬来的」：清副本那步只认它
+  try { writeCfg() } catch (e) { return { ok: false, error: '写入配置失败：' + e.message } }
+  /* 内存缓存全部作废：目录快照、预览登记、目录体量记忆都指向旧路径 */
+  try { SRC_CACHE = { at: 0, data: null } } catch (_) {}
+  try { V115_SNAP.clear() } catch (_) {}
+  try { if (typeof DAV_SNAP !== 'undefined' && DAV_SNAP.clear) DAV_SNAP.clear() } catch (_) {}
+  try { SRC_DIR_MEMO.clear() } catch (_) {}
+  try { PREV_SET.clear(); previewLoad() } catch (_) {}
+  try { srcMemoLoad() } catch (_) {}
+  console.log('[cache] 离线数据已迁移：' + from + ' → ' + to + '（' + copied.items + ' 项 / ' + copied.files + ' 个文件 / ' + Math.round(copied.bytes / 1048576) + ' MB）')
+  return { ok: true, from, to, copied, keptFrom: from, note: '原目录内容已保留，确认新目录没问题后可点「删除旧目录副本」清理' }
+}
+/* 删除迁移后留下的旧副本：只允许删「上一次迁移记录下来的那个目录」，且逐条删内容、保留目录本身。
+ * 为什么要这么严：这是个不可逆的删除动作，宁可多一道校验，也不能让一个错参数把别处删了。 */
+function cacheCleanupOld(dir) {
+  const from = path.resolve(String(dir || CFG.migrateFrom || ''))
+  const keep = path.resolve(cacheDir())
+  if (!from || from === keep) return { ok: false, error: '没有可清理的旧目录' }
+  if (String(CFG.migrateFrom || '') !== from) return { ok: false, error: '只允许清理「上一次迁移」留下的旧目录（当前记录：' + (CFG.migrateFrom || '无') + '）' }
+  if (!fs.existsSync(from)) return { ok: false, error: '旧目录已经不存在了' }
+  if (fs.existsSync(path.join(from, 'server-config.json'))) return { ok: false, error: '这个目录看起来是程序目录，拒绝清理' }
+  let files = 0, bytes = 0, fail = 0
+  let es = []
+  try { es = fs.readdirSync(from, { withFileTypes: true }) } catch (e) { return { ok: false, error: '读取失败：' + e.message } }
+  for (const e of es) {
+    const fp = path.join(from, e.name)
+    const t = entryTally(fp)
+    try { fs.rmSync(fp, { recursive: true, force: true }); files += t.files; bytes += t.bytes }
+    catch (_) { fail++ }
+  }
+  CFG.migrateFrom = ''
+  try { writeCfg() } catch (_) {}
+  console.log('[cache] 已清理迁移后的旧副本 ' + from + '（' + files + ' 个文件）' + (fail ? '，' + fail + ' 项失败' : ''))
+  return { ok: !fail, dir: from, files, bytes, failed: fail, error: fail ? fail + ' 项没能删掉（可能被占用）' : '' }
+}
 function cacheClean() {
   const root = cacheDir()
   let freed = 0, files = 0
@@ -2923,6 +7868,10 @@ function cacheClean() {
     }
   }
   tmpWalk(path.join(root, 'movies'))
+  /* 网站图标缓存（「网站」页）：清掉完全安全，下次打开页面自动重取 */
+  try {
+    for (const e of fs.readdirSync(path.join(root, 'site-icons'), { withFileTypes: true })) rm(path.join(root, 'site-icons', e.name))
+  } catch (_) {}
   return { freed, files, stats: cacheStats() }
 }
 
@@ -3193,10 +8142,12 @@ function jdbParseActorMovies(html) {
   }
   const cm = html.match(/([0-9][0-9,]*)\s*部影片/)
   if (cm) out.total = parseInt(cm[1].replace(/,/g, ''), 10) || 0
-  /* 总页数：页脚分页链接里的最大 page=（筛选后页数会变，所以不能拿 total/40 硬算） */
+  /* 总页数：页脚分页里的最大 page= 与「总数 ÷ 每页 40」取大。
+   * ⚠ 只信页脚会少算：实测葵司 476 部（= 12 页）时页脚只渲染到 page=6，
+   * 拿它当上限就直接砍掉后半程作品（第 7 页往后根本翻不到）。 */
   let maxPg = 0
   for (const mm of html.matchAll(/[?&]page=([0-9]+)/g)) { const n = parseInt(mm[1], 10); if (n > maxPg) maxPg = n }
-  out.totalPages = Math.max(1, maxPg)
+  out.totalPages = Math.max(1, maxPg, Math.ceil((out.total || 0) / 40))
   const re = /<a[^>]*href="\/v\/([A-Za-z0-9]+)"[^>]*\sclass="box[^"]*"[^>]*>([\s\S]*?)<\/a>/g
   const seen = new Set()
   let m
@@ -3222,6 +8173,36 @@ function jdbParseActorMovies(html) {
     })
   }
   return out
+}
+/* 抓一页演员页 —— 唯一能给出「某位女优全部作品」的来源。
+ * 供 /api/online/actor_movies 与「订阅检查」共用（后者**不能**再退回 v2/search 标题搜索，见下）。
+ * 参数：page≥1；sortType 0 发行日期倒序 / 1 评分 / 2 热度 / 3 想看 / 4 看过；t p 可播放 / s 单体 / d 含磁链 / c 含字幕。 */
+async function jdbActorMoviesPage(id, page, sortType, t) {
+  const qs = []
+  if (t) qs.push('t=' + t)
+  if (sortType && sortType !== '0') qs.push('sort_type=' + sortType)
+  if (page && page > 1) qs.push('page=' + page)
+  const rel = '/actors/' + encodeURIComponent(String(id || '').trim()) + (qs.length ? '?' + qs.join('&') : '')
+  let lastErr = null
+  for (const base of ['https://javdb.com', 'https://javdb580.com']) {
+    try {
+      /* 短超时：scFetch 默认能拖到 120s（域名闸+多跳重定向+双通道重试叠加），
+       * 网页版在没配代理的机器上必然连不上，让用户干等两分钟才看到「失败」体验很差。 */
+      const html = await scFetch(base + rel, { totalMs: 25000, hdrs: { referer: base + '/', cookie: 'over18=1; locale=zh' } })
+      if (!/class="item"|actor-section-name/.test(html)) throw new Error('演员页没有内容（女优 id 可能不对）')
+      const parsed = jdbParseActorMovies(html)
+      parsed.hasMore = (page || 1) < parsed.totalPages
+      parsed.perPage = 40
+      parsed.webUrl = base + '/actors/' + id
+      /* 封面从 cN.jdbstatic.com 换到国内可达的 spfcas 镜像（详见 jdbImgBase 注释） */
+      const imgBase = await jdbImgBase()
+      parsed.movies = parsed.movies.map(m => Object.assign({}, m, {
+        thumb: jdbImgMirror(m.thumb, imgBase), cover: jdbImgMirror(m.cover, imgBase)
+      }))
+      return parsed
+    } catch (e) { lastErr = e }
+  }
+  throw lastErr || new Error('演员页抓取失败')
 }
 function scPick(rows, labels) {
   for (const [th, td] of rows) {
@@ -4357,7 +9338,7 @@ function allItems() { return ((DATA && DATA.items) || []).concat(scrapedVirtualI
 
 /* 同番号多版本合并：破解/中字/无码等同一番号的多个视频文件归为一条（files 数组带每个文件的路径/大小/独立标签）。
  * 其余字段取代表条目（已刮削的优先）；徽章取各文件并集（保序去重）；size 求和、mtime 取最大、pending/hidden/scraped 任一为真即为真。 */
-const fileOf = it => ({ relVideo: it.relVideo, size: it.size || 0, mtime: it.mtime || 0, tags: it.tags || [] })
+const fileOf = it => ({ relVideo: it.relVideo, size: it.size || 0, mtime: it.mtime || 0, tags: it.tags || [], pick: it.pick || undefined })
 function mergeCodeGroup(list) {
   if (list.length === 1) return Object.assign({}, list[0], { files: [fileOf(list[0])].filter(f => f && f.relVideo) })
   /* 主文件 = 已刮削的里面体积最大的（原版通常最大，-U/-C 转制版较小）；全未刮削则取最大 */
@@ -4569,6 +9550,57 @@ function autoIngestQueue(codes, via = '订阅', front = false, subId = '') {
   return pos0
 }
 
+/* 刮削失败的番号：自动排队冷却多久（默认 7 天）。
+ * 用户诉求「没刮成功的番号等手动刮，不要自动重试」—— 手动刮削完全不受影响，
+ * 这里只拦「每次启动 / 每次扫描自动塞回队列」那条路。 */
+const SCRAPE_FAIL_COOL_MS = 7 * 24 * 3600 * 1000
+
+/* 把「还没刮过」的影片排队进后台刮削队列（设置页 autoScrapeNew 可关，默认开）。
+ * 两类：① 识别失败待处理（无 nfo 标题）且番号可解析；② 有 nfo 标题但**没有海报图**的
+ * （relPoster/webPoster 都没有）—— 海报墙封面空缺的大头。
+ * 缓存里已有离线数据的（之前刮过，m.scraped）不算，直接跳过；每次最多 500 部防刷站。
+ * 扫描完成与 app 启动恢复两条路径都调用（后者见文件底部 boot 段），保证重启即自动补封面，不必手动重扫。
+ * ⚠ 回填口径见 enrichFromCache：只补空字段，本地 nfo 标题/简介不会被覆盖。返回本次入队数量。 */
+function autoQueueMissingCovers(items, via) {
+  if (CFG.autoScrapeNew === false) return 0
+  if (!Array.isArray(items) || !items.length) return 0
+  const codeOk = c => /^\d{6}-\d{2,4}$/.test(c) || (/[A-Z]/.test(c) && /\d/.test(c))
+  const fresh = []
+  let cooled = 0        // 因「最近刮失败」被跳过的数量（打进日志，方便确认机制真的在生效）
+  for (const it of items) {
+    if (!it || !it.code) continue
+    const code = String(it.code).toUpperCase()
+    if (!codeOk(code) || fresh.includes(code)) continue
+    try { const m = readMovieCache(code); if (m && m.scraped) continue } catch (_) {}
+    /* 2026-10-15：刮削**失败过**的番号设 24 小时冷却，别每次启动 / 每次扫描都重新排队。
+     * 根因：上面判「要不要刮」只看 `m.scraped`，而失败的番号 scraped 恒为 false →
+     *   每次启动（今天重启了 20 次）都把它们原样塞回队列，实测 MELVSC-011 / HHD-800 /
+     *   9OAE-312 / 586HNHU-0206 等一天被刮了 18~19 次，每次都是同一个失败原因
+     *   （站点反爬或番号根本不存在）—— 纯浪费配额，还容易被站点判成爬虫。
+     * 现在查 scrape-history 里该番号最近一条：ok=false 且在冷却期内 → 跳过自动排队。
+     * ⚠ 只拦「自动」这条路；用户在添加页 / 详情页手动点刮削不受任何影响。
+     * 冷却期 = SCRAPE_FAIL_COOL_MS（默认 7 天）：失败的原因（番号不存在 / 站点反爬）几乎不会
+     *   在几天内自己变好，24 小时重试一次只是每天白刮一遍；7 天 ≈「等用户手动」，
+     *   既给临时故障留了自愈窗口，也不会再出现「一天刮 19 次同一个失败番号」。 */
+    try {
+      scrapeHistLoad()
+      const h = SCRAPE_HIST.list.find(x => x && bare(String(x.code || '')) === bare(code))
+      if (h && h.ok === false && (Date.now() - (h.at || 0)) < SCRAPE_FAIL_COOL_MS) { cooled++; continue }
+    } catch (_) {}
+    /* ① 识别失败待处理；② 从未刮过且本地/缓存都没有海报图（封面空缺） */
+    if (!it.pending && !(!it.scraped && !it.relPoster && !it.webPoster)) continue
+    fresh.push(code)
+    if (fresh.length >= 500) break
+  }
+  if (cooled) console.log('[scan] 自动刮削跳过 ' + cooled + ' 个最近刮失败的番号（冷却 ' + (SCRAPE_FAIL_COOL_MS / 86400000) + ' 天，可手动刮削）')
+  if (fresh.length) {
+    SCAN.autoQueued = (SCAN.autoQueued || 0) + fresh.length
+    autoIngestQueue(fresh, via)
+    console.log('[scan] 自动刮削：' + fresh.length + ' 个新番号已排队（via ' + via + '，设置 → 自动化 可关）')
+  }
+  return fresh.length
+}
+
 /* ================== 订阅自动下载：刮削完成后自动把磁力推到 115 ==================
  * 触发链：订阅检查 → 新作排进刮削队列 → 刮完拿到磁力 → 若这条订阅开了自动下载，
  *         就把磁力列表第一条（按 seeders 降序，即种子最多的那条）推到 115 离线目录。
@@ -4599,9 +9631,26 @@ function subDlMax() { const n = parseInt(CFG.subAutoDlMax, 10); return isNaN(n) 
  * 磁力对象字段见刮削处（title / hash / size / date / seeders / leechers / magnet）。
  * 这些标都藏在 title 里：中字 / 無修正(无码) / 4K·UHD / HEVC / VR / AI / 字幕 … */
 function magTitle(m) { return String((m && (m.title || (m.magnet || ''))) || '').toLowerCase() }
-function magIsChinese(t) { if (/(无|無)字幕|字幕なし|英字|no[-\s]?sub/i.test(t)) return false; return /中文字幕|字幕|chinese|\b(chs|cht|zh|sub|bilingual)\b|subtitle/i.test(t) }
-function magIsUC(t) { return /無修正|无码|无修正|uncensored|\buc\b/.test(t) }
-function magIsUHD(t) { return /(^|[\s._\-])(4k|2160p|uhd)/.test(t) }
+function magIsChinese(t) { if (/(无|無)字幕|字幕なし|英字|no[-\s]?sub/i.test(t)) return false; return /中文字幕|中字|字幕|chinese|\b(chs|cht|zh|sub|bilingual)\b|subtitle/i.test(t) }
+function magIsUC(t) { return /無修正|无码|无修正|uncensored|reducing\s*mosaic|\buc\b|破解|流出/.test(t) }
+/* 破解：有码原片被软件去码（reducing mosaic）/ 流出片。语义上 破解 ⊆ 无码 ——
+   「只要无码」把它算进来（用户要的就是「去码」），「排除无码」也一并排除；
+   但「破解」单独成项，这样同档里能把破解版排到原生无码前面（原版 HD 去码 > 老片无码）。 */
+function magIsBreak(t) { return /破解|reducing\s*mosaic|流出|\bleak(?:ed)?\b|uncensored\s*leak/.test(t) }
+/* UHD：分隔符要认括号。【原实现只认 空格/./_/- ，`[4K]`、`(4K)`、`【4K】` 这类方括号包裹的写法全漏判，
+   而磁力标题里方括号恰恰是最常见的 —— 等于「默认排除 4K」经常形同虚设。】 */
+function magIsUHD(t) { return /(^|[^a-z0-9])(4k|2160p|uhd)/.test(t) }
+/* 画质档位：FHD/1080p = 2，HD/720p = 1，未标注 = 0。
+   仅用于同分排序（同种子数时 1080p 优先于 720p）——原实现只分「4K / 非4K」，
+   默认排除 4K 之后剩下的一堆 720p 与 1080p 完全不加区分，按种子数排容易选中 720p。 */
+function magQual(t) {
+  if (/(^|[^a-z0-9])(fhd|full\s*-?\s*hd|1080[pi]|1920x1080)([^a-z0-9]|$)/.test(t)) return 2
+  if (/(^|[^a-z0-9])(hd|720[pi]|1280x720)([^a-z0-9]|$)/.test(t)) return 1
+  return 0
+}
+/* 去码档位：破解/流出(2) > 原生无码(1) > 有码(0)。同一步片子的多条磁力里这是内容上的实质差别，
+   但「能不能下完」（种子数）比它更重，所以放在种子数、画质之后做同档微调。 */
+function magDecensor(t) { return magIsBreak(t) ? 2 : (magIsUC(t) ? 1 : 0) }
 function magSizeMB(m) {
   const s = String((m && m.size) || '')
   const m1 = s.match(/([\d.]+)\s*(TiB|TB|GiB|GB|MiB|MB)/i); if (!m1) return 0
@@ -4619,9 +9668,12 @@ function subMagnetPick(magnets, sub) {
   if (!list.length) return null
   const onlyChinese = (sub && sub.requireSub === true) || CFG.subDlOnlyChinese === '1'
   const onlyUc = (sub && sub.requireUncensored === true) || CFG.subDlOnlyUc === '1'
-  // onlyX 优先于 excludeX：勾「只要无码 / 只要4K」时，不应再执行对应的「排除无码 / 排除4K」，
+  const onlyBreak = CFG.subDlOnlyBreak === '1'
+  // onlyX 优先于 excludeX：勾「只要无码 / 只要破解 / 只要4K」时，不应再执行对应的「排除无码 / 排除破解 / 排除4K」，
   // 否则两开关互斥 → 任何磁力都过不了 → 自动下载静默跳过（不占额度、无报错，极难察觉）。
-  const excludeUc = onlyUc ? false : (CFG.subDlExcludeUc === '1')
+  // 「只要破解」还要连带架空「排除无码」—— 破解 ⊆ 无码（见 magIsUC），两条同时生效必然零结果。
+  const excludeUc = (onlyUc || onlyBreak) ? false : (CFG.subDlExcludeUc === '1')
+  const excludeBreak = onlyBreak ? false : (CFG.subDlExcludeBreak === '1')
   const onlyUhd = CFG.subDlOnlyUhd === '1'
   const excludeUhd = onlyUhd ? false : (CFG.subDlExcludeUhd !== '')   // 默认开（排除 4K/UHD，对标 Byte-Muse exclude_uhd:true）
   const includeKw = String(CFG.subDlIncludeKw || '').toLowerCase().split(/[,，\s]+/).filter(Boolean)
@@ -4632,6 +9684,8 @@ function subMagnetPick(magnets, sub) {
     if (onlyChinese && !magIsChinese(t)) return false
     if (onlyUc && !magIsUC(t)) return false
     if (excludeUc && magIsUC(t)) return false
+    if (onlyBreak && !magIsBreak(t)) return false
+    if (excludeBreak && magIsBreak(t)) return false
     if (onlyUhd && !magIsUHD(t)) return false
     if (excludeUhd && magIsUHD(t)) return false
     if (includeKw.length && !includeKw.some(k => t.includes(k))) return false
@@ -4641,13 +9695,23 @@ function subMagnetPick(magnets, sub) {
     return true
   })
   if (!list.length) return null
-  /* DEFAULT_SORT 精神：中字 > 无码 > 种子数 > (默认非UHD / onlyUhd时UHD)。
-   * 原实现是纯 seeders 降序（等于把 Byte-Muse 里 seeders 之前的维度全丢了），这里补上。 */
+  /* 挑最优（只推 1 条）。优先级自上而下：
+   *   ① 有活种（seeders > 0）—— 死种推过去基本下不动，先淘汰
+   *   ② 中文字幕
+   *   ③ 种子数（多者优先）
+   *   ④ 画质档位：1080p/FHD > 720p/HD > 未标注
+   *   ⑤ 去码档位：破解/流出 > 原生无码 > 有码（同档微调）
+   *   ⑥ 非 UHD（默认）；勾了「只要 4K」时反过来
+   * 原实现把「无码」排在种子数之前，导致无码片里只标了「無修正」的 1 种条目
+   * 会挤掉旁边 5 种的主条目（实测 020324-001 就是这样挑错的）——
+   * 「能不能下完」应当比「标签」更重，故把无码降为同档微调。 */
   list.sort((a, b) => {
     const ta = magTitle(a), tb = magTitle(b)
+    const la = (a.seeders || 0) > 0 ? 1 : 0, lb = (b.seeders || 0) > 0 ? 1 : 0; if (la !== lb) return lb - la
     const ca = magIsChinese(ta) ? 1 : 0, cb = magIsChinese(tb) ? 1 : 0; if (ca !== cb) return cb - ca
-    const ua = magIsUC(ta) ? 1 : 0, ub = magIsUC(tb) ? 1 : 0; if (ua !== ub) return ub - ua
     const sa = a.seeders || 0, sb = b.seeders || 0; if (sb !== sa) return sb - sa
+    const qa = magQual(ta), qb = magQual(tb); if (qa !== qb) return qb - qa
+    const da = magDecensor(ta), db = magDecensor(tb); if (da !== db) return db - da   // 破解/流出 > 原生无码
     const va = magIsUHD(ta) ? 1 : 0, vb = magIsUHD(tb) ? 1 : 0
     return onlyUhd ? (vb - va) : (va - vb)   // 默认非 UHD 优先；onlyUhd 时 UHD 优先
   })
@@ -5008,6 +10072,13 @@ async function onlineActorSmartResolve(input) {
       if (d && d.name) return { code: e.id, actor: d }
     } catch (_) {}
   }
+  /* 第三级：名字精确匹配（2026-10-13 补 —— 注释一直写着「三级跳」，但这一级从没实现）。
+   * 后果：从女优名册直接点「✚ 订阅」时只带名字，一旦代号缓存还没回填到她（新人 / 刚重建缓存），
+   * 就锁不到 id，订阅检查只好退回「拿名字当标题搜影片」→ 收进来一堆不相干的片子。
+   * 用 onlineActorExact（同名 → 姓同+名部=别名 → 详情全量别名+异体字）：认不出就 null，
+   * 由调用方决定怎么提示，绝不猜一个人回来。 */
+  const a = await onlineActorExact(name).catch(() => null)
+  if (a && a.id) return { code: a.id, actor: a }
   return null
 }
 
@@ -5136,6 +10207,9 @@ async function onlineActorAllWorks(name, { maxPages = 0, meta: preMeta = null } 
   const LIM = 50
   const pgMax = maxPages || Math.min(30, Math.ceil((meta.expect || 200) / LIM) + 3)
   const codes = []; const seen = new Set(); const dropped = []
+  /* bare 会把「SSNI-826」压成「SSNI826」（去连字符），但消费方要的是**能拿去刮削的原始番号**，
+   * 所以顺手记一份 bare → 原始写法的映射（2026-10-15：缺口体检要用它把番号显示回原样）。 */
+  const raw = {}
   let rounds = 0
   for (const term of meta.terms) {
     const got = new Set(); let pgs = 0
@@ -5144,7 +10218,13 @@ async function onlineActorAllWorks(name, { maxPages = 0, meta: preMeta = null } 
       const list = ((j || {}).data || {}).movies || []
       pgs = pg
       if (!list.length) break
-      for (const m of list) { const c = bare(m.number || m.code); if (c) got.add(c) }
+      for (const m of list) {
+        const src = String(m.number || m.code || '').trim()
+        const c = bare(src)
+        if (!c) continue
+        got.add(c)
+        if (src && !raw[c]) raw[c] = src
+      }
       if (got.size > cap) break             // 已能判定是泛化词（如「みる」921 部）→ 立刻停，别白翻十几页
       if (list.length < LIM) break          // 不满一页 = 这个词已经到底
     }
@@ -5152,8 +10232,15 @@ async function onlineActorAllWorks(name, { maxPages = 0, meta: preMeta = null } 
     if (got.size > cap) { dropped.push(term + '（' + got.size + ' 部，超线上记录 ' + meta.expect + '，疑为同名泛化词）'); continue }
     for (const c of got) if (!seen.has(c)) { seen.add(c); codes.push(c) }
   }
-  return { codes, rounds, terms: meta.terms, expect: meta.expect, exact: meta.exact, dropped, matched: meta.actor ? meta.actor.name : '' }
+  return { codes, raw, rounds, terms: meta.terms, expect: meta.expect, exact: meta.exact, dropped, matched: meta.actor ? meta.actor.name : '' }
 }
+
+/* ---------- 缺口体检缓存（2026-10-15）
+ * /api/gap/actor 拉一位女优的线上全量作品要翻十几页、十几秒，同一个人短时间内反复点要秒回。
+ * 只放进程内存：数据会随线上更新，落盘反而容易给出过期的「缺 N 部」。 */
+const GAP_ACTOR_CACHE = new Map()
+const GAP_ACTOR_TTL = 30 * 60 * 1000
+const GAP_ACTOR_MAX = 40
 
 /* dry = 只抓取、不入库：用于「先看看这位女优线上有多少部」的诊断，也方便无损验证抓取链路 */
 async function subsFullRun(sub, { dry = false } = {}) {
@@ -5304,34 +10391,58 @@ async function subsFeed(force, auto) {
     let movies = []
     try {
       if (s.kind === 'actor') {
-        /* 线上没有「按女优取作品」的接口，用搜索（搜索会匹配女优名）拉前两页 */
-        const a = await onlineActorFind(s.name).catch(() => null)
-        if (a) rec.onlineId = a.id
-        if (s.actorId) rec.onlineId = s.actorId   // 订阅时已按 JavDB 代号锁人的，直接用
-        const acc = []
-        for (const pg of [1, 2]) {
-          const j = await onlineGet('v2/search?q=' + encodeURIComponent(s.name) + '&type=movie&page=' + pg)
-          const list = ((j || {}).data || {}).movies || []
-          acc.push.apply(acc, list)
-          if (list.length < 10) break
+        /* ⚠ 2026-10-13：**不能**再用 v2/search?type=movie&q=<女优名>。
+         * 那是标题模糊搜索 —— 实测搜「葵司」返回的是松嶋葵／藤咲葵／葵百合香甚至无关国产片，
+         * 一部她的都没有（它把名字拆成「葵」去匹配标题）。用户报的「自动订阅老是下载不相干的、
+         * 根本没有该女优的影片」就是它。正确来源是网页版演员页 /actors/<id>（每页 40 部、按发行日期倒序）。
+         * 锁人：订阅填了 JavDB 代号就用它；否则 onlineActorExact 精确匹配，认不出就**跳过这条订阅**
+         * ——宁可什么都不收，也不能把别人的片子收进来。 */
+        let aid = String(s.actorId || '').trim()
+        if (!aid) {
+          const a = await onlineActorExact(s.name).catch(() => null)
+          if (a && a.id) aid = a.id
         }
-        if (!a && !acc.length) rec.note = '线上搜不到这位女优'
-        movies = acc.map(onlineMovie)
+        if (!aid) {
+          rec.note = '线上没有同名女优，已跳过（避免抓到别人的片子；订阅里可直接贴她的 JavDB 女优页链接）'
+          movies = []
+        } else {
+          rec.onlineId = aid
+          try {
+            /* 只取第 1 页就够：演员页按发行日期倒序、一页 40 部，追「新作」绰绰有余，
+             * 而且比原来 app 搜索拉 2 页还省请求。 */
+            const r = await jdbActorMoviesPage(aid, 1, '0', '')
+            movies = r.movies || []
+          } catch (e) {
+            rec.note = '演员页抓取失败：' + ((e && e.message) || '未知错误')
+            movies = []
+          }
+        }
       } else if (s.kind === 'rank') {
-        /* 榜单：读本机榜单 → 取前 N 名 → 每人一次搜索（limit=50 一页拿满，比翻 2 页省一半请求）
+        /* 榜单：读本机榜单 → 取前 N 名 → 每人抓一次演员页第 1 页（40 部，按发行日期倒序）。
+         * ⚠ 2026-10-13：原先这里是 v2/search?type=movie&q=<女优名> 标题模糊搜索，和 actor 订阅
+         * 犯的是同一个错 —— 榜上第 3 名是「葵司」时，搜回来的可能是松嶋葵／藤咲葵的片子。
+         * 现在先精确锁 id 再抓演员页；锁不到就跳过这个人（不拿名字去瞎搜）。
+         * 请求量没变（每人 1 次），只是从 app 搜索换成网页版演员页。
          * 记下 _actress，前端才能在列表里显示「这是谁的作品」（榜名只能说明来源）。 */
         const board = rankBoard(s.board || 'day')
         const topN = rankTopN(s.topN)
-        const names = board.slice(0, topN).map(x => String(x.name || '').trim()).filter(Boolean)
-        rec.checked = names.length
-        if (!board.length) rec.note = '本机还没有榜单数据（排行榜每天自动更新，也可去「排行榜」页手动刷新）'
-        else if (!names.length) rec.note = '榜单数据异常（没有人名）'
+        const rows = board.slice(0, topN)
+        rec.checked = rows.length
+        if (!board.length) rec.note = '本机还没有榜单数据（排行榜每天自动更新，也可去「排行榜」页面手动刷新）'
         const acc = []
-        for (const nm of names) {
-          const j = await onlineGet('v2/search?q=' + encodeURIComponent(nm) + '&type=movie&page=1&limit=50')
-          const mv = (((j || {}).data || {}).movies || []).map(onlineMovie)
-          for (const x of mv) acc.push(Object.assign(x, { _actress: nm }))
+        const skipped = []
+        for (const row of rows) {
+          const nm = String(row.name || '').trim()
+          if (!nm) continue
+          let aid = ''
+          try { const a = await onlineActorExact(nm); if (a && a.id) aid = a.id } catch (_) {}
+          if (!aid) { skipped.push(nm); continue }
+          try {
+            const r = await jdbActorMoviesPage(aid, 1, '0', '')
+            for (const x of (r.movies || [])) acc.push(Object.assign({}, x, { _actress: nm }))
+          } catch (e) { skipped.push(nm) }
         }
+        if (skipped.length) rec.note = '这几位在线上没能精确匹配到，已跳过：' + skipped.join('、')
         movies = acc
       } else {
         const j = await onlineGet('v2/search?q=' + encodeURIComponent(rec.query) + '&type=movie&page=1')
@@ -5387,7 +10498,7 @@ async function subsFeed(force, auto) {
     /* 订阅自动下载（115）实时状态：开关是否生效、单次检查额度、本轮已推/成功/失败/超额度跳过、最近 30 条明细。
      * 前端订阅页调度面板读这个展示「本轮推了多少、有没有超额度」。 */
     subAutoDl: { on: subDlOn(), max: subDlMax(), round: SUB_DL.round, pushed: Object.keys(SUB_DL.pushed).length,
-      filter: { excludeUhd: CFG.subDlExcludeUhd !== '', onlyUhd: CFG.subDlOnlyUhd === '1', onlyChinese: CFG.subDlOnlyChinese === '1', onlyUc: CFG.subDlOnlyUc === '1', excludeUc: CFG.subDlExcludeUc === '1', includeKw: CFG.subDlIncludeKw || '', excludeKw: CFG.subDlExcludeKw || '', minSize: CFG.subDlMinSize || '', maxSize: CFG.subDlMaxSize || '' } },
+      filter: { excludeUhd: CFG.subDlExcludeUhd !== '', onlyUhd: CFG.subDlOnlyUhd === '1', onlyChinese: CFG.subDlOnlyChinese === '1', onlyUc: CFG.subDlOnlyUc === '1', excludeUc: CFG.subDlExcludeUc === '1', onlyBreak: CFG.subDlOnlyBreak === '1', excludeBreak: CFG.subDlExcludeBreak === '1', includeKw: CFG.subDlIncludeKw || '', excludeKw: CFG.subDlExcludeKw || '', minSize: CFG.subDlMinSize || '', maxSize: CFG.subDlMaxSize || '' } },
     subFull: Object.assign({ on: subsFullOn() }, SUB_FULL)
   }
   /* P1a：自动检查结束 → 先落定 SUB_CHECK 终态（lastAt/nextAt/running），再快照进 feed，
@@ -5406,7 +10517,7 @@ async function subsFeed(force, auto) {
   }
   data.subCheck = { enabled: subCheckEnabled(), intervalMin: subCheckIntervalMin(), running: SUB_CHECK.running, lastAt: SUB_CHECK.lastAt, nextAt: SUB_CHECK.nextAt, done: SUB_CHECK.done, total: SUB_CHECK.total, current: SUB_CHECK.current,
     subAutoDl: CFG.subAutoDl === '1', subAutoDlMax: subDlMax(),
-    subAutoDlFilter: { excludeUhd: CFG.subDlExcludeUhd !== '', onlyUhd: CFG.subDlOnlyUhd === '1', onlyChinese: CFG.subDlOnlyChinese === '1', onlyUc: CFG.subDlOnlyUc === '1', excludeUc: CFG.subDlExcludeUc === '1', includeKw: CFG.subDlIncludeKw || '', excludeKw: CFG.subDlExcludeKw || '', minSize: CFG.subDlMinSize || '', maxSize: CFG.subDlMaxSize || '' } }   // 全局总开关 + 单次额度上限 + 质量过滤：调度面板读这个
+    subAutoDlFilter: { excludeUhd: CFG.subDlExcludeUhd !== '', onlyUhd: CFG.subDlOnlyUhd === '1', onlyChinese: CFG.subDlOnlyChinese === '1', onlyUc: CFG.subDlOnlyUc === '1', excludeUc: CFG.subDlExcludeUc === '1', onlyBreak: CFG.subDlOnlyBreak === '1', excludeBreak: CFG.subDlExcludeBreak === '1', includeKw: CFG.subDlIncludeKw || '', excludeKw: CFG.subDlExcludeKw || '', minSize: CFG.subDlMinSize || '', maxSize: CFG.subDlMaxSize || '' } }   // 全局总开关 + 单次额度上限 + 质量过滤：调度面板读这个
   SUB_FEED = { at: Date.now(), data }
   try { writeCfg() } catch (_) {}
   return data
@@ -5421,22 +10532,44 @@ async function handleActorApi(req, res, p) {
       rankAuto: CFG.rankAuto !== false,
       rankHour: rankHour(), rankUpdatedAt: rankUpdatedAt(), rankRunning: RANKUP.running,
       autoScrapeNew: CFG.autoScrapeNew !== false,
+      /* 网盘片源分辨率探测（默认开）：云盘条目走本机代理 ffprobe 读 moov 头拿宽高，
+       * 没有它云盘片永远没有分辨率 → 不显示、筛不了、排不了 */
+      probeNetRes: CFG.probeNetRes !== false, netResRun: NETRES_RUN, netResStats: NETRES_STATS,
       autoAvatar: CFG.autoAvatar !== false,
       auto115Watch: CFG.auto115Watch !== false,
       autoAvatarRunning: AVA_BACKFILL_RUNNING, autoAvatarStats: AVA_BACKFILL_STATS,
       /* 默认开：设置里「媒体库每日自动重扫」开关默认开启，只有显式 false 才算关 */
       autoRescan: CFG.autoRescan !== false, autoRescanHour: autoRescanHour(), autoRescanLast: autoRescanLast(),
+      /* 入库最小体积（MB，字符串；空 = 不过滤）。扫盘时小于它的视频不进影片库 */
+      scanMinMb: CFG.scanMinMb || '',
       subCheckEnabled: CFG.subCheckEnabled !== false, subCheckInterval: subCheckIntervalMin(), subCheckRunning: SUB_CHECK.running, subCheckLast: SUB_CHECK.lastAt, subCheckNext: SUB_CHECK.nextAt,
       subAutoDl: CFG.subAutoDl === '1', subAutoDlMax: subDlMax(),
       subDlExcludeUhd: CFG.subDlExcludeUhd !== '', subDlOnlyUhd: CFG.subDlOnlyUhd === '1',
       subDlOnlyChinese: CFG.subDlOnlyChinese === '1', subDlOnlyUc: CFG.subDlOnlyUc === '1', subDlExcludeUc: CFG.subDlExcludeUc === '1',
+      subDlOnlyBreak: CFG.subDlOnlyBreak === '1', subDlExcludeBreak: CFG.subDlExcludeBreak === '1',
       subDlIncludeKw: CFG.subDlIncludeKw || '', subDlExcludeKw: CFG.subDlExcludeKw || '',
       subDlMinSize: CFG.subDlMinSize || '', subDlMaxSize: CFG.subDlMaxSize || '',
       accessOn: !!ACCESS_CODE(),
-      mounts: containerMounts(), mediaRoot: MEDIA_ROOT
+      mounts: containerMounts(), mediaRoot: MEDIA_ROOT,
+      sourceNames: CFG.sourceNames || {}
     })
+    /* 媒体源显示名（添加页卡片标题）：{ local: '本地存储', pan115: '115 网盘' }，可自定义 */
+    if ('sourceNames' in body) {
+      const sn = (body.sourceNames && typeof body.sourceNames === 'object') ? body.sourceNames : {}
+      CFG.sourceNames = {
+        local: String(sn.local || '').trim().slice(0, 30),
+        pan115: String(sn.pan115 || '').trim().slice(0, 30)
+      }
+      SRC_CACHE = { at: 0, data: null }   // 名字变了，来源统计缓存作废（下次拉取重算）
+    }
     // 各字段独立保存：body 里带哪个就更新哪个，互不覆盖
     if ('autoScrapeNew' in body) CFG.autoScrapeNew = !!body.autoScrapeNew
+    /* 网盘片源分辨率探测：打开开关立刻补跑一轮（不然要等下次扫描/重启才见效） */
+    if ('probeNetRes' in body) {
+      CFG.probeNetRes = !!body.probeNetRes
+      if (CFG.probeNetRes) setTimeout(() => { resBackfillRun('开关').catch(() => {}) }, 800)
+      else console.log('[res] 已关闭网盘片源分辨率探测（已有标签保留）')
+    }
     if ('autoAvatar' in body) {
       CFG.autoAvatar = !!body.autoAvatar
       if (!CFG.autoAvatar) AVA_BACKFILL_RUNNING = false   // 关开关 → 立即叫停进行中的预取
@@ -5444,6 +10577,8 @@ async function handleActorApi(req, res, p) {
     if ('autoRescan' in body) CFG.autoRescan = !!body.autoRescan
     if ('auto115Watch' in body) CFG.auto115Watch = !!body.auto115Watch
     if ('autoRescanHour' in body) CFG.autoRescanHour = Math.max(0, Math.min(23, parseInt(body.autoRescanHour, 10) || 0))
+    /* 入库最小体积（MB）：只存字符串，真正的换算在 scanMinBytes()（扫描时按 1024 进制算一次） */
+    if ('scanMinMb' in body) CFG.scanMinMb = String(body.scanMinMb === null || body.scanMinMb === undefined ? '' : body.scanMinMb).trim().slice(0, 12)
     if ('rankAuto' in body) CFG.rankAuto = !!body.rankAuto
     if ('rankHour' in body) CFG.rankHour = Math.max(0, Math.min(23, parseInt(body.rankHour, 10) || 0))
     if ('subCheckEnabled' in body) CFG.subCheckEnabled = !!body.subCheckEnabled
@@ -5456,6 +10591,8 @@ async function handleActorApi(req, res, p) {
     if ('subDlOnlyChinese' in body) CFG.subDlOnlyChinese = body.subDlOnlyChinese ? '1' : ''
     if ('subDlOnlyUc' in body) CFG.subDlOnlyUc = body.subDlOnlyUc ? '1' : ''
     if ('subDlExcludeUc' in body) CFG.subDlExcludeUc = body.subDlExcludeUc ? '1' : ''
+    if ('subDlOnlyBreak' in body) CFG.subDlOnlyBreak = body.subDlOnlyBreak ? '1' : ''      // 只要破解/流出
+    if ('subDlExcludeBreak' in body) CFG.subDlExcludeBreak = body.subDlExcludeBreak ? '1' : ''   // 排除破解/流出
     if ('subDlIncludeKw' in body) CFG.subDlIncludeKw = String(body.subDlIncludeKw || '').slice(0, 200)
     if ('subDlExcludeKw' in body) CFG.subDlExcludeKw = String(body.subDlExcludeKw || '').slice(0, 200)
     if ('subDlMinSize' in body) CFG.subDlMinSize = String(body.subDlMinSize || '').trim()
@@ -5478,7 +10615,13 @@ async function handleActorApi(req, res, p) {
     }
     if ('cacheDir' in body) {
       const cd = String(body.cacheDir || '').trim()
-      if (cd && !cd.startsWith('/')) return json(res, { ok: false, error: '请填写容器内的绝对路径（如 /media/cache 或 /app/cache），留空用默认 cache/' })
+      /* 绝对路径校验（2026-10-15 修）：以前只认 '/…'（容器路径），Windows 版填 D:\JavPacoData
+       * 会被判成「不是绝对路径」—— 离线数据目录在 Windows 上根本改不了。现在盘符路径也认。 */
+      const abs = /^\//.test(cd) || /^[A-Za-z]:[\\/]/.test(cd) || /^\\\\/.test(cd)
+      if (cd && !abs) return json(res, { ok: false, error: '请填写绝对路径（Windows 如 D:\\JavPacoData，容器如 /media/cache），留空用默认 cache/' })
+      if (cd && fs.existsSync(path.join(path.resolve(cd), 'server-config.json'))) {
+        return json(res, { ok: false, error: '这个目录是程序目录（里面有 server-config.json），不能当离线数据目录' })
+      }
       CFG.cacheDir = cd
       try { fs.mkdirSync(path.join(cacheDir(), 'movies'), { recursive: true }); fs.mkdirSync(path.join(cacheDir(), 'actors'), { recursive: true }) } catch (_) {}
     }
@@ -5502,6 +10645,7 @@ async function handleActorApi(req, res, p) {
       subAutoDl: CFG.subAutoDl === '1', subAutoDlMax: subDlMax(),
       subDlExcludeUhd: CFG.subDlExcludeUhd !== '', subDlOnlyUhd: CFG.subDlOnlyUhd === '1',
       subDlOnlyChinese: CFG.subDlOnlyChinese === '1', subDlOnlyUc: CFG.subDlOnlyUc === '1', subDlExcludeUc: CFG.subDlExcludeUc === '1',
+      subDlOnlyBreak: CFG.subDlOnlyBreak === '1', subDlExcludeBreak: CFG.subDlExcludeBreak === '1',
       subDlIncludeKw: CFG.subDlIncludeKw || '', subDlExcludeKw: CFG.subDlExcludeKw || '',
       subDlMinSize: CFG.subDlMinSize || '', subDlMaxSize: CFG.subDlMaxSize || ''
     })
@@ -6126,8 +11270,11 @@ async function handleActorApi(req, res, p) {
     try {
       let id = aid
       if (!id) {
-        const hit = await onlineActorFind(aname)
-        if (!hit || !hit.id) return json(res, { ok: false, error: '线上没有找到这位女优（试试她的日文原名）' })
+        /* ⚠ 用 onlineActorExact，不用 onlineActorFind（2026-10-13）：
+         * 后者原先兜底返回搜索结果第一条，实测 21% 的名字会因此锁到**另一个人**，
+         * 于是「▣ JavDB 女优页」列出来的是那个人的全部作品。exact 认不出就明确报错，不猜。 */
+        const hit = await onlineActorExact(aname).catch(() => null)
+        if (!hit || !hit.id) return json(res, { ok: false, error: '线上没有找到这位女优（试试她的日文原名；或在订阅里直接贴她的 JavDB 女优页链接）' })
         id = hit.id
       }
       const j = await onlineGet('v1/actors/' + encodeURIComponent(id))
@@ -6171,32 +11318,79 @@ async function handleActorApi(req, res, p) {
     const _tf = String((body && body.t) || uq.searchParams.get('t') || '').trim()
     const tf = ['', 'p', 's', 'd', 'c'].includes(_tf) ? _tf : ''
     if (!/^[A-Za-z0-9]{3,16}$/.test(id)) return json(res, { ok: false, error: '女优 id 不合法' })
-    const qs = []
-    if (tf) qs.push('t=' + tf)
-    if (st !== '0') qs.push('sort_type=' + st)
-    if (pg > 1) qs.push('page=' + pg)
-    const rel = '/actors/' + id + (qs.length ? '?' + qs.join('&') : '')
-    let lastErr = null
-    for (const base of ['https://javdb.com', 'https://javdb580.com']) {
-      try {
-        const html = await scFetch(base + rel, { hdrs: { referer: base + '/', cookie: 'over18=1; locale=zh' } })
-        if (!/class="item"|actor-section-name/.test(html)) throw new Error('演员页没有内容（女优 id 可能不对）')
-        const parsed = jdbParseActorMovies(html)
-        parsed.hasMore = pg < parsed.totalPages
-        parsed.perPage = 40
-        /* 封面从 cN.jdbstatic.com 换到国内可达的 spfcas 镜像（详见 jdbImgBase 注释） */
-        const imgBase = await jdbImgBase()
-        parsed.movies = parsed.movies.map(m => Object.assign({}, m, {
-          thumb: jdbImgMirror(m.thumb, imgBase), cover: jdbImgMirror(m.cover, imgBase)
-        }))
-        return json(res, Object.assign({ ok: true, id, page: pg, sortType: st, t: tf, webUrl: base + '/actors/' + id }, parsed))
-      } catch (e) { lastErr = e }
+    try {
+      const parsed = await jdbActorMoviesPage(id, pg, st, tf)
+      return json(res, Object.assign({ ok: true, id, page: pg, sortType: st, t: tf }, parsed))
+    } catch (e) {
+      return json(res, { ok: false, error: '演员页抓取失败：' + ((e && e.message) || '未知错误') })
     }
-    return json(res, { ok: false, error: '演员页抓取失败：' + ((lastErr && lastErr.message) || '未知错误') })
   }
   /* ---------- JavDB 目录页（复刻 app「演员」「片商」「系列」tab）：v1/actors|makers|series ----------
    * 目录 = 大全式翻页（type: 0有码 1无码 all）；带 q 时走 v2/search 对应类型。
    * 片商/系列没有专属作品端点（实测 maker_id 会被 v1/movies/latest 静默忽略），作品列表用名字搜索兜底。 */
+  /* ---- 缺口体检：某位女优的线上全量作品 × 本地库存 = 缺哪几部（2026-10-15）
+   * 复用「订阅·全量」那条链路（onlineActorSearchTerms + onlineActorAllWorks）——
+   * 泛化别名过滤、翻页深度限制、限速都已在那边处理好，这里不重造一套。 */
+  if (p === '/api/gap/actor') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    const name = String(body.name || '').trim()
+    if (!name) return json(res, { ok: false, error: '缺少女优名' })
+    const ck = onNorm(name)
+    const hit = GAP_ACTOR_CACHE.get(ck)
+    if (hit && Date.now() - hit.at < GAP_ACTOR_TTL) {
+      return json(res, Object.assign({ ok: true, cached: true, at: hit.at }, hit.data))
+    }
+    try {
+      const meta = await onlineActorSearchTerms(name)
+      /* ⚠ 线上没有同名女优时**绝不能硬搜**：实测「恋れん」能搜回 344 部别人的片。
+       * 这里同样严格执行（与订阅一致），认不出就明确说认不出。 */
+      if (!meta || !meta.exact) {
+        return json(res, { ok: false, name, error: '线上没有找到这位女优（搜到的都是名字相近的别人）。试试日文原名，或在订阅里贴她的 JavDB 女优页链接。' })
+      }
+      const r = await onlineActorAllWorks(name, { meta })
+      const local = new Set()
+      for (const it of ((DATA && DATA.items) || [])) if (it.code) local.add(bare(it.code))
+      for (const it of scrapedVirtualItems()) if (it.code) local.add(bare(it.code))
+      const missing = r.codes.filter(c => !local.has(c))
+      /* 显示 / 入队都用**原始番号**（SSNI-826），不用 bare 压缩形态（SSNI826）—— 后者拿去刮削容易被当野格式 */
+      const missingRaw = missing.map(c => (r.raw && r.raw[c]) || c)
+      const data = {
+        name, matched: r.matched || (meta.actor && meta.actor.name) || name,
+        expect: r.expect || 0, fetched: r.codes.length,
+        localCount: r.codes.length - missing.length,
+        missing: missingRaw.slice(0, 500),
+        missingAll: missing.length,
+        terms: r.terms || [], dropped: r.dropped || [], rounds: r.rounds || 0
+      }
+      if (GAP_ACTOR_CACHE.size >= GAP_ACTOR_MAX) GAP_ACTOR_CACHE.delete(GAP_ACTOR_CACHE.keys().next().value)
+      GAP_ACTOR_CACHE.set(ck, { at: Date.now(), data })
+      return json(res, Object.assign({ ok: true, cached: false, at: Date.now() }, data))
+    } catch (e) {
+      return json(res, { ok: false, name, error: '抓取失败：' + ((e && e.message) || String(e)) })
+    }
+  }
+  /* ---- 磁盘容量（「珍藏 → 空间」用）----
+   * 与媒体源卡片的容量同源：fs.statfsSync，每块盘一条，同一块盘上的多个目录只算一次。
+   * 单独成一个接口是因为空间页需要**离线数据目录所在盘**（它常和媒体库不同盘）。 */
+  if (p === '/api/disk') {
+    if (req.method !== 'GET') { res.writeHead(405); return res.end() }
+    const seen = {}, disks = []
+    const addDisk = (dir) => {
+      let root = ''
+      try { root = path.parse(dir).root || String(dir).slice(0, 3) } catch (_) { root = String(dir || '').slice(0, 3) }
+      root = String(root || '').replace(/[\\/]+$/, '')
+      if (!root || seen[root.toLowerCase()]) return
+      seen[root.toLowerCase()] = 1
+      try {
+        const st = fs.statfsSync(dir)
+        const total = st.bsize * st.blocks, free = st.bsize * st.bavail
+        if (total > 0) disks.push({ root, free, total, dirs: [dir] })
+      } catch (_) {}   // 盘读不到（拔了 / 权限）就跳过，不画这块
+    }
+    for (const d of LIBS) addDisk(d)
+    try { addDisk(cacheDir()) } catch (_) {}
+    return json(res, { ok: true, disks, roots: { media: LIBS.slice(), cache: cacheDir() } })
+  }
   if (p === '/api/online/dirs') {
     const uq = new URL(req.url, 'http://x')
     const kindRaw = String(uq.searchParams.get('kind') || 'actors').toLowerCase()
@@ -6264,13 +11458,25 @@ async function handleActorApi(req, res, p) {
    *   目录列表 https://webapi.115.com/files?cid=&show_dir=1              → 目标文件夹下拉
    *   任务列表 https://clouddownload.115.com/web/?ac=task_lists          → 推送结果查验
    * 推到 115 指定文件夹后，本地挂载这个文件夹，重扫媒体库即可入库。 */
-  function pan115Cfg() {
-    const o = (CFG.pan115 && typeof CFG.pan115 === 'object') ? CFG.pan115 : {}
-    return { cookie: String(o.cookie || '').trim(), savepath: String(o.savepath || '').trim(), cid: String(o.cid || '').trim(), cidName: String(o.cidName || '').trim(), timeout: Number(o.timeout) || 20 }
+  function pan115Cfg(acct) {
+    /* acct 缺省 = 配置的推送账号 pan115PushAcctOf()。账号 1 = CFG.pan115（老卡，推送目录也在这）；
+     * 账号 N（≥2）= CFG.pan115x[N-2]，savepath/cid/cidName/timeout 存该账号自己的槽
+     * （媒体源模块只用 cookie/linkTpl/roots/name，互不干扰）。自动认领不用改 —— v115FindByCode 本来就遍历所有就绪账号。 */
+    let n = acct != null ? (parseInt(acct, 10) || 1) : pan115PushAcctOf()
+    n = Math.max(1, n)
+    const base = (CFG.pan115 && typeof CFG.pan115 === 'object') ? CFG.pan115 : {}
+    if (n === 1) return { acct: 1, cookie: String(base.cookie || '').trim(), savepath: String(base.savepath || '').trim(), cid: String(base.cid || '').trim(), cidName: String(base.cidName || '').trim(), timeout: Number(base.timeout) || 20, name: String(base.name || '').trim() }
+    const cx = (Array.isArray(CFG.pan115x) ? CFG.pan115x[n - 2] : null) || {}
+    return { acct: n, cookie: String(cx.cookie || '').trim(), savepath: String(cx.savepath || '').trim(), cid: String(cx.cid || '').trim(), cidName: String(cx.cidName || '').trim(), timeout: Number(cx.timeout) || Number(base.timeout) || 20, name: String(cx.name || '').trim() }
   }
-  function pan115Request(url, { method = 'GET', form = null, timeout } = {}) {
+  /* ⚠ 2026-10-15：这条通道以前**完全不过节流器**（它是独立的 https 请求，不是 v115FetchRaw），
+   *   于是「批量推 20 部磁力」= 40 个请求瞬间打出去（每部 get_id + add_task_url），
+   *   是本机把 115 逼到风控的最直接来源。现在与网盘那条路共用同一个串行闸门。 */
+  async function pan115Request(url, { method = 'GET', form = null, timeout, acct } = {}) {
+    if (v115AuthCdOn('push', acct)) throw v115AuthCdErr('push', acct)   // 推送通道登录失效 → 暂停
+    await v115Throttle()
     return new Promise((resolve, reject) => {
-      const c = pan115Cfg()
+      const c = pan115Cfg(acct)
       const to = (timeout || c.timeout || 20) * 1000
       let u
       try { u = new URL(url) } catch (e) { return reject(new Error('URL 无效')) }
@@ -6280,18 +11486,29 @@ async function handleActorApi(req, res, p) {
         hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443),
         path: u.pathname + u.search, method,
         headers: Object.assign({
-          'Cookie': c.cookie,
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+          'Cookie': c.cookie + V115_WAF,
+          /* ⚠ UA 必须与 v115FetchRaw 一致（都是 V115_UA）：同一 Cookie + 两个不同 UA
+           * = 115 眼里的「同一设备被两个浏览器同时使用」，是会话被判异常/强制下线的经典特征。
+           * 2026-10-13 前这里伪装的是 macOS Chrome，与另一条通道的 115Browser 冲突。 */
+          'User-Agent': V115_UA,
           'Referer': 'https://115.com/web/lixian/',
           'Accept': 'application/json, text/plain, */*'
         }, payload ? { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Content-Length': Buffer.byteLength(payload) } : {})
       }, rsp => {
+        try { v115WafAbsorb(rsp.headers['set-cookie']) } catch (_) {}   // 同一份 WAF 会话粘性
         const chunks = []
         rsp.on('data', d => chunks.push(d))
         rsp.on('end', () => {
           const buf = Buffer.concat(chunks)
           let j = null
           try { j = JSON.parse(buf.toString('utf8')) } catch (_) {}
+          /* 推送通道自己的登录失效判定（990001）：与 webapi 那条路分开记冷却，
+           * 否则「推送还能用、网盘已掉线」会被一刀切，反之亦然。 */
+          if (j) {
+            const raw = String(j.error || j.errorMsg || j.error_msg || j.msg || '')
+            if (v115LoginErrCode(j) || v115LoginErrText(raw)) v115AuthCdHit('push', acct, raw)
+            else v115AuthCdClear('push', acct)
+          }
           resolve({ status: rsp.statusCode, json: j, text: buf.toString('utf8').slice(0, 500) })
         })
       })
@@ -6307,12 +11524,24 @@ async function handleActorApi(req, res, p) {
     const u = uid || (pan115Cfg().cookie.match(/UID=(\d+)/i) || [])[1] || ''
     return { uid: u, sign: sha1hex(u + sha1hex(userkey + sha1hex('115' + time))) }
   }
-  async function pan115GetId() {
-    const cfg = pan115Cfg()
+  /* get_id 结果缓存 5 分钟（2026-10-15 降速）：
+   * 推一部磁力要两个请求（get_id 拿签名 key + add_task_url 提交），批量推 20 部 = 40 次。
+   * 签名用的 userkey 短期不变，缓存之后一批推送只剩 21 次 —— 请求量直接砍半。
+   * 换了 Cookie / 切换推送账号时清空（见 v115CookieChanged）。 */
+  async function pan115GetId(acct) {
+    const k = acct == null ? pan115PushAcctOf() : Math.max(1, parseInt(acct, 10) || 1)
+    const hit = V115_LXID.get(k)
+    if (hit && Date.now() - hit.t < 5 * 60 * 1000) return hit.data
+    const d = await pan115GetIdRaw(acct)
+    V115_LXID.set(k, { t: Date.now(), data: d })
+    return d
+  }
+  async function pan115GetIdRaw(acct) {
+    const cfg = pan115Cfg(acct)
     const ukOf = j => j && (j.userkey || (j.data && j.data.userkey) || (j.info && j.info.userkey) || (j.result && j.result.userkey)) || ''
     const uidOf = j => { const u = j && (j.user_id || (j.data && j.data.user_id) || (j.info && j.info.user_id)); if (u) return String(u); return (cfg.cookie.match(/UID=(\d+)/i) || [])[1] || '' }
     const dcOf = j => String((j && (j.dest_cid || (j.data && j.data.dest_cid))) || '')
-    const r = await pan115Request('https://115.com/web/lixian/?ct=lixian&ac=get_id')
+    const r = await pan115Request('https://115.com/web/lixian/?ct=lixian&ac=get_id', { acct })
     const j = r.json
     const uk = ukOf(j)
     if (!uk) {
@@ -6332,6 +11561,8 @@ async function handleActorApi(req, res, p) {
     const cid = pan115Cfg().cid
     let id = null
     try { id = await pan115GetId() } catch (e) { id = { err: e.message } }
+    /* 推送通道已因登录失效暂停 → 别再提交（提交必然失败，还白送一次请求给风控） */
+    if (id && id.err && /登录已失效|暂停请求/.test(String(id.err))) return { ok: false, error: id.err }
     const time = Math.floor(Date.now() / 1000)
     const form = { url: magnet, time: String(time) }
     if (cid) form.wp_path_id = cid
@@ -6348,9 +11579,82 @@ async function handleActorApi(req, res, p) {
     return { ok: false, error: String(msg).slice(0, 200) }
   }
   if (p === '/api/115/config') {
+    /* acct：媒体源多账号（2026-10-14）。acct=1 = 老卡（Cookie 与离线推送共用）；acct≥2 = 附加账号（CFG.pan115x）。
+     * 推送账号（2026-10-15）：CFG.pan115.pushAcct，可设为任意已配置账号 —— 推送/离线任务/推送目录都跟着走该账号。 */
+    const qAcct = () => {
+      try { return Math.max(1, parseInt(new URL(req.url, 'http://x').searchParams.get('acct'), 10) || 1) } catch (_) { return 1 }
+    }
     if (req.method === 'GET') {
-      const c = pan115Cfg()
-      return json(res, { ok: true, hasCookie: !!c.cookie, savepath: c.savepath, cid: c.cid, cidName: c.cidName, timeout: c.timeout })
+      const n = qAcct()
+      const c = v115Cfg(n)
+      /* 容量/会员（v115UserCached 可能还没拉过 → 空时后台补一发，下次刷新就有） */
+      let ui = v115UserCached(n)
+      if (!ui && v115Ready(n)) { v115UserInfo(false, n).catch(() => {}); ui = null }
+      /* 推送账号下拉的数据源：对外账号列表（账号 1 恒在）+ 各自显示名 + 是否已有 Cookie */
+      const accts = v115AcctListAll().map(a => { const cc = v115Cfg(a); return { acct: a, name: String(cc.name || '').trim() || ('115 网盘 ' + a), ready: v115Ready(a) } })
+      if (n > 1) {
+        const pc = pan115Cfg(n)
+        return json(res, {
+          ok: true, acct: n, hasCookie: !!c.cookie, linkTpl: c.linkTpl || '', name: c.name || '',
+          pushAcct: pan115PushAcctOf(), accts, savepath: pc.savepath, cid: pc.cid, cidName: pc.cidName, timeout: pc.timeout,
+          fileOk: v115AuthOf(n).ok, fileError: v115AuthOf(n).err, authNote: v115AuthNote(n),
+          pace: v115PaceOf(), throttle: v115ThrottleState(),
+          space: ui ? { total: ui.total, totalFmt: ui.totalFmt, used: ui.used, usedFmt: ui.usedFmt, remainFmt: ui.remainFmt, percent: ui.percent } : null,
+          vip: ui ? ui.vip : null, user: (ui && ui.user) || '', userErr: (ui && ui.err) || ''
+        })
+      }
+      const pan = pan115Cfg(1)
+      return json(res, {
+        ok: true, acct: 1, hasCookie: !!c.cookie, savepath: pan.savepath, cid: pan.cid, cidName: pan.cidName,
+        timeout: pan.timeout, linkTpl: c.linkTpl || '', name: c.name || '',
+        pushAcct: pan115PushAcctOf(), accts,
+        /* 网盘是否真的读得到（null=还没试过）。与「离线推送可用」是两回事，UI 必须分开展示 */
+        fileOk: v115AuthOf(1).ok, fileError: v115AuthOf(1).err, authNote: v115AuthNote(1),
+        pace: v115PaceOf(), throttle: v115ThrottleState(),
+        space: ui ? { total: ui.total, totalFmt: ui.totalFmt, used: ui.used, usedFmt: ui.usedFmt, remainFmt: ui.remainFmt, percent: ui.percent } : null,
+        vip: ui ? ui.vip : null, user: (ui && ui.user) || '', userErr: (ui && ui.err) || ''
+      })
+    }
+    /* 115 请求节奏档位（2026-10-15）：设置页「请求节奏」直接改这个，立即生效，不用重启 */
+    if ('v115Pace' in body) {
+      const pc = String(body.v115Pace || 'safe')
+      if (V115_PACE[pc]) {
+        CFG.v115Pace = pc
+        writeCfg()
+        console.log('[115] 请求节奏 → ' + pc + '（基础间隔 ' + V115_PACE[pc] + 'ms，所有 115 请求共用）')
+      }
+    }
+    /* 推送账号切换：先于其它字段处理（独立于 body.acct —— body.acct 是「这份表单在改哪个账号」，pushAcct 是「推送走哪个账号」） */
+    if ('pushAcct' in body) {
+      const pa = Math.max(1, parseInt(body.pushAcct, 10) || 1)
+      const allowed = v115AcctListAll()
+      if (!allowed.includes(pa)) return json(res, { ok: false, error: '账号 ' + pa + ' 还没有配置（先在 媒体源 里添加）' })
+      if (!CFG.pan115 || typeof CFG.pan115 !== 'object') CFG.pan115 = {}
+      CFG.pan115.pushAcct = pa
+      writeCfg()
+    }
+    const n = Math.max(1, parseInt(body.acct, 10) || 1)
+    if (n > 1) {
+      /* 附加账号：媒体库字段 + 推送目录都存该账号自己的配置槽（互不串号） */
+      const c = v115Cfg(n)
+      if ('cookie' in body) c.cookie = String(body.cookie || '').trim()
+      if ('name' in body) c.name = String(body.name || '').trim().slice(0, 30)
+      if ('linkTpl' in body) c.linkTpl = String(body.linkTpl || '').trim()
+      if ('savepath' in body) c.savepath = String(body.savepath || '').trim()
+      if ('cid' in body) c.cid = String(body.cid || '').trim()
+      if ('cidName' in body) c.cidName = String(body.cidName || '').trim()
+      if ('timeout' in body) c.timeout = Math.max(5, Math.min(120, parseInt(body.timeout, 10) || 20))
+      writeCfg()
+      if ('cookie' in body) {
+        const a = v115AuthOf(n); a.ok = null; a.err = ''; a.at = 0
+        for (const k of Array.from(V115_SNAP.keys())) if (k.startsWith(n + '|')) V115_SNAP.delete(k)
+        V115_USERS[n] = { t: 0, data: null, busy: null }
+        SRC_CACHE = { at: 0, data: null }
+        v115CookieChanged(n)      // 换了 Cookie → 立刻解除登录失效冷却 + 丢掉 get_id 缓存
+        srcHealthProbeNow(n > 1 ? 'pan115@' + n : 'pan115')   // 立刻复检：新 Cookie 对不对，几秒内就在卡片上出结果
+      }
+      const cc = v115Cfg(n)
+      return json(res, { ok: true, acct: n, name: cc.name || ('115 网盘 ' + n), ready: v115Ready(n) })
     }
     const o = Object.assign({}, (CFG.pan115 && typeof CFG.pan115 === 'object') ? CFG.pan115 : {})
     if ('cookie' in body) o.cookie = String(body.cookie || '').trim()
@@ -6358,21 +11662,44 @@ async function handleActorApi(req, res, p) {
     if ('cid' in body) o.cid = String(body.cid || '').trim()
     if ('cidName' in body) o.cidName = String(body.cidName || '').trim()
     if ('timeout' in body) o.timeout = Math.max(5, Math.min(120, parseInt(body.timeout, 10) || 20))
+    /* 媒体源卡片显示名（添加页「添加媒体源 → 115 网盘」表单里的「名称」） */
+    if ('name' in body) o.name = String(body.name || '').trim().slice(0, 30)
+    if ('linkTpl' in body && !('savepath' in body)) o.linkTpl = String(body.linkTpl || '').trim()   // 纯媒体库表单也允许改模板
     CFG.pan115 = o; writeCfg()
+    /* 换了凭据就把结论清空：否则「网盘读不了」的旧状态会一直粘着，用户重贴 Cookie 也看不到恢复 */
+    if ('cookie' in body) {
+      const a = v115AuthOf(1); a.ok = null; a.err = ''; a.at = 0
+      V115_SNAP = new Map()
+      V115_USERS[1] = { t: 0, data: null, busy: null }   // 容量/会员也跟着换账号，必须重拉
+      SRC_CACHE = { at: 0, data: null }
+      v115CookieChanged(1)
+      srcHealthProbeNow('pan115')   // 立刻复检（Emby 式：一贴完 Cookie 就自己恢复，不用等冷却）
+    }
     const c = pan115Cfg()
-    return json(res, { ok: true, hasCookie: !!c.cookie, savepath: c.savepath, cid: c.cid, cidName: c.cidName, timeout: c.timeout })
+    return json(res, {
+      ok: true, hasCookie: !!c.cookie, savepath: c.savepath, cid: c.cid, cidName: c.cidName,
+      timeout: c.timeout, linkTpl: v115Cfg().linkTpl || '', name: c.name || '',
+      pushAcct: pan115PushAcctOf(), accts: v115AcctListAll().map(a => { const cc = v115Cfg(a); return { acct: a, name: String(cc.name || '').trim() || ('115 网盘 ' + a), ready: v115Ready(a) } }),
+      fileOk: v115AuthOf(1).ok, fileError: v115AuthOf(1).err, authNote: v115AuthNote(1),
+      space: null, vip: null, user: '', userErr: ''
+    })
   }
-  if (p === '/api/115/dirs') {   // 目标文件夹下拉：列出 cid 下的子目录 + 面包屑路径
+  if (p === '/api/115/dirs') {   // 目标文件夹下拉：列出 cid 下的子目录 + 面包屑路径（acct=浏览哪个账号的网盘，缺省推送账号）
     const q = new URL(req.url, 'http://x')
     const cid = (q.searchParams.get('cid') || '0').replace(/[^\d]/g, '') || '0'
-    if (!pan115Cfg().cookie) return json(res, { ok: false, error: '还没有填写 115 cookie' })
+    const acct = Math.max(1, parseInt(q.searchParams.get('acct'), 10) || pan115PushAcctOf())
+    if (!pan115Cfg(acct).cookie) return json(res, { ok: false, error: '该账号还没有填写 115 cookie（账号 ' + acct + '）' })
     try {
-      const r = await pan115Request('https://webapi.115.com/files?cid=' + cid + '&show_dir=1&limit=1000&o=user_ptime&asc=0&format=json')
+      const r = await pan115Request('https://webapi.115.com/files?cid=' + cid + '&show_dir=1&limit=1000&o=user_ptime&asc=0&format=json', { acct })
       const j = r.json
       if (!j || j.state !== true) {
         const msg = (j && (j.error || j.errorMsg || j.errNo)) || ('HTTP ' + r.status)
+        /* 这条和扫描/匹配文件打的是同一个 webapi/files —— 顺手把「网盘可读」状态带出来，
+         * 用户在设置页拉目录失败时就不会只看到一句「读取目录失败」而不知道网盘整体不可读了 */
+        if (v115AuthErr(msg)) v115MarkAuth(false, String(msg), acct)
         return json(res, { ok: false, error: '读取目录失败（' + msg + '）' })
       }
+      v115MarkAuth(true, '', acct)
       const dirs = (j.data || []).filter(x => x && x.pid !== undefined && x.cid !== undefined && x.n)
         .map(x => ({ cid: String(x.cid), name: x.n, cnt: Number(x.m) || 0 }))
       const path = (j.path || []).map(p2 => ({ cid: String(p2.cid), name: p2.name || '' }))
@@ -6380,21 +11707,43 @@ async function handleActorApi(req, res, p) {
     } catch (e) { return json(res, { ok: false, error: e.message }) }
   }
   if (p === '/api/115/test') {   // 验证 cookie：主验证走任务列表（cookie 有效必返回 state:true + 配额），get_id 只作补充
-    const c = pan115Cfg()
-    if (!c.cookie) return json(res, { ok: false, error: '还没有填写 115 cookie' })
+    /* 多账号（2026-10-15）：body.acct / ?acct= 指定测哪个账号，缺省 = 配置的推送账号。
+       推送已支持任意账号 → 每个账号都做完整验证（离线推送通道 task_lists + 网盘文件接口 webapi/files + 配额）。 */
+    /* ⚠ 本段作用域没有预解析的 URL 对象（别段的 u/uq 在这里都不存在），按本段惯例现场解析 */
+    const tn = Math.max(1, parseInt((body && body.acct) || (new URL(req.url, 'http://x').searchParams.get('acct')), 10) || pan115PushAcctOf())
+    const c = pan115Cfg(tn)
+    if (!c.cookie) return json(res, { ok: false, error: '该账号还没有填写 115 cookie' + (tn > 1 ? ('（账号 ' + tn + '，在 媒体源 里配置）') : '') })
     try {
-      const tr = await pan115Request('https://clouddownload.115.com/web/?ac=task_lists&page=1&page_size=1&stat=1')
+      let id = null, quota = null, uid = (c.cookie.match(/UID=(\d+)/i) || [])[1] || ''
+      const tr = await pan115Request('https://clouddownload.115.com/web/?ac=task_lists&page=1&page_size=1&stat=1', { acct: tn })
       const tj = tr.json
       if (!tj || tj.state !== true) {
         const msg = (tj && (tj.error || tj.errorMsg || tj.errtype)) || ('HTTP ' + tr.status + (tr.text ? ' ' + tr.text.slice(0, 80) : ''))
         return json(res, { ok: false, error: 'cookie 无效或已过期（' + msg + '）—— 去 115 网页版重新复制（要含 UID/CID/SEID）' })
       }
-      let id = null
-      try { id = await pan115GetId() } catch (_) {}
-      const uid = (id && id.uid) || (c.cookie.match(/UID=(\d+)/i) || [])[1] || ''
+      try { id = await pan115GetId(tn) } catch (_) {}
+      uid = (id && id.uid) || uid
       /* 任务列表自带离线配额：quota=已用，total=总量（2026-09 实测 {"quota":1421,"total":1500}） */
-      const quota = tj.total ? { total: tj.total, used: tj.quota } : null
-      return json(res, { ok: true, uid, signed: !!(id && id.userkey), destCid: (id && id.destCid) || '', savepath: c.savepath, cid: c.cid, cidName: c.cidName, quota })
+      quota = tj.total ? { total: tj.total, used: tj.quota } : null
+      /* ★ 再单独探一次「网盘能不能读」—— 上面那条是**离线推送**接口，
+       *   两者鉴权不同：实测 2026-10-13 推送接口 state:true 而 webapi/files 已 errNo 990001。
+       *   不分开测的话，用户会看到「✓ 连接成功」却怎么都扫不到/匹配不到网盘文件。 */
+      let fileOk = v115AuthOf(tn).ok, fileError = v115AuthOf(tn).err
+      /* 60 秒内刚确认过「网盘能读」就复用结论 —— 反复点「测试连接」不该反复打 115 接口（风控优化）。
+       * 没有近期结论时才探一次，且走快照（根目录快照就够判断可读性）。 */
+      if (!(fileOk === true && Date.now() - v115AuthOf(tn).at < 60000)) {
+        try {
+          await v115List('0', false, tn)
+          fileOk = true; fileError = ''
+        } catch (e) {
+          fileOk = false; fileError = (e && e.message) || '未知错误'
+        }
+      }
+      return json(res, {
+        ok: true, acct: tn, uid, signed: !!(id && id.userkey), destCid: (id && id.destCid) || '',
+        savepath: c.savepath, cid: c.cid, cidName: c.cidName, quota,
+        fileOk, fileError
+      })
     } catch (e) { return json(res, { ok: false, error: e.message }) }
   }
   if (p === '/api/115/push') {   // 推送磁力：body { code, magnets: [..] }
@@ -6405,8 +11754,8 @@ async function handleActorApi(req, res, p) {
     const results = []
     for (const m of magnets) { try { results.push(Object.assign({ magnet: m }, await pan115AddOne(m))) } catch (e) { results.push({ magnet: m, ok: false, error: e.message }) } }
     const okN = results.filter(r => r.ok).length
-    if (okN > 0) watch115Push(String(body.code || ''))   // 推送成功 → 登记自动认领盯梢
-    return json(res, { ok: okN > 0, code: String(body.code || ''), pushed: okN, total: magnets.length, results, savepath: c.savepath })
+    if (okN > 0) watch115Push(String(body.code || ''), c.acct)   // 推送成功 → 登记自动认领盯梢（记下推到哪个账号，展示用）
+    return json(res, { ok: okN > 0, code: String(body.code || ''), pushed: okN, total: magnets.length, results, savepath: c.savepath, acct: c.acct, acctName: c.name || ('115 网盘 ' + c.acct) })
   }
   if (p === '/api/115/watch') {   // 自动认领盯梢状态：body { code }（可空）→ 任务列表（详情页轮询本页番号的任务）
     const code = norm(String(body.code || ''))
@@ -6427,6 +11776,394 @@ async function handleActorApi(req, res, p) {
       return json(res, { ok: true, tasks, count: (j.count != null ? j.count : tasks.length) })
     } catch (e) { return json(res, { ok: false, error: e.message }) }
   }
+  /* ---------- 115 网盘「媒体库来源」----------
+   * 与上面的「离线推送」是两件事：推送是把磁力丢给 115 下载；这里是**把 115 上的目录当媒体库根**，
+   * 扫描时走 API 列目录（不落本地盘），播放时服务端取 302 直链后代理转发。
+   * 归属 CFG.pan115.roots = [{ cid, name, path }]，与本地 LIBS 并列但不混在一起。 */
+  if (p === '/api/115/lib') {   // 状态：Cookie 是否配好 + 已添加的网盘根目录 + 收录统计（多账号：accts 数组逐账号一份）
+    const c = v115Cfg(1)
+    const accts = v115AcctListAll().map(n => {
+      const cx = v115Cfg(n), auth = v115AuthOf(n), ui = v115UserCached(n)
+      return {
+        acct: n, key: n > 1 ? 'pan115@' + n : 'pan115',
+        name: n > 1 ? (cx.name || ('115 网盘 ' + n)) : (cx.name || '115 网盘'),
+        hasCookie: !!String(cx.cookie || '').trim(),
+        user: (ui && ui.user) || '',
+        roots: v115Roots(n).map(r => Object.assign({}, r, { acct: n })),
+        stats: v115Stats(n), authOk: auth.ok, authNote: v115AuthNote(n)
+      }
+    })
+    return json(res, {
+      ok: true, hasCookie: !!c.cookie, linkTpl: c.linkTpl || '', accts,
+      roots: v115Roots(1), stats: v115Stats(1), mapped: V115_MAP.size,
+      throttle: v115ThrottleState(),
+      blocked: v115BlockedNow() ? { remainMin: v115BlockRemain(), msg: V115_BLOCK_MSG } : null
+    })
+  }
+  if (p === '/api/115/lib/browse') {   // 浏览网盘目录（只列一层，前端逐级下钻 + 多选）
+    const q = new URL(req.url, 'http://x')
+    const cid = String(q.searchParams.get('cid') || '0').replace(/[^\d]/g, '') || '0'
+    const acct = Math.max(1, parseInt(q.searchParams.get('acct'), 10) || 1)
+    const fresh = q.searchParams.get('fresh') === '1'
+    if (!v115Cookie(acct)) return json(res, { ok: false, hasCookie: false, error: '还没有填写 115 Cookie —— 在「设置 → 115 推送」里粘贴（两个功能共用这一份）' })
+    try {
+      /* ⚠ 默认**走 10 分钟快照**，不再每次实时打接口（2026-10-13 风控优化）：
+       * 用户在弹层里逐级下钻 / 来回切目录 = 一连串实时请求，是触发 405 的主要来源之一。
+       * 想看最新目录时前端会带 ?fresh=1（弹层里的「⟳ 刷新目录」按钮）。 */
+      const items = await v115List(cid, fresh, acct)
+      const snap = V115_SNAP.get(acct + '|' + String(cid)) || null
+      const ageMin = snap && snap.t ? Math.round((Date.now() - snap.t) / 60000) : 0
+      const dirs = items.filter(x => x.isDir && x.id).map(x => ({ cid: x.id, name: x.name }))
+      const vids = items.filter(x => !x.isDir && VIDEO_EXT.includes(extOf(x.name)))
+      return json(res, { ok: true, acct, cid, fresh: !!fresh, ageMin, dirs, videos: vids.length, samples: vids.slice(0, 5).map(x => x.name) })
+    } catch (e) {
+      /* 把失败原因结构化带出去：前端要区分「没 Cookie」（要去贴）和「405 限流冷却」（等几分钟自动恢复），
+       * 不能一律弹「去粘贴 Cookie」—— 那对被限流的用户是误导（2026-10-13 实测反馈）。 */
+      return json(res, {
+        ok: false, hasCookie: true, error: e.message,
+        blocked: v115BlockedNow() ? { remainMin: v115BlockRemain(), msg: V115_BLOCK_MSG } : null
+      })
+    }
+  }
+  if (p === '/api/115/lib/add') {   // 把网盘目录收进媒体库（支持一次加多个：body.roots=[{cid,name,path}]，加完只重扫一次；body.acct 指定账号）
+    const acct = Math.max(1, parseInt(body.acct, 10) || 1)
+    if (!v115Cookie(acct)) return json(res, { ok: false, error: '还没有填写 115 Cookie' })
+    const list = Array.isArray(body.roots) && body.roots.length
+      ? body.roots
+      : [{ cid: body.cid, name: body.name, path: body.path }]     // 兼容旧的单个添加
+    const c = v115Cfg(acct)
+    const added = []
+    let skipped = 0, bad = 0
+    for (const r of list) {
+      const cid = String((r && r.cid) || '').replace(/[^\d]/g, '')
+      if (!cid) { bad++; continue }
+      if (c.roots.some(x => String(x.cid) === cid)) { skipped++; continue }
+      const name = String((r && r.name) || '').trim()
+      const pth = String((r && r.path) || '').trim().replace(/^\/+|\/+$/g, '')
+      const root = { cid, name: name || pth || cid, path: pth, acct }
+      c.roots.push(root)
+      added.push(root)
+    }
+    if (!added.length && !skipped && bad) return json(res, { ok: false, error: '缺少目录 id（请先在浏览里勾选目标文件夹）' })
+    /* 2026-10-14：收录后**只扫新收录的这几个根**（定向扫描），不再全库重扫 ——
+     * 全库重扫要把 115 整树重走一遍，又慢又喂风控；移出媒体库那条路仍走全量（要把条目摘出去）。 */
+    if (added.length) { writeCfg(); rescan({ roots: added.map(r => ({ kind: 'v115', root: r })) }) }
+    console.log('[115' + (acct > 1 ? '@' + acct : '') + '] 收录目录：新增 ' + added.length + '（' + added.map(a => a.name).join('、') + '），重复跳过 ' + skipped + '，无效 ' + bad)
+    return json(res, {
+      ok: true, acct, added: added.length, addedNames: added.map(a => a.name), skipped: skipped, invalid: bad,
+      roots: v115Roots(acct), stats: v115Stats(acct), scanning: SCAN.running
+    })
+  }
+  if (p === '/api/115/lib/remove') {   // 移出媒体库（只删配置，网盘文件不动；body.acct 指定账号）
+    const acct = Math.max(1, parseInt(body.acct, 10) || 1)
+    const c = v115Cfg(acct)
+    const before = c.roots.length
+    /* 批量：body.cids=[...]（编辑弹层里逐行删）/ body.all=true（卡片上「删除媒体源」＝清空这个来源）。
+     * 都只写一次配置、只重扫一次 —— 逐条删会触发多次 rescan。 */
+    if (body.all === true || Array.isArray(body.cids)) {
+      const set = body.all === true ? null : body.cids.map(x => String(x).replace(/[^\d]/g, ''))
+      c.roots = set ? c.roots.filter(r => set.indexOf(String(r.cid)) < 0) : []
+    } else {
+      const cid = String(body.cid || '').replace(/[^\d]/g, '')
+      c.roots = c.roots.filter(r => String(r.cid) !== cid)
+    }
+    const removed = before - c.roots.length
+    if (removed > 0) { writeCfg(); rescan() }
+    return json(res, { ok: true, acct, removed: removed, roots: v115Roots(acct), stats: v115Stats(acct), scanning: SCAN.running })
+  }
+  if (p === '/api/115/lib/config') {   // 自定义直链接口模板（内置接口失效时的兜底） + 清直链缓存（body.acct 指定账号）
+    const acct = Math.max(1, parseInt(body.acct, 10) || 1)
+    const c = v115Cfg(acct)
+    if ('linkTpl' in body) c.linkTpl = String(body.linkTpl || '').trim()
+    if (body.clearUrlCache) V115_URL = new Map()
+    writeCfg()
+    return json(res, { ok: true, acct, linkTpl: c.linkTpl, cacheCleared: !!body.clearUrlCache })
+  }
+  if (p === '/api/115/lib/stream') {   // 备用播放入口（正常播放走 /media/115:/…）
+    const q = new URL(req.url, 'http://x')
+    const pick = String(q.searchParams.get('pick') || '').trim()
+    const acct = Math.max(1, parseInt(q.searchParams.get('acct'), 10) || 1)
+    if (!pick) { res.writeHead(400); return res.end('缺少 pick') }
+    let down = null
+    try { down = await v115DownURL(pick, acct) }
+    catch (e) { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(v115PlayErrText(e, acct)) }
+    return v115Proxy(req, res, down.url, pick, '115:/x.mp4', 0, down.cookie)
+  }
+  /* ---------- WebDAV / 光鸭网盘「媒体库来源」----------
+   * 两个来源共用 davApiRoute()：区别只有 CFG 键名（webdav/guangya）与 relVideo 前缀（dav:/ gy:/）。 */
+  const davApiRoute = async (kind, p, body, res) => {
+    const label = davLabel(kind)
+    /* acct：多账号（2026-10-14）。GET 用 ?acct=，POST 用 body.acct；缺省 1（老行为不变）。 */
+    const qAcct = () => {
+      try { return Math.max(1, parseInt(new URL(req.url, 'http://x').searchParams.get('acct'), 10) || 1) } catch (_) { return 1 }
+    }
+    if (p === '/api/' + kind + '/config') {
+      if (req.method === 'GET') {
+        const n = qAcct()
+        const c = davCfg(kind, n)
+        const isApi = kind === 'guangya' && gyIsApi(kind, n)
+        const auth = DAV_AUTH[davInst(kind, n)] || {}
+        return json(res, {
+          ok: true, acct: n, name: c.name || (n > 1 ? (DAV_DEFNAME[kind] + ' ' + n) : DAV_DEFNAME[kind]),
+          url: c.url || '', user: c.user || '', hasPass: !!c.pass, ready: davReady(kind, n),
+          mode: kind === 'guangya' ? (isApi ? 'api' : 'webdav') : 'webdav',
+          account: kind === 'guangya' ? (c.account || '') : '',
+          hasToken: kind === 'guangya' ? !!(String(c.accessToken || '').trim() || String(c.refreshToken || '').trim()) : false,
+          authOk: davReady(kind, n) ? (auth.ok === undefined ? null : auth.ok) : null, authErr: auth.err || '',
+          roots: davRoots(kind, n), stats: davStats(kind, n),
+          space: davQuotaCached(kind, n)
+        })
+      }
+      const n = Math.max(1, parseInt(body.acct, 10) || 1)
+      const c = davCfg(kind, n)
+      /* 名称：媒体源卡片显示名（空 = 用默认「WebDAV / 光鸭网盘」） */
+      if ('name' in body) c.name = String(body.name || '').trim().slice(0, 30)
+      if ('url' in body) c.url = String(body.url || '').trim().replace(/\/+$/, '')
+      if ('user' in body) c.user = String(body.user || '').trim()
+      /* 密钥支持「留空 = 不改」：表单把已保存的密钥显示成占位符，只在真的输入了新值时才覆盖 */
+      if ('pass' in body && String(body.pass || '') !== '') c.pass = String(body.pass)
+      if (body.clearPass) c.pass = ''
+      /* 光鸭登录途径切换 / 断开：clearToken 连 token 一起清（卡片会随之隐藏，等重新添加） */
+      if (kind === 'guangya') {
+        if (body.mode === 'api' || body.mode === 'webdav') c.mode = body.mode
+        if (body.clearToken) {
+          c.accessToken = ''; c.refreshToken = ''; c.tokenExp = 0; c.account = ''
+          GY_USERS[n] = null
+        }
+      }
+      writeCfg()
+      /* 换了地址/凭据 → 旧快照与容量缓存全部作废（地址都换了，还拿着旧目录列表就是错误信息） */
+      const inst = davInst(kind, n)
+      for (const k of Array.from(DAV_SNAP.keys())) if (k.startsWith(inst + ' ')) DAV_SNAP.delete(k)
+      DAV_QUOTA[inst] = null
+      DAV_AUTH[inst] = { ok: null, err: '' }
+      console.log('[' + inst + '] 配置已保存：url=' + (c.url || '(空)') + ' user=' + (c.user || '(空)') + ' roots=' + c.roots.length +
+        (kind === 'guangya' ? ' mode=' + (gyIsApi(kind, n) ? 'api' : 'webdav') : ''))
+      srcHealthProbeNow(inst)   // 改了地址/密钥就立刻复检：对了马上翻绿，错了马上告诉你错在哪（2026-10-15）
+      return json(res, { ok: true, acct: n, name: c.name || (n > 1 ? (DAV_DEFNAME[kind] + ' ' + n) : DAV_DEFNAME[kind]), ready: davReady(kind, n) })
+    }
+    if (p === '/api/' + kind + '/test') {   // 连接测试：PROPFIND 根目录，附带把容量一并探回来
+      const n = Math.max(1, parseInt(body.acct, 10) || qAcct())
+      if (!davReady(kind, n)) return json(res, { ok: false, error: '请先填写服务器地址、账号和密钥' })
+      const t0 = Date.now()
+      return davQuota(kind, true, n).then(space => {
+        const auth = DAV_AUTH[davInst(kind, n)] || {}
+        return json(res, { ok: auth.ok !== false, acct: n, ms: Date.now() - t0, error: auth.err || '',
+          space, url: davBase(kind, n) })
+      }).catch(e => json(res, { ok: false, error: e.message }))
+    }
+    if (p === '/api/' + kind + '/lib') {   // 状态：凭据是否齐 + 已收录根目录 + 收录统计（多账号：accts 数组逐账号一份）
+      const accts = davAcctListAll(kind).map(n => {
+        const c = davCfg(kind, n), auth = DAV_AUTH[davInst(kind, n)] || {}
+        const isApi = kind === 'guangya' && gyIsApi(kind, n)
+        return {
+          acct: n, key: davInst(kind, n),
+          name: n > 1 ? (c.name || (DAV_DEFNAME[kind] + ' ' + n)) : (c.name || DAV_DEFNAME[kind]),
+          ready: davReady(kind, n), mode: kind === 'guangya' ? (isApi ? 'api' : 'webdav') : 'webdav',
+          account: kind === 'guangya' ? (c.account || '') : (c.user || ''),
+          roots: davRoots(kind, n).map(r => Object.assign({}, r, { acct: n })),
+          stats: davStats(kind, n)
+        }
+      })
+      return json(res, { ok: true, accts, ready: davReady(kind, 1), roots: davRoots(kind, 1), stats: davStats(kind, 1), mapped: DAV_MAP.size })
+    }
+    if (p === '/api/' + kind + '/lib/browse') {   // 浏览网盘目录（只列一层，前端逐级下钻 + 多选）
+      const q = new URL(req.url, 'http://x')
+      const bpath = String(q.searchParams.get('path') || '').replace(/^\/+|\/+$/g, '')
+      const n = Math.max(1, parseInt(q.searchParams.get('acct'), 10) || 1)
+      if (!davReady(kind, n)) return json(res, { ok: false, error: '请先填写 ' + label + ' 的服务器地址、账号和密钥' })
+      try {
+        /* force=true：浏览是用户主动操作，必须看实时目录，不走 10 分钟快照 */
+        const items = await davList(kind, bpath, true, n)
+        const dirs = items.filter(x => x.isDir).map(x => ({ path: x.path.replace(/^\/+/, ''), name: x.name }))
+        const vids = items.filter(x => !x.isDir && VIDEO_EXT.includes(extOf(x.name)))
+        return json(res, { ok: true, acct: n, path: bpath, dirs, videos: vids.length, samples: vids.slice(0, 5).map(x => x.name) })
+      } catch (e) { return json(res, { ok: false, error: e.message }) }
+    }
+    if (p === '/api/' + kind + '/lib/add') {   // 收录目录进媒体库（body.roots=[{path,name}]，加完只重扫一次；body.acct 指定账号）
+      const n = Math.max(1, parseInt(body.acct, 10) || 1)
+      if (!davReady(kind, n)) return json(res, { ok: false, error: '请先填写 ' + label + ' 的服务器地址、账号和密钥' })
+      const list = Array.isArray(body.roots) && body.roots.length ? body.roots : [{ path: body.path, name: body.name }]
+      const c = davCfg(kind, n)
+      const added = []
+      let skipped = 0, bad = 0
+      for (const r of list) {
+        const pth = String((r && r.path) || '').trim().replace(/^\/+|\/+$/g, '')
+        if (!pth) { bad++; continue }
+        if (c.roots.some(x => String(x.path || '').replace(/^\/+|\/+$/g, '') === pth)) { skipped++; continue }
+        const name = String((r && r.name) || '').trim()
+        const root = { path: pth, name: name || pth, acct: n }
+        c.roots.push(root)
+        added.push(root)
+      }
+      if (!added.length && !skipped) return json(res, { ok: false, error: bad ? '目录路径无效' : '没有可添加的目录' })
+      /* 收录后只扫新根（定向扫描），不全库重扫 —— 同 /api/115/lib/add 的 2026-10-14 改动 */
+      if (added.length) {
+        writeCfg()
+        for (const k of Array.from(DAV_SNAP.keys())) if (k.startsWith(davInst(kind, n) + ' ')) DAV_SNAP.delete(k)
+        rescan({ roots: added.map(r => ({ kind, root: r })) })
+      }
+      console.log('[' + davInst(kind, n) + '] 收录目录：新增 ' + added.length + '（' + added.map(a => a.name).join('、') + '），重复跳过 ' + skipped + '，无效 ' + bad)
+      return json(res, { ok: true, acct: n, added: added.length, addedNames: added.map(a => a.name), skipped,
+        invalid: bad, roots: davRoots(kind, n), stats: davStats(kind, n), scanning: SCAN.running })
+    }
+    if (p === '/api/' + kind + '/lib/remove') {   // 移出媒体库（只删配置，网盘文件不动；body.acct 指定账号）
+      const n = Math.max(1, parseInt(body.acct, 10) || 1)
+      const c = davCfg(kind, n)
+      const normP = s => String(s || '').replace(/^\/+|\/+$/g, '')
+      const before = c.roots.length
+      if (body.all === true) c.roots = []
+      else if (Array.isArray(body.paths)) { const set = body.paths.map(normP); c.roots = c.roots.filter(r => set.indexOf(normP(r.path)) < 0) }
+      else c.roots = c.roots.filter(r => normP(r.path) !== normP(body.path))
+      const removed = before - c.roots.length
+      if (removed > 0) { writeCfg(); rescan() }
+      return json(res, { ok: true, acct: n, removed, roots: davRoots(kind, n), stats: davStats(kind, n), scanning: SCAN.running })
+    }
+    /* ---------- 光鸭专有：官方接口登录（短信验证码 / 粘贴 Token）----------
+     * 登录中间态存 GY_SMS（10 分钟有效）；成功后 token 落 CFG.guangya[.x]，mode='api'。
+     * 多账号（2026-10-14）：body.acct 指定登录到哪个账号槽（缺省 1 = 老行为）。 */
+    if (kind === 'guangya') {
+      if (p === '/api/guangya/sms/send' && req.method === 'POST') {
+        const n = Math.max(1, parseInt(body.acct, 10) || 1)
+        /* ⚠ 手机号必须规范成官方要求的「+86 13800138000」形态：少区号在 signin 会被 HTTP 400 拒掉
+         *   （2026-10-13 用户实测报的「登录失败：HTTP 400」就是这个）。四步登录全程用同一个串。 */
+        const phone = gyNormPhone(body.phone)
+        if (!phone) return json(res, { ok: false, error: '手机号格式不对（填 13800138000 即可，会自动补 +86）' })
+        /* captcha_token：与 AList GuangYaPan 驱动一致，也是**可人工填**的一项
+         * （AList 文档：「如果页面要求 captcha_token，先按提示完成验证码校验，再填写验证码」）。
+         * 两条路：用户填了就用他过完人机的 token；没填就自己向 /v1/shield/captcha/init 要一个。 */
+        const manualCaptcha = String(body.captchaToken || '').trim()
+        try {
+          let captchaToken = manualCaptcha
+          if (!captchaToken) {
+            const init = await gyFetch(GY_ACC_BASE + '/v1/shield/captcha/init', {
+              headers: gyAccHeaders(n), json: {
+                client_id: GY_CLIENT_ID, action: 'POST:/v1/auth/verification',
+                device_id: gyDid(n), meta: { phone_number: phone }
+              }
+            })
+            const d0 = gyUnwrap(init.j) || {}
+            captchaToken = d0.captcha_token || ''
+            if (!captchaToken) {
+              /* init 没给 captcha_token：多半触发了网页端人机验证（滑块）——
+               * 让用户自己去网页过一遍，把拿到的 captcha_token 填回来（AList 就是这么做的）。 */
+              const why = gyErrDetail(init.status, init.j, init.text)
+              if (/captcha|verify|challenge|slide|人机/i.test(why)) {
+                return json(res, { ok: false, needCaptcha: true, error: '光鸭要求先过网页人机验证，短信发不出去。请到 guangyapan.com 触发一次登录验证（F12 → Network 里搜 captcha）把 captcha_token 填到上面的输入框，或改用「粘贴 Token」方式登录。' })
+              }
+              return json(res, { ok: false, error: '验证码初始化失败：' + why })
+            }
+          }
+          const sent = await gyFetch(GY_ACC_BASE + '/v1/auth/verification', {
+            headers: gyAccHeaders(n, { 'x-captcha-token': captchaToken }),
+            json: { phone_number: phone, target: 'ANY', client_id: GY_CLIENT_ID }
+          })
+          const d1 = gyUnwrap(sent.j) || {}
+          if (sent.status !== 200 || !d1.verification_id) {
+            return json(res, { ok: false, error: '验证码发送失败：' + gyErrDetail(sent.status, sent.j, sent.text) })
+          }
+          GY_SMS.phone = phone; GY_SMS.captchaToken = captchaToken
+          GY_SMS.verificationId = d1.verification_id; GY_SMS.t = Date.now(); GY_SMS.acct = n
+          console.log('[guangya' + (n > 1 ? '@' + n : '') + '] 短信验证码已发送：' + gyMask(phone))
+          return json(res, { ok: true, acct: n, phone: gyMask(phone) })
+        } catch (e) { return json(res, { ok: false, error: e.message }) }
+      }
+      if (p === '/api/guangya/sms/verify' && req.method === 'POST') {
+        if (!GY_SMS.verificationId || Date.now() - GY_SMS.t > 10 * 60 * 1000) {
+          return json(res, { ok: false, error: '登录会话已过期，请重新发送验证码' })
+        }
+        const n = Math.max(1, parseInt(body.acct, 10) || GY_SMS.acct || 1)
+        const code = String(body.code || '').trim()
+        if (!code) return json(res, { ok: false, error: '请输入收到的短信验证码' })
+        try {
+          const vf = await gyFetch(GY_ACC_BASE + '/v1/auth/verification/verify', {
+            headers: gyAccHeaders(n),
+            json: { verification_id: GY_SMS.verificationId, verification_code: code, client_id: GY_CLIENT_ID }
+          })
+          const d2 = gyUnwrap(vf.j) || {}
+          /* 验证码是一次性的（AList 文档同样注明）——失败多为「填错」或「这条码已经用过」 */
+          if (!d2.verification_token) return json(res, { ok: false, error: '验证码不对或已被使用（光鸭验证码一次性，一次登录只能用一个）：请重新「发送验证码」再试 → ' + gyErrDetail(vf.status, vf.j, vf.text) })
+          const si = await gyFetch(GY_ACC_BASE + '/v1/auth/signin', {
+            headers: gyAccHeaders(n, { 'x-captcha-token': GY_SMS.captchaToken }),
+            json: {
+              verification_code: code, verification_token: d2.verification_token,
+              username: GY_SMS.phone, client_id: GY_CLIENT_ID
+            }
+          })
+          const d3 = gyUnwrap(si.j) || {}
+          if (si.status !== 200 || !d3.access_token) {
+            return json(res, { ok: false, error: '登录失败：' + gyErrDetail(si.status, si.j, si.text) })
+          }
+          const c = davCfg('guangya', n)
+          c.mode = 'api'
+          c.accessToken = d3.access_token
+          c.refreshToken = String(d3.refresh_token || '') || c.refreshToken
+          if (d3.expires_in) c.tokenExp = Date.now() / 1000 + Number(d3.expires_in)
+          writeCfg()
+          const inst = davInst('guangya', n)
+          for (const k of Array.from(DAV_SNAP.keys())) if (k.startsWith(inst + ' ')) DAV_SNAP.delete(k)
+          DAV_QUOTA[inst] = null
+          DAV_AUTH[inst] = { ok: true, err: '' }
+          GY_USERS[n] = null
+          GY_SMS.verificationId = ''
+          gyUserInfo(n, true).catch(() => {})      // 后台补账号名/容量，不阻塞登录返回
+          srcHealthProbeNow(inst)                  // 登录成功 → 立刻复检一次，卡片马上从「登录失效」翻绿（2026-10-15）
+          console.log('[guangya' + (n > 1 ? '@' + n : '') + '] 短信验证码登录成功：' + gyMask(GY_SMS.phone))
+          return json(res, { ok: true, acct: n, mode: 'api', user: c.account || gyMask(GY_SMS.phone) })
+        } catch (e) { return json(res, { ok: false, error: e.message }) }
+      }
+      if (p === '/api/guangya/token' && req.method === 'POST') {
+        /* 粘贴 Token：网页版 guangyapan.com 登录后 F12 → 应用 → Local Storage → token 键里的
+         * access_token / refresh_token。填 refresh_token 最划算（能自动续期）。 */
+        const n = Math.max(1, parseInt(body.acct, 10) || 1)
+        const at = String(body.accessToken || '').trim()
+        const rt = String(body.refreshToken || '').trim()
+        if (!at && !rt) return json(res, { ok: false, error: '请粘贴 access_token 或 refresh_token（至少一个）' })
+        const c = davCfg('guangya', n)
+        c.mode = 'api'
+        if (at) c.accessToken = at
+        if (rt) c.refreshToken = rt
+        c.tokenExp = 0
+        if ('name' in body) c.name = String(body.name || '').trim().slice(0, 30)
+        writeCfg()
+        const inst = davInst('guangya', n)
+        for (const k of Array.from(DAV_SNAP.keys())) if (k.startsWith(inst + ' ')) DAV_SNAP.delete(k)
+        DAV_QUOTA[inst] = null
+        DAV_AUTH[inst] = { ok: null, err: '' }
+        GY_USERS[n] = null
+        /* 验活：user/me 打得通才算真的登录上了（失败也保存，给 warning 让用户自己看） */
+        try {
+          const u = await gyUserInfo(n, true)
+          srcHealthSet(inst, 'ok', '')      // 验活通了 → 健康表立刻翻绿（卡片同步，2026-10-15）
+          return json(res, { ok: true, acct: n, mode: 'api', user: (u && u.user) || '' })
+        } catch (e) {
+          srcHealthSet(inst, 'auth', e.message)
+          return json(res, { ok: true, acct: n, warn: 'Token 已保存，但验活没通过：' + e.message, mode: 'api' })
+        }
+      }
+      if (p === '/api/guangya/logout' && req.method === 'POST') {
+        const n = Math.max(1, parseInt(body.acct, 10) || 1)
+        const c = davCfg('guangya', n)
+        c.accessToken = ''; c.refreshToken = ''; c.tokenExp = 0; c.account = ''; c.mode = ''
+        GY_USERS[n] = null
+        writeCfg()
+        const inst = davInst('guangya', n)
+        for (const k of Array.from(DAV_SNAP.keys())) if (k.startsWith(inst + ' ')) DAV_SNAP.delete(k)
+        DAV_QUOTA[inst] = null
+        DAV_AUTH[inst] = { ok: null, err: '' }
+        return json(res, { ok: true, acct: n })
+      }
+      /* 光鸭「新增账号」：清空一个空槽，让前端表单知道下一个可用账号号 */
+      if (p === '/api/guangya/acct/next' && req.method === 'GET') {
+        return json(res, { ok: true, acct: davAcctNext('guangya') })
+      }
+    }
+    return null
+  }
+  for (const dk of DAV_KINDS) {
+    const hit = await davApiRoute(dk, p, body, res)
+    if (hit !== null) return hit
+  }
   if (p === '/api/online/image') {   // 线上封面/剧照直取（封面本身就在国内 CDN 上）
     const q = new URL(req.url, 'http://x')
     const u = q.searchParams.get('u') || ''
@@ -6438,19 +12175,11 @@ async function handleActorApi(req, res, p) {
       return res.end(r.buf)
     } catch (_) { res.writeHead(404); return res.end('Not Found') }
   }
-  /* ---------- 海报墙缩略图：/thumb/<番号>/<poster|fanart> ----------
-   * 全尺寸原图（海报可到 1032×1468、大图 2184×1468，单张几百 KB ~ 1MB）直接喂墙会拖慢滚动，
-   * 这里用 ffmpeg 压成墙用小图（海报限高 720 / 大图限宽 960），原图仍留给详情页。
-   * 缩略图缓存 cache/thumbs/，按源图 mtime 失效；生成失败回退原图。 */
-  const MT = /^\/thumb\/([A-Za-z0-9._-]+)\/(poster|fanart)$/.exec(p)
-  if (MT) {
-    const tb = await movieThumb(MT[1], MT[2])
-    if (tb) {
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': tb.length, 'Cache-Control': 'public, max-age=604800' })
-      return res.end(tb)
-    }
-    return sendFile(req, res, path.join(cacheDir(), 'movies', MT[1], 'images', MT[2] + '.jpg'))
-  }
+  /* ⚠ 海报墙缩略图 /thumb/<番号>/<poster|fanart> 的路由已挪到主 createServer 处理器里。
+   * 原来它写在这儿（handleActorApi 内部），而 handleActorApi 只被 /api/actor|offline|import|scrape|images
+   * 这几类路径调用 —— /thumb/ 永远进不来，前端 thumbOf() 改写后全部 404，再静默回退全尺寸原图，
+   * 于是「缩略图优化」等于没生效，首页铺几百张 1MB 海报（Mac 上尤其慢，因为还没 ffmpeg）。 */
+
   /* ---------- 外挂字幕：找同目录同名字幕，srt/ass 现场转成 WebVTT 再喂给 <track>（浏览器只认 vtt） ---------- */
   if (p === '/api/subs') {
     const rel = String(body.rel || '')
@@ -6494,6 +12223,19 @@ async function handleActorApi(req, res, p) {
     return json(res, { ok: true, started: true })
   }
   if (p === '/api/rank/status') return json(res, { ok: true, running: RANKUP.running, phase: RANKUP.phase, error: RANKUP.error, added: RANKUP.added, count: RANKUP.count, finishedAt: RANKUP.finishedAt, updatedAt: rankUpdatedAt(), rankAuto: CFG.rankAuto !== false, rankHour: rankHour() })
+  /* ---------- 网盘死链检测：POST 开始 / 停止 / 清空，GET 查状态与结果 ---------- */
+  if (p === '/api/audit/deadlink') {
+    if (req.method === 'GET') {
+      return json(res, {
+        ok: true, running: DL.running, at: DL.at, total: DL.total, done: DL.done,
+        dead: DL.dead, note: DL.note, err: DL.err
+      })
+    }
+    const act = String((body && body.act) || 'run')
+    if (act === 'stop') { DL.cancel = true; return json(res, { ok: true }) }
+    if (act === 'clear') { DL.dead = []; DL.at = 0; DL.note = ''; dlSave(); return json(res, { ok: true }) }
+    return json(res, await dlScan())
+  }
   /* ---------- 女优名册自动同步：GET 查状态 / POST 立即拉一次（每日自动由内置定时器负责） ---------- */
   if (p === '/api/roster/sync') {
     if (req.method === 'GET') {
@@ -6748,6 +12490,37 @@ async function handleActorApi(req, res, p) {
       return json(res, { ok: false, error: e.message })
     }
   }
+  /* 女优重名合并表：GET 读全表；POST 改（set / setMany / unset / clear）。
+   * 前端拿到 map 后作废女优名册缓存重算，所以这里的写必须落盘成功再返回 ok。 */
+  if (p === '/api/actor/merge') {
+    try {
+      if (req.method === 'GET') return json(res, { ok: true, map: readMerge() })
+      const map = readMerge()
+      const act = String(body.action || 'set')
+      if (act === 'set') {
+        const d = String(body.merged || '').trim()
+        if (!mergeAdd(map, d, body.keep)) {
+          return json(res, { ok: false, error: '这两个名字已经（或互相）合并过了：先撤销原来那条，或换一个保留名', map })
+        }
+      } else if (act === 'setMany') {
+        const src = (body.map && typeof body.map === 'object') ? body.map : {}
+        let n = 0
+        for (const d of Object.keys(src)) if (mergeAdd(map, d, src[d])) n++
+        if (!n) return json(res, { ok: false, error: '没有可合并的名字（可能都已经合并过了）', map })
+      } else if (act === 'unset') {
+        delete map[String(body.merged || '').trim()]
+      } else if (act === 'clear') {
+        for (const k of Object.keys(map)) delete map[k]
+      } else {
+        return json(res, { ok: false, error: '未知操作：' + act, map })
+      }
+      writeMerge(map)
+      const dk = String(body.merged || '').trim()
+      return json(res, { ok: true, map, keep: map[dk] || '', count: Object.keys(map).length })
+    } catch (e) {
+      return json(res, { ok: false, error: e.message })
+    }
+  }
   /* 聚合刮削：一次拿回「资料候选 + 头像候选」，前端列表选择后再保存（只读，不落盘） */
   if (p === '/api/actor/probe') {
     const name = String(body.name || '').trim()
@@ -6827,17 +12600,96 @@ async function handleActorApi(req, res, p) {
     })
   }
   /* ---------- Emby 式媒体库管理：挂载点只作权限边界，媒体库 = 设置里选的子文件夹 ---------- */
+  /* ---------- 媒体源（添加页「媒体源」卡片 + 统计，2026-10-13） ----------
+   * 把「视频目录 / 115 网盘」并成一组来源，每个来源一张卡片：影片数、封面数、预览视频数、
+   * 视频段数（成/败）与缓存占用。归属规则：relVideo 以 115:/ 开头 = 115 网盘来源，其余 = 本地存储。
+   * 目录体量要递归 stat，60s 内存缓存（管理页轮询不卡盘）。 */
+  if (p === '/api/sources/media') {
+    if (req.method === 'GET') {
+      const now = Date.now()
+      /* fresh=1（卡片右键「刷新容量与统计」）= 用户明确要最新 → 同步重算等他
+       * ⚠ 这个变量必须在本块内定义（2026-10-15 重写时漏掉 → 接口全程抛 "fresh is not defined"、
+       *   媒体源卡片整片空白，用户报「状态都不显示」）。 */
+      const fresh = new URL(req.url, 'http://x').searchParams.get('fresh') === '1'
+      /* stale-while-revalidate：sourcesPayload 要遍历全部番号目录的 images/（实测 ~1900 条要 2s），
+       * 60s 缓存一过期用户进页面就干等 —— 有旧数据先秒回旧的，后台静默重建，下一轮自动是新的。 */
+      if (!SRC_CACHE.data || fresh) SRC_CACHE = { at: now, data: sourcesPayload(fresh) }
+      else if (now - SRC_CACHE.at >= SRC_TTL && !SRC_REBUILDING) {
+        SRC_REBUILDING = true
+        setImmediate(() => { try { SRC_CACHE = { at: Date.now(), data: sourcesPayload() } } catch (_) {} finally { SRC_REBUILDING = false } })
+      }
+      /* 容量/会员还没拉过（或已过期）→ 后台补一发；下一轮卡片刷新就有数据，本请求不等它。
+       * 拿到后把统计缓存标记过期（at=0）→ 下一次请求走 SWR 后台重建，卡片上就能显示容量/会员行（2026-10-15）。 */
+      for (const n of v115AcctList()) if (v115Cookie(n) && !v115UserCached(n)) {
+        v115UserInfo(false, n).then(() => { SRC_CACHE.at = 0 }).catch(() => {})
+      }
+      return json(res, SRC_CACHE.data)
+    }
+    return json(res, { ok: false, error: '只支持 GET' })
+  }
+  /* ---------- 来源健康（2026-10-15）：掉线自愈的状态出口 ----------
+   * GET  /api/srchealth        → 各来源当前状态 + 原因 + 上次/下次复检时间（前端画状态点、恢复时弹提示）
+   * POST /api/srchealth/probe  → 立刻复检某个 key（卡片上的「重连」按钮）或全部（key 省略） */
+  if (p === '/api/srchealth') {
+    if (req.method !== 'GET') { res.writeHead(405); return res.end() }
+    srcHealthSeed()
+    return json(res, {
+      ok: true, at: Date.now(),
+      list: Object.keys(SRC_HEALTH).map(k => Object.assign({}, SRC_HEALTH[k])),
+      down: Object.keys(SRC_HEALTH).filter(k => SRC_HEALTH[k].state !== 'ok' && SRC_HEALTH[k].state !== 'unknown')
+    })
+  }
+  if (p === '/api/srchealth/probe') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    const key = String(body.key || '').trim()
+    if (key) {
+      if (srcHealthKeys().indexOf(key) < 0) return json(res, { ok: false, error: '没有这个来源：' + key })
+      await srcHealthProbe(key)
+      return json(res, { ok: true, key, health: srcHealthOf(key) })
+    }
+    const keys = srcHealthKeys()
+    for (const k of keys) { try { await srcHealthProbe(k) } catch (_) {} }
+    return json(res, { ok: true, list: keys.map(k => Object.assign({}, srcHealthOf(k))) })
+  }
   if (p === '/api/library') {
     return json(res, {
-      ok: true, root: MEDIA_ROOT, hostPath: readMediaPathFile() || '',
+      ok: true, root: MEDIA_ROOT, hostPath: readMediaPathFile() || '', native: NATIVE,
       libraries: LIBS, libs: libStats(), scanning: SCAN.running,
+      /* 115 网盘来源（与本地库并列，不属于 LIBS）：Cookie 状态 + 网盘根目录 + 收录统计（多账号：accts 逐账号一份） */
+      v115: {
+        hasCookie: !!v115Cookie(1), roots: v115Roots(1), stats: v115Stats(1),
+        accts: v115AcctListAll().map(n => ({
+          acct: n, key: n > 1 ? 'pan115@' + n : 'pan115',
+          name: n > 1 ? (v115Cfg(n).name || ('115 网盘 ' + n)) : (v115Cfg(n).name || '115 网盘'),
+          hasCookie: !!v115Cookie(n), roots: v115Roots(n), stats: v115Stats(n)
+        })),
+        blocked: v115BlockedNow() ? { remainMin: v115BlockRemain(), msg: V115_BLOCK_MSG } : null
+      },
+      /* WebDAV / 光鸭网盘来源：连接状态 + 根目录 + 收录统计（设置页/管理面板用；多账号：每账号一条） */
+      dav: DAV_KINDS.flatMap(kind => davAcctListAll(kind).map(n => {
+        const c = davCfg(kind, n)
+        const auth = DAV_AUTH[davInst(kind, n)] || { ok: null, err: '' }
+        return {
+          id: kind, acct: n, key: davInst(kind, n),
+          name: n > 1 ? (c.name || (DAV_DEFNAME[kind] + ' ' + n)) : (c.name || DAV_DEFNAME[kind]),
+          ready: davReady(kind, n), url: c.url || '', user: c.user || '',
+          hasCreds: davReady(kind, n), authOk: davReady(kind, n) ? auth.ok : null, authErr: auth.ok === false ? auth.err : '',
+          roots: davRoots(kind, n), stats: davStats(kind, n)
+        }
+      })),
       /* 「添加 → 导入视频整理」用过的目录：设置 → 媒体库里展示，可一键收进媒体库 */
       importDirs: Array.isArray(CFG.importDirs) ? CFG.importDirs : [],
       scan: { running: SCAN.running, phase: SCAN.phase, videos: SCAN.videos, scanned: SCAN.scanned, matched: SCAN.matched, ok: SCAN.okCount, fail: SCAN.failCount, error: SCAN.error, ms: SCAN.ms, finishedAt: SCAN.finishedAt }
     })
   }
   /* 重新扫描（等价「⟳ 重新扫描」）：扫描中调用会在本轮结束后自动再扫一遍 */
-  if (p === '/api/library/rescan') { rescan(); return json(res, { ok: true, scanning: SCAN.running }) }
+  if (p === '/api/library/rescan') {
+    /* 手动重扫 = 用户明确要「看到最新」→ 清掉 115 列目录快照（10 分钟缓存）。
+     * 否则刚离线下载完/刚放进网盘的文件会因为缓存命中而扫不出来（用户点重扫却看不到新片）。 */
+    V115_SNAP = new Map()
+    DAV_SNAP.clear()   // WebDAV / 光鸭 同理
+    rescan(); return json(res, { ok: true, scanning: SCAN.running })
+  }
   /* 番号页「📂 找媒体文件」（v0.2.29）：按番号在媒体库里找文件名/文件夹匹配的视频（手动触发，不自动跑）。
    * 场景：线上详情页推送 115 离线下载完成后，文件落进挂载目录，来这里认领绑定入库。 */
   if (p === '/api/library/matchCode') {
@@ -6862,8 +12714,40 @@ async function handleActorApi(req, res, p) {
         }
       }
     }
+    /* 115 网盘来源：按番号**搜索**（1~2 次请求，2026-10-14 起不再遍历整树 —— 风控）。
+     * 用户刚在网盘里放好/离线下载完就能立刻匹配到。 */
+    for (const m of await v115FindByCode(ccode, code)) {
+      if (seen.has(m.relVideo)) continue
+      seen.add(m.relVideo)
+      matches.push(m)
+    }
+    /* WebDAV / 光鸭：同样实时列目录按番号找（force=true 绕开快照缓存） */
+    for (const m of await davFindAllByCode(ccode)) {
+      if (seen.has(m.relVideo)) continue
+      seen.add(m.relVideo)
+      matches.push(m)
+    }
     matches.sort((a, b) => a.relVideo.localeCompare(b.relVideo))
-    return json(res, { ok: true, code, matches })
+    /* 一条都没搜到时把「为什么搜不到」明说 —— 用户最常踩的两条：
+     *   ① 本地媒体库是空的（根本没添加过目录，磁盘上自然搜不到）；
+     *   ② 115 Cookie 过期了（网盘里的文件一个也列不出来）。
+     * 以前只回一句空列表，用户完全看不出问题在哪（2026-10-13 反馈）。 */
+    const notes = []
+    if (!matches.length) {
+      if (!LIBS.length) notes.push('本机还没配置任何「媒体库目录」（添加影片 → 视频目录），磁盘上没有任何可搜的地方。')
+      else notes.push('已搜过本机 ' + LIBS.length + ' 个媒体库目录，没有文件名或目录名含「' + code + '」的视频。')
+      /* ⚠ 判定顺序（用户可操作性优先）：没 Cookie → 没登记目录 → 搜失败 → 搜过没结果。
+         中间两条别颠倒：「没登记目录」是用户能立刻动手修的，比「搜索接口暂时不可用」更该先看到。 */
+      if (!v115AcctList().some(n => v115Ready(n))) notes.push('115 网盘还没配置 Cookie，网盘里的文件搜不到。')
+      else if (!v115AcctList().some(n => v115Roots(n).length)) notes.push('115 网盘没登记任何目录（设置 → 115 网盘 → 要收录的目录），网盘里的文件搜不到。')
+      else if (V115_FIND_NOTE) notes.push(V115_FIND_NOTE)
+      else notes.push('已用 115 全盘搜索搜过一遍（1 次请求，不遍历目录），没有文件名或目录名含「' + code + '」的视频。')
+      if (DAV_KINDS.some(k => davAcctList(k).some(n => davReady(k, n)))) {
+        if (DAV_FIND_NOTE) notes.push(DAV_FIND_NOTE)
+        else if (!DAV_KINDS.some(k => davAcctList(k).some(n => davRoots(k, n).length))) notes.push('WebDAV/光鸭 已连上但没登记任何目录，网盘里的文件搜不到。')
+      }
+    }
+    return json(res, { ok: true, code, matches, notes })
   }
   /* 把找到的文件绑定到番号：写 manual-codes.json（重扫后仍生效）→ 触发重扫入库。
    * 重扫后该文件的番号取 manualCode，enrichFromCache 会回填本番号已有的离线数据 → 详情页自动变在库。 */
@@ -6871,6 +12755,20 @@ async function handleActorApi(req, res, p) {
     const code = norm(String(body.code || ''))
     const relVideo = String(body.relVideo || '').trim().replace(/\\/g, '/')
     if (!code || !relVideo) return json(res, { ok: false, error: '缺少番号或文件路径' })
+    /* 115 网盘条目：文件本来就在已收录的网盘目录里，没有「绑定本地文件」这回事 —— 重扫一遍即可。
+     * ⚠ 风控优化（2026-10-13）：**不清 V115_SNAP**。能绑到这里说明刚在「📂 匹配文件」里实时列过目录
+     *   （matchCode → v115FindByCode 走实时），而 v115List 无论实时与否都会把结果写进快照，
+     *   所以这份快照已经是新鲜的 —— 直接重扫就能收录，省掉整树重打。 */
+    if (v115Rel(relVideo)) {
+      rescan()
+      return json(res, { ok: true, code, relVideo, scanning: SCAN.running })
+    }
+    /* WebDAV / 光鸭条目同理：文件本来就在网盘目录里，清快照重扫即可 */
+    if (davRel(relVideo)) {
+      DAV_SNAP.clear()
+      rescan()
+      return json(res, { ok: true, code, relVideo, scanning: SCAN.running })
+    }
     if (relVideo.includes('..') || path.isAbsolute(relVideo)) return json(res, { ok: false, error: '非法路径' })
     /* relVideo 相对挂载根（MEDIA_ROOT）；必须落在某个已配置媒体库（LIBS 是挂载根的子目录）里 */
     const fp = path.resolve(MEDIA_ROOT, relVideo)
@@ -6892,18 +12790,43 @@ async function handleActorApi(req, res, p) {
       try { writeCfg() } catch (_) {}
       return json(res, { ok: true, importDirs: CFG.importDirs })
     }
+    /* 批量删除：body.paths=[...]（编辑弹层里逐行删）/ body.all=true（卡片上「删除媒体源」＝清空本地目录）。
+     * 只写一次配置、只重扫一次 —— 逐条删会触发多次 rescan。 */
+    if (p === '/api/library/remove' && (body.all === true || Array.isArray(body.paths))) {
+      const want = body.all === true ? null : body.paths.map(x => path.resolve(String(x)))
+      const gone = []
+      for (const lib of LIBS.slice()) {
+        if (want === null || want.indexOf(path.resolve(lib)) >= 0) { gone.push(lib); LIBS.splice(LIBS.indexOf(lib), 1) }
+      }
+      if (!gone.length) return json(res, { ok: false, error: '没有匹配到任何本地媒体库目录' })
+      if (NATIVE) recomputeMediaRoot()
+      try { writeCfg() } catch (e) { return json(res, { ok: false, error: '保存失败：' + e.message }) }
+      rescan()
+      return json(res, { ok: true, removed: gone, libraries: LIBS, libs: libStats(), scanning: SCAN.running })
+    }
     let raw = String(body.path || '').trim()
     if (!raw) return json(res, { ok: false, error: '请填写文件夹路径' })
-    if (raw === '~' || raw.startsWith('~/')) raw = path.join(MEDIA_ROOT, raw.slice(1))
+    /* ~ 的展开：原生 Windows = 用户主目录（C:\Users\xxx）；容器部署维持原样 = MEDIA_ROOT */
+    if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+      raw = (process.platform === 'win32' && NATIVE)
+        ? path.join(os.homedir(), raw.slice(1).replace(/^[\\/]/, ''))
+        : path.join(MEDIA_ROOT, raw.slice(1))
+    }
     const rp = path.resolve(raw)
-    if (!(rp === MEDIA_ROOT || rp.startsWith(MEDIA_ROOT + path.sep)))
-      return json(res, { ok: false, error: `只能添加挂载进来的目录（${MEDIA_ROOT}）里的文件夹。宿主机的路径在容器里不存在——要挂别的目录请先在 docker-compose.yml 里加一行映射，再重建容器` })
+    if (!NATIVE) {
+      if (!(rp === MEDIA_ROOT || rp.startsWith(MEDIA_ROOT + path.sep)))
+        return json(res, { ok: false, error: `只能添加挂载进来的目录（${MEDIA_ROOT}）里的文件夹。宿主机的路径在容器里不存在——要挂别的目录请先在 docker-compose.yml 里加一行映射，再重建容器` })
+    }
     if (p === '/api/library/add') {
       let st = null
       try { st = fs.statSync(rp) } catch (_) {}
       if (!st || !st.isDirectory())
-        return json(res, { ok: false, error: `路径不存在或不可读：${rp}（检查容器是否已挂载该目录、云盘是否在线）` })
-      if (!LIBS.includes(rp)) LIBS.push(rp)
+        return json(res, { ok: false, error: `路径不存在或不可读：${rp}` + (NATIVE ? '' : '（检查容器是否已挂载该目录、云盘是否在线）') })
+      if (!LIBS.includes(rp)) {
+        LIBS.push(rp)
+        /* 原生模式：加进跨共同祖先的目录时把媒体根扩张到新的共同祖先，保证 relVideo 不含 `..` */
+        if (NATIVE) recomputeMediaRoot()
+      }
       /* 转正成媒体库了 → 从「导入整理用过目录」记录里移除，避免两处重复展示 */
       if (Array.isArray(CFG.importDirs)) {
         CFG.importDirs = CFG.importDirs.filter(x => path.resolve(String(x)) !== rp)
@@ -6912,23 +12835,45 @@ async function handleActorApi(req, res, p) {
       const i = LIBS.indexOf(rp)
       if (i < 0) return json(res, { ok: false, error: '该文件夹不在媒体库列表里' })
       LIBS.splice(i, 1)
+      if (NATIVE) recomputeMediaRoot()
     }
     try { writeCfg() } catch (e) { return json(res, { ok: false, error: '保存失败：' + e.message }) }
     rescan()
     return json(res, {
       ok: true, libraries: LIBS, libs: libStats(), scanning: SCAN.running,
-      warn: rp === MEDIA_ROOT ? '加的是挂载根目录（整根扫描）。挂载点只是权限范围，通常建议改加它下面的子文件夹，例如 ' + MEDIA_ROOT + '/某个子目录' : ''
+      warn: (!NATIVE && rp === MEDIA_ROOT) ? '加的是挂载根目录（整根扫描）。挂载点只是权限范围，通常建议改加它下面的子文件夹，例如 ' + MEDIA_ROOT + '/某个子目录' : ''
     })
   }
   /* ---------- 备份 / 恢复：配置 + 播放记录 + 个人数据打成一个 JSON ----------
    * 换机、清库、重装容器前先导出；恢复时只合并白名单字段，不会动影片文件。 */
   if (p === '/api/backup') {
     if (req.method === 'GET') {
+      /* ⚠ 这份导出里躺着 server-config.json 的全部内容 —— 115 Cookie、多账号 Cookie、
+       *   WebDAV/光鸭的账号密码、GitHub PAT、以及**访问口令本体**。
+       *   原来是无条件原样吐出来的：局域网里任何人一条 GET 就能把全部网盘凭据端走
+       *   （默认没设口令时更是裸奔），比越权访问还严重。
+       * 现在：只有「从本机发出来的」请求才给完整版；外部请求一律把这些字段抹成空串，
+       * 并在 secretsOmitted 里列出抹了哪些，前端可以照实提示用户（凭据请在设置里重填）。
+       * 本机判定用 TCP 对端地址，不看 Host（Host 客户端可以随便写 localhost）。 */
+      const localReq = (typeof isLocalReq === 'function') ? isLocalReq(req) : true
+      let cfg = {}
+      try { cfg = JSON.parse(fs.readFileSync(CFG_FILE, 'utf8')) || {} } catch (_) { cfg = {} }
+      const omitted = []
+      if (!localReq) {
+        const wipe = (o, k) => { try { if (o && typeof o === 'object' && o[k]) { o[k] = ''; omitted.push(k) } } catch (_) {} }
+        ;['accessCode', 'githubToken'].forEach(k => { if (cfg[k]) { cfg[k] = ''; omitted.push(k) } })
+        ;['cookie', 'pass', 'password', 'token', 'refreshToken', 'apiKey'].forEach(k => {
+          wipe(cfg.pan115, k)
+          if (Array.isArray(cfg.pan115x)) cfg.pan115x.forEach(a => wipe(a, k))
+          wipe(cfg.webdav, k)
+          wipe(cfg.guangya, k)
+        })
+      }
       const bundle = {
         app: 'javpaco', version: 1, exportedAt: new Date().toISOString(),
-        config: (() => { try { return JSON.parse(fs.readFileSync(CFG_FILE, 'utf8')) } catch (_) { return {} } })(),
-        watch: WATCH, userdata: UD
+        config: cfg, watch: WATCH, userdata: UD
       }
+      if (omitted.length) bundle.secretsOmitted = [...new Set(omitted)]
       const b = Buffer.from(JSON.stringify(bundle, null, 1))
       const stamp = new Date().toISOString().slice(0, 10)
       res.writeHead(200, {
@@ -6941,7 +12886,7 @@ async function handleActorApi(req, res, p) {
     const applied = []
     try {
       if (inc.config && typeof inc.config === 'object') {
-        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoScrapeNew', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'auto115Watch', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
+        const SAFE = ['proxy', 'proxyEnabled', 'cacheDir', 'metaMode', 'autoScrapeNew', 'probeNetRes', 'autoAvatar', 'autoRescan', 'autoRescanHour', 'auto115Watch', 'rankAuto', 'rankHour', 'hidden', 'uiPrefs', 'libraries', 'importDirs', 'sources', 'priority', 'priorities', 'keywords', 'accessCode', 'favorites', 'subscriptions', 'online', 'pan115']
         SAFE.forEach(k => { if (inc.config[k] !== undefined) CFG[k] = inc.config[k] })
         LIBS = Array.isArray(CFG.libraries) ? CFG.libraries.map(s => path.resolve(String(s))) : []
         writeCfg(); applied.push('配置')
@@ -7006,22 +12951,26 @@ async function handleActorApi(req, res, p) {
     const buf = Buffer.from(m[1], 'base64')
     if (!buf.length) return json(res, { ok: false, error: '裁剪结果为空，请重试' })
     if (buf.length > 12 * 1024 * 1024) return json(res, { ok: false, error: '图片过大（超过 12MB），请缩小裁剪范围' })
+    /* kind：poster（竖版海报，默认）/ fanart（横版主图）。
+     * 播放器「存为封面」传 fanart —— 视频帧本来就是横的，塞进竖版海报会被裁得很难看。 */
+    const kind = String(body.kind || 'poster') === 'fanart' ? 'fanart' : 'poster'
     const safe = String(code).replace(/[^\w.-]/g, '_')
     const dir = path.join(cacheDir(), 'movies', safe, 'images')
     try { fs.mkdirSync(dir, { recursive: true }) } catch (_) {}
-    const fp = path.join(dir, 'poster.jpg')
+    const fp = path.join(dir, kind + '.jpg')
     try { fs.writeFileSync(fp, buf) } catch (e) { return json(res, { ok: false, error: '写入失败：' + e.message }) }
-    /* 回写 meta.json：海报指向本地文件 + 记尺寸/来源/时间（前端据此显示分辨率与「手动裁剪」标记） */
+    /* 回写 meta.json：图片指向本地文件 + 记尺寸/来源/时间（前端据此显示分辨率与「手动裁剪」标记） */
     const meta = readMovieCache(code) || { code }
     meta.code = meta.code || code
     meta.images = Object.assign({}, meta.images || {})
     const sz = imgSize(fp) || {}
-    meta.images.poster = '/cache/movies/' + safe + '/images/poster.jpg'
-    meta.images.posterManual = true
-    meta.images.posterSrc = 'manual-crop'
-    meta.images.posterMeta = { w: sz.w || 0, h: sz.h || 0, bytes: buf.length, src: 'manual-crop' }
+    const relImg = '/cache/movies/' + safe + '/images/' + kind + '.jpg'
+    meta.images[kind] = relImg
+    meta.images[kind === 'poster' ? 'posterManual' : 'fanartManual'] = true
+    meta.images[kind === 'poster' ? 'posterSrc' : 'fanartSrc'] = 'manual-crop'
+    meta.images[kind === 'poster' ? 'posterMeta' : 'fanartMeta'] = { w: sz.w || 0, h: sz.h || 0, bytes: buf.length, src: 'manual-crop' }
     /* 存下裁剪构图（归一化到原底图的 0~1 区间）：底图将来升级成更高清时，可按此构图自动重裁 */
-    if (body.crop && typeof body.crop === 'object') {
+    if (kind === 'poster' && body.crop && typeof body.crop === 'object') {
       const cl = v => Math.max(0, Math.min(1, +v || 0))
       meta.images.posterCrop = {
         x: cl(body.crop.x), y: cl(body.crop.y),
@@ -7031,8 +12980,8 @@ async function handleActorApi(req, res, p) {
     } else delete meta.images.posterCrop
     try { fs.writeFileSync(movieCacheFile(code), JSON.stringify(meta, null, 2)) } catch (e) { return json(res, { ok: false, error: '元数据写入失败：' + e.message }) }
     mirrorMeta(code)   // 选了「跟视频放一起」时同步平铺到番号文件夹
-    console.log(`[poster] ${code} 手动裁剪海报 ${sz.w}×${sz.h} ${(buf.length / 1024).toFixed(0)}KB`)
-    return json(res, { ok: true, code, poster: meta.images.poster, w: sz.w || 0, h: sz.h || 0, bytes: buf.length })
+    console.log(`[poster] ${code} 手动设置${kind === 'fanart' ? '横版主图' : '海报'} ${sz.w}×${sz.h} ${(buf.length / 1024).toFixed(0)}KB`)
+    return json(res, { ok: true, code, kind, poster: relImg, w: sz.w || 0, h: sz.h || 0, bytes: buf.length })
   }
   /* ---------- 影片磁力（sukebei.nyaa，缓存优先可离线） ---------- */
   if (p === '/api/movie') {
@@ -7046,6 +12995,256 @@ async function handleActorApi(req, res, p) {
     if (req.method !== 'POST') { res.writeHead(405); return res.end() }
     const r = cacheClean()
     return json(res, Object.assign({ ok: true }, r))
+  }
+  /* 离线数据迁移（2026-10-15）：复制 + 校验 + 切目录；旧副本另走 cleanup（二次确认） */
+  if (p === '/api/cache/migrate') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    return json(res, await cacheMigrate(body.dir))
+  }
+  if (p === '/api/cache/migrate/cleanup') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    return json(res, cacheCleanupOld(body.dir))
+  }
+  /* ---------- 网站（导航栏「网站」页：卡片式网址收藏，2026-10-15） ---------- */
+  if (p === '/api/sites') {
+    if (req.method !== 'GET') { res.writeHead(405); return res.end() }
+    const s = sitesLoad()
+    /* 每张卡带上「图标版本号」= 图标文件 mtime：换了图标前端自然刷新（不然浏览器一直用旧图）。
+     * logo = 内嵌高清矢量 logo（data URI，零网络）；custom 字段优先（用户自己填的图标地址）。 */
+    const list = s.list.map(x => {
+      const host = siteHostOf(x.url)
+      const key = siteIconKey(x.url)
+      let iconAt = 0
+      /* 优先级：用户自己填的图标 > 内置图标（人工筛过，比运行时抓的靠谱）> 本地抓到的 favicon。
+       * 三者都通过 iconAt 这个「版本号」告诉前端该去 /api/sites/icon 取图，图本身不进这个响应。 */
+      if (x.logo) iconAt = 0
+      else if (x.builtinLogo) iconAt = x.builtinLogoAt
+      else if (key) {
+        const hit = siteIconExisting(key)
+        if (hit && hit.file) { try { iconAt = Math.round(fs.statSync(hit.file).mtimeMs) } catch (_) {} }
+      }
+      let logo = String(x.logo || '').trim()
+      const logoAuto = siteLogoUri(host, x.name)             // 程序画的内嵌矢量 logo（永远有）
+      const out = Object.assign({}, x, { host, iconAt, logo, logoAuto, bg: x.bg || '', useLogo: x.useLogo ? 1 : 0 })
+      delete out.builtinLogo                                  // 4MB 的图标本体绝不进这个响应
+      delete out.builtinLogoAt
+      return out
+    })
+    /* 进页面顺手把还没图标的站点排进后台队列（并发 1、间隔 1.2s；前端轮询会自己把新图标画出来）。
+     * 已经是内嵌 logo / 用户自填图标的站点不进队列 —— 它们本来就有图，没必要去碰墙。 */
+    /* ⚠ 2026-10-15 改：老逻辑是 filter(!siteHasLogo(x)) —— 而品牌表里登记了全部 73 个域名，
+     * 等于**一个站都不会去抓真图标**，卡片只能一直显示程序画的那枚 logo。
+     * 现在改成「只要用户没指定图标 / 没选「用内置」就都排一次队」：
+     * 抓到真图标就显示真的，抓不到再退回内置矢量 logo —— 品牌表退回它本来的职责（让兜底好看）。 */
+    try { siteIconWarm(s.list.filter(x => !x.logo && !x.useLogo && !x.builtinLogo)) } catch (_) {}
+    return json(res, { ok: true, cats: SITE_CATS, list, file: SITES_FILE(), builtinFile: SITES_BUILTIN_FILE(), builtinCount: sitesBuiltinList().length })
+  }
+  if (p === '/api/sites/save') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    let s = sitesLoad()
+    const url = siteNormUrl(body.url)
+    if (!url) return json(res, { ok: false, error: '网址不对（要 http/https 的完整地址，比如 https://www.javbus.com）' })
+    const name = String(body.name || '').trim().slice(0, 40) || siteHostOf(url)
+    const cat = SITE_CATS.indexOf(String(body.cat || '')) >= 0 ? String(body.cat) : '其他'
+    const desc = String(body.desc || '').trim().slice(0, 120)
+    /* 自定义图标：http(s) 网址 或 data:image/svg 都收（用户想用自己的 logo 就用）
+     * 留空 = 用内嵌矢量 logo / 站点真实 favicon */
+    let logo = String(body.logo || '').trim().slice(0, 1200000)
+    if (logo && !/^https?:\/\//i.test(logo) && !/^data:image\//i.test(logo)) logo = ''
+    /* 图标底色（2026-10-15 需求）：'' = 默认统一白 · 'transparent' = 透明 · '#rrggbb' = 指定颜色。
+     * 只收这三种，别的写法一律回到默认白，前端不用做兜底判断。 */
+    let bg = String(body.bg || '').trim().slice(0, 32)
+    if (bg && !/^transparent$/i.test(bg) && !/^#[0-9a-fA-F]{3,8}$/.test(bg)) bg = ''
+    if (/^transparent$/i.test(bg)) bg = 'transparent'
+    const useLogo = body.useLogo ? 1 : 0
+    const id = String(body.id || '').trim()
+    const host = siteHostOf(url)
+    const mine = sitesMineLoad()
+    let it = id ? s.list.find(x => x.id === id) : null
+    /* 新增时同域名且同分类视为重复（只更新不新增一条），跟旧逻辑一致 */
+    if (!it && !id) it = s.list.find(x => siteHostOf(x.url) === host && x.cat === cat) || null
+    const oldHost = it ? siteHostOf(it.url) : ''
+    /* 落点：内置站 → 在个人层建/改一份「覆盖副本」（位置仍旧按内置顺序显示，卡片不会跳走）；
+     * 自己加的站 → 直接改个人层里那条；新站 → 新建一条进个人层。 */
+    let target = sitesMineEntry(it)
+    if (!target) {
+      target = { id: it ? it.id : siteNewId(), url: it ? it.url : url, hits: it ? (it.hits || 0) : 0, at: Date.now() }
+      mine.list.push(target)
+    }
+    if (oldHost && oldHost !== host && siteIsBuiltinHost(oldHost)) {
+      /* 内置站的网址被改到了别的域名：原来那一格留墓碑，改后的这条当成「自己的站点」 */
+      if (mine.del.indexOf(oldHost) < 0) mine.del.push(oldHost)
+      target.id = siteNewId()
+    }
+    Object.assign(target, { name, cat, desc, logo, bg, useLogo })
+    target.url = url
+    mine.del = mine.del.filter(h => h !== host)     // 之前删过又想加回来 → 撤墓碑
+    sitesSave()
+    s = sitesRebuild()
+    it = s.list.find(x => x.id === target.id) || target
+    /* 新增/改了网址 → 顺手后台取一次图标（不阻塞保存；取不到前端画内嵌 logo）。
+     * 用户明确选了「不用抓来的图」就不去碰墙了。 */
+    if (!it.logo && !useLogo) setTimeout(() => { siteIconEnsure(it.url, { upgrade: true }).catch(() => {}) }, 50)
+    return json(res, { ok: true, site: it, total: s.list.length })
+  }
+  if (p === '/api/sites/del') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    let s = sitesLoad()
+    const mine = sitesMineLoad()
+    const ids = Array.isArray(body.ids) ? body.ids.map(String) : (body.id ? [String(body.id)] : [])
+    if (!ids.length) return json(res, { ok: false, error: '没有指定要删的网站' })
+    let removed = 0
+    for (const id of ids) {
+      const it = s.list.find(x => x.id === id)
+      if (!it) continue
+      const host = siteHostOf(it.url)
+      const before = mine.list.length
+      mine.list = mine.list.filter(x => x !== sitesMineEntry(it))
+      if (mine.list.length !== before) removed++
+      /* 内置库里有同域名 → 必须留墓碑，否则重启后它又回来了（这一格会被认为从没删过） */
+      if (host && siteIsBuiltinHost(host) && mine.del.indexOf(host) < 0) { mine.del.push(host); if (mine.list.length === before) removed++ }
+      if (host && mine.stats[host]) delete mine.stats[host]
+    }
+    sitesSave()
+    s = sitesRebuild()
+    return json(res, { ok: true, removed: removed, total: s.list.length })
+  }
+  if (p === '/api/sites/hit') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    const s = sitesLoad()
+    const it = s.list.find(x => x.id === String(body.id || ''))
+    if (!it) return json(res, { ok: true, hits: 0 })
+    const host = siteHostOf(it.url)
+    if (!host) return json(res, { ok: true, hits: 0 })
+    /* 点击次数属于「使用痕迹」，按 host 记在个人层，不去复制内置站的条目内容 */
+    const mine = sitesMineLoad()
+    const st = mine.stats[host] || (mine.stats[host] = {})
+    st.hits = (st.hits || 0) + 1
+    st.lastAt = Date.now()
+    it.hits = st.hits
+    it.lastAt = st.lastAt
+    sitesSave()
+    return json(res, { ok: true, hits: st.hits })
+  }
+  if (p === '/api/sites/icon') {
+    const u = new URL(req.url, 'http://x').searchParams.get('u') || ''
+    if (!u) { res.writeHead(400); return res.end('bad') }
+    /* ① 内置图标优先：从内存里的内置站点库直接取，不联网、不落用户目录。
+     *    （装完就有图，不用等它一个个去抓；删掉的站留了墓碑就不再吐图。） */
+    try {
+      const bHost = siteHostOf(siteNormUrl(u) || u)
+      const mineIc = sitesMineLoad()
+      if (bHost && (!mineIc.del || mineIc.del.indexOf(bHost) < 0)) {
+        const dec = dataUriToBuf(sitesBuiltinIconMap()[bHost])
+        if (dec) {
+          res.writeHead(200, { 'Content-Type': dec.type, 'Content-Length': dec.buf.length, 'Cache-Control': 'public, max-age=604800' })
+          return res.end(dec.buf)
+        }
+      }
+    } catch (_) {}
+    try {
+      /* ② 再走本地缓存（运行时抓到的 favicon / 用户点过「重新抓」的）。
+       * ⚠ 只读缓存（cacheOnly）：每张卡的 <img> 都会打这个地址，绝不能在这里联网 ——
+       * 否则卡片每次重画都会触发一轮重抓，图就会「一直刷新」。没缓存就 404 + 排后台队列。 */
+      const r = await siteIconEnsure(u, { cacheOnly: true })
+      const ct = /^(png|gif|webp|ico|svg)$/.test(r.type) ? (r.type === 'svg' ? 'image/svg+xml' : r.type === 'ico' ? 'image/x-icon' : 'image/' + r.type) : 'image/png'
+      res.writeHead(200, { 'Content-Type': ct, 'Content-Length': r.buf.length, 'Cache-Control': 'public, max-age=604800' })
+      return res.end(r.buf)
+    } catch (_) { res.writeHead(404); return res.end('Not Found') }
+  }
+  /* 「🔍 获取图标」：列出这个网址的候选图标（不回写缓存，纯给用户挑） */
+  if (p === '/api/sites/icons/candidates') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    const url = siteNormUrl(body.url)
+    if (!url) return json(res, { ok: false, error: '网址不对（要 http/https 的完整地址，比如 https://www.javbus.com）' })
+    try {
+      const list = await siteIconCandidatesFor(url)
+      return json(res, { ok: true, url: url, list: list })
+    } catch (e) { return json(res, { ok: false, error: (e && e.message) || '抓取失败' }) }
+  }
+  /* 「✂ 裁剪图标」的取图通道（2026-10-15 需求：编辑图标的时候能手动裁剪）。
+   * 为什么不让前端直接 `<img src=外部地址>` 再画进 canvas：跨域图片会把画布**污染**，
+   * 之后 canvas.toDataURL() 直接抛 SecurityError —— 裁好的图根本存不进去。
+   * 所以统一由本地服务把图取回来（照样走用户的代理）转成 data URI：同源、能画、能存、断网也在。 */
+  if (p === '/api/sites/img') {
+    if (req.method !== 'GET') { res.writeHead(405); return res.end() }   // 只读端点：方法不对直接 405，别返回一个 200 的错误体
+    const u = siteNormUrl(new URL(req.url, 'http://x').searchParams.get('u') || '')
+    if (!u) return json(res, { ok: false, error: '图片地址不对（要 http/https 的完整地址）' })
+    try {
+      const r = await siteIconFetch(u, 12000)
+      if (!r.buf || r.buf.length < 20) return json(res, { ok: false, error: '这张图是空的' })
+      const e2 = siteIconSniff(r.buf, r.type)
+      if (!e2) return json(res, { ok: false, error: '这不是浏览器能画的图片（png/jpg/gif/webp/svg/ico）' })
+      const mime = e2 === 'svg' ? 'image/svg+xml' : e2 === 'ico' ? 'image/x-icon' : e2 === 'webp' ? 'image/webp'
+        : e2 === 'gif' ? 'image/gif' : e2 === 'jpg' ? 'image/jpeg' : 'image/png'
+      const dim = e2 === 'svg' ? null : siteIconDim(r.buf, e2)
+      return json(res, { ok: true, data: 'data:' + mime + ';base64,' + r.buf.toString('base64'),
+        w: dim ? dim.w : 0, h: dim ? dim.h : 0, bytes: r.buf.length })
+    } catch (e) {
+      /* 说人话：底层报的是「TLS socket disconnected」这种，用户看不懂也帮不上忙 */
+      const m = String((e && e.message) || '')
+      const friendly = /ENOTFOUND|EAI_AGAIN/i.test(m) ? '这个地址解析不了（网址写错或被墙）'
+        : /ETIMEDOUT|timeout|超时/i.test(m) ? '取图超时了（网络慢或站点不通）'
+        : /内容过大/i.test(m) ? '这张图太大了（超过 1.5MB），换张小点的'
+        : /HTTP \d/.test(m) ? '这个地址返回了 ' + (m.match(/HTTP \d+/) || [''])[0] + '，取不到图'
+        : /ECONNREFUSED|ECONNRESET|socket|TLS|EPIPE|证书/i.test(m) ? '连不上这个地址（被墙或代理没通）'
+        : m || '取图失败'
+      return json(res, { ok: false, error: '取图失败：' + friendly })
+    }
+  }
+  /* 手动「重抓图标」（2026-10-15）：把选中网站已缓存的图标清掉重新抓一遍。
+   * 换过代理 / 发现某个站的图不对时用它；不阻塞请求，抓好的图下次轮询自然出现。 */
+  if (p === '/api/sites/icons/refresh') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+    const s = sitesLoad()
+    const ids = Array.isArray(body.ids) ? body.ids.map(String) : []
+    const cand = ids.length ? s.list.filter(x => ids.indexOf(x.id) >= 0) : s.list
+    if (!cand.length) return json(res, { ok: false, error: '没有要重抓的网站' })
+    try { fs.mkdirSync(SITE_ICON_DIR(), { recursive: true }) } catch (_) {}
+    let n = 0
+    for (const x of cand) {
+      const key = siteIconKey(x.url)
+      if (!key) continue
+      try {
+        for (const name of siteIconNames()) {
+          if (!name.startsWith(key + '.')) continue
+          try { fs.unlinkSync(path.join(SITE_ICON_DIR(), name)) } catch (_) {}
+        }
+      } catch (_) {}
+      siteIconBust()
+      SITE_ICON_UPGRADED.delete(key)
+      n++
+    }
+    siteIconWarm(cand, true)
+    return json(res, { ok: true, total: n })
+  }
+  if (p === '/api/sites/probe') {
+    if (req.method === 'POST') {
+      /* 单点即时测：编辑弹层里「📡 测这个网址通不通」用（不建任务，直接等结果） */
+      if (body.url && !body.ids) {
+        const r = await siteProbeOne(String(body.url), SITE_PROBE_TIMEOUT)
+        return json(res, { ok: true, one: { ok: r.pass ? 1 : 0, code: r.code || 0, ms: r.ms, err: r.err || '', at: Date.now() } })
+      }
+      if (SITE_PROBE && SITE_PROBE.running) return json(res, { ok: false, error: '上一次测试还没跑完（' + SITE_PROBE.done + '/' + SITE_PROBE.total + '），等它结束再试' })
+      const s = sitesLoad()
+      const ids = Array.isArray(body.ids) ? body.ids.map(String) : []
+      const cand = ids.length ? s.list.filter(x => ids.indexOf(x.id) >= 0) : s.list
+      if (!cand.length) return json(res, { ok: false, error: '没有要测试的网站' })
+      /* 不 await：立刻返回，前端轮询同一个地址读进度（不然 73 个站得挂住这个请求一分多钟） */
+      siteProbeRun(ids).catch(e => console.log('[sites] 测试异常：' + e.message))
+      return json(res, { ok: true, id: SITE_PROBE.id, total: cand.length })
+    }
+    const t = SITE_PROBE
+    return json(res, {
+      ok: true,
+      running: !!(t && t.running),
+      at: t ? t.at : 0,
+      total: t ? t.total : 0,
+      done: t ? t.done : 0,
+      pass: t ? t.pass : 0,
+      fail: t ? t.fail : 0,
+      results: t ? t.results : {}
+    })
   }
   /* ---------- 在线刮削（添加本地库没有的影片） ---------- */
   if (p === '/api/scrape/start') {
@@ -7374,7 +13573,7 @@ async function handleActorApi(req, res, p) {
   }
   function importScan(dir) {
     const root = path.resolve(String(dir || '').trim())
-    if (!(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) throw new Error(mountTip())
+    if (!NATIVE && !(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) throw new Error(mountTip())
     let st; try { st = fs.statSync(root) } catch (_) { throw new Error('目录不存在或不可读：' + root + '（检查是否已挂载、云盘是否在线）') }
     if (!st.isDirectory()) throw new Error('不是目录：' + root)
     const files = []
@@ -7452,7 +13651,7 @@ async function handleActorApi(req, res, p) {
   if (p === '/api/import/run') {
     try {
       const root = path.resolve(String(body.dir || '').trim())
-      if (!(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) return json(res, { ok: false, error: mountTip() })
+      if (!NATIVE && !(root === MEDIA_ROOT || root.startsWith(MEDIA_ROOT + path.sep))) return json(res, { ok: false, error: mountTip() })
       const rootName = path.basename(root)
       const list = Array.isArray(body.items) ? body.items.slice(0, 2000) : []
       if (!list.length) return json(res, { ok: false, error: '没有勾选任何文件' })
@@ -7965,9 +14164,14 @@ function localSourceForCode(code) {
 /* 文件夹浏览：逐级选择子文件夹（Emby 同款体验），只允许挂载点以内 */
 function libraryBrowse(q) {
   let raw = String(q || '').trim()
-  if (raw.startsWith('~/')) raw = path.join(MEDIA_ROOT, raw.slice(1))
+  /* ~ 同 /api/library/add：原生 Windows = 用户主目录；容器 = MEDIA_ROOT */
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    raw = (process.platform === 'win32' && NATIVE)
+      ? path.join(os.homedir(), raw.slice(1).replace(/^[\\/]/, ''))
+      : path.join(MEDIA_ROOT, raw.slice(1))
+  }
   const dir = raw ? path.resolve(raw) : MEDIA_ROOT
-  if (!(dir === MEDIA_ROOT || dir.startsWith(MEDIA_ROOT + path.sep)))
+  if (!NATIVE && !(dir === MEDIA_ROOT || dir.startsWith(MEDIA_ROOT + path.sep)))
     return { ok: false, error: '只能浏览挂载目录以内' }
   let dirs = []
   try {
@@ -7981,12 +14185,14 @@ function libraryBrowse(q) {
 }
 
 /* ================= 项目内置动作 ③：115 推送自动认领（v0.2.29） =================
- * 线上详情页推送磁力到 115 离线下载后，服务自动盯梢媒体库：
- *   文件落盘（连续两轮看到且大小不变才算稳定）→ 绑定番号（manual-codes.json，文件名解析不出番号也能挂对）
- *   → 清理同目录垃圾文件（网页 / 种子 / 快捷方式 / 系统文件，不动视频图片 nfo 字幕）
- *   → 重扫入库（v0.3.0 起不再原地整理）。
- * 库里已有该番号离线数据（详情页）→ 重扫时 enrichFromCache 自动挂上；
- * 没有 → 扫描尾部的 autoScrapeNew 自动排队刮削（元数据 / 封面 / 剧照进离线数据）。
+ * 线上详情页推送磁力到 115 离线下载后，服务自动盯梢：
+ *   ① 本机媒体库（115 挂载盘 / 同步目录）：文件落盘（连续两轮看到且大小不变才算稳定）
+ *      → 绑定番号（manual-codes.json，文件名解析不出番号也能挂对）
+ *      → 清理同目录垃圾文件（网页 / 种子 / 快捷方式 / 系统文件，不动视频图片 nfo 字幕）
+ *   ② 115 网盘（纯云片源）：列一遍已收录的网盘目录，按番号命中就直接重扫入库
+ *      → 重扫（v0.3.0 起不再原地整理）。
+ * 两条路都走 w115Claim*，最终都是 rescan()；库里已有该番号离线数据（详情页）→
+ * 重扫时 enrichFromCache 自动挂上；没有 → 扫描尾部的 autoScrapeNew 自动排队刮削。
  * 开关：设置 → 刮削「115 推送自动认领」（CFG.auto115Watch，默认开）。任务 24h 未等到文件自动作废。 */
 const W115 = { jobs: [], timer: null }
 function w115File() { return path.join(cacheDir(), '115-watch.json') }
@@ -7996,18 +14202,20 @@ function w115Load() {
 function w115Save() {
   try { fs.mkdirSync(cacheDir(), { recursive: true }); fs.writeFileSync(w115File(), JSON.stringify({ jobs: W115.jobs.slice(-50) }, null, 2)) } catch (_) {}
 }
-function watch115Push(code) {
+function watch115Push(code, acct) {
   code = norm(String(code || ''))
   if (!code || !bare(code) || CFG.auto115Watch === false) return
   if (W115.jobs.some(j => j.code === code && (j.status === 'watching' || j.status === 'rescanning'))) return
-  W115.jobs.push({ code, addedAt: Date.now(), status: 'watching', rounds: 0, seen: {}, note: '' })
+  W115.jobs.push({ code, addedAt: Date.now(), status: 'watching', rounds: 0, seen: {}, note: '', acct: Math.max(1, parseInt(acct, 10) || pan115PushAcctOf()) })
   W115.jobs = W115.jobs.slice(-50)
   w115Save()
   console.log('[115-watch] 盯梢 ' + code + '：等离线下载的文件落进媒体库（每 2 分钟查一轮，24h 内有效）')
   if (W115.timer) { clearTimeout(W115.timer); W115.timer = null }
   W115.timer = setTimeout(() => { W115.timer = null; w115Pump() }, 20000)
 }
-/* 与 /api/library/matchCode 同口径找文件，但用「词边界」匹配防误伤（ABC-1 不许匹配 ABC-123） */
+/* 与 /api/library/matchCode 同口径找文件，但用「词边界」匹配防误伤（ABC-1 不许匹配 ABC-123）。
+ * ⚠ 只搜本机媒体库（LIBS）。115 网盘那一侧由 w115Pump 单独调 v115FindByCode —— 这里返回的是
+ *   可以用来 fs.statSync 的本地绝对路径，网盘的 `115:/…` 混进来会让后面的稳定性闸门全判失败。 */
 async function w115FindMatches(code) {
   const ccode = bare(code)
   if (!ccode || ccode.length < 3) return []
@@ -8054,6 +14262,41 @@ async function w115Claim(job, files) {
   job.note = '已入库 ' + files.length + ' 个文件' + (bound ? '、绑定番号' : '')
   console.log('[115-watch] ✓ ' + code + '：' + job.note)
 }
+/* 网盘侧认领：文件本来就在已收录的网盘目录里，没有「绑定本地文件」这回事 —— 重扫一遍即可。
+ * 扫描时 v115Walk 会把它变成 `115:/…` 条目，enrichFromCache 自动挂上本番号的离线数据。
+ * ⚠ 风控优化（2026-10-13）：**故意不清 V115_SNAP** —— 能走到这里说明刚刚（盯梢的 v115FindByCode，
+ *   走的就是同一份快照）在这棵目录树里找到了文件，复用同一份快照重扫就能收录，
+ *   省掉一次整树重打（实测一个根 27 个子目录 = 27 次 webapi 请求）。 */
+async function w115ClaimNet(job, files) {
+  const code = job.code
+  job.status = 'rescanning'; job.note = ''; w115Save()
+  rescan()
+  await waitScanDone()
+  enqueuePreview(code)
+  job.status = 'done'
+  job.finishedAt = Date.now()
+  job.found = files.length; job.bound = 0
+  job.note = '网盘里发现 ' + files.length + ' 个文件，已重新扫描入库'
+  console.log('[115-watch] ✓ ' + code + '：' + job.note)
+}
+/* 盯梢退避（2026-10-13 新增）—— 降低后台对 115 的持续高频访问。
+ * 一轮 = 全树遍历网盘（本机实测「破解测试」一个根就 27 个子目录 = 27 次 webapi 请求）。
+ * 以前固定 2 分钟一轮：只要有 watching 任务，一天就是上千次带 Cookie 的规整请求 ——
+ * 这是最可能触发 115 风控、进而让登录态被安全下线的因素。文件落盘后几分钟内就稳定，
+ * 没必要时时刻刻高频扫。间隔：连续未命中 2 → 4 → 8 → 16 → 30 分钟（封顶）；
+ * 一旦有发现立刻回到 2 分钟。计数**不落盘**：重启从 0 开始（刚打开程序时盯勤一点更符合直觉）。 */
+const W115_MISS = new Map()
+const W115_ROUND_MAX = 3          // 每轮最多查几个盯梢任务（多了就是给风控送流量，见 w115Pump）
+function w115GapMs() {
+  let best = null
+  for (const j of W115.jobs) {
+    if (j.status !== 'watching') { W115_MISS.delete(j.code); continue }
+    const m = W115_MISS.get(j.code) || 0
+    best = best === null ? m : Math.min(best, m)     // 最新鲜的那个任务决定频率
+  }
+  if (best === null) return 120000
+  return Math.min(120000 * Math.pow(2, Math.min(best, 4)), 30 * 60 * 1000)
+}
 async function w115Pump() {
   W115.timer = null
   if (W115.running) { w115Reschedule(120000); return }   // 上一轮还没跑完 → 稍后再来
@@ -8061,13 +14304,40 @@ async function w115Pump() {
   try {
     if (CFG.auto115Watch !== false) {
       if (SCAN.running) return w115Reschedule(120000)   // 扫描中让路（walk 云盘挂载很贵）
-      const act = W115.jobs.filter(j => j.status === 'watching')
+      const act = []
       const now = Date.now()
-      for (const job of act) {
+      for (const job of W115.jobs) {
+        if (job.status !== 'watching') continue
         if (now - job.addedAt > 24 * 3600 * 1000) { job.status = 'expired'; job.note = '24 小时未等到文件，已放弃'; continue }
+        act.push(job)
+      }
+      /* ⚠ 每轮只查前 W115_ROUND_MAX 个（2026-10-15）：一次盯梢十来部时，
+       * 旧实现一轮就是十几次搜索请求，而且这些请求彼此只隔 2 分钟 —— 后台长期高频打接口，
+       * 是最容易把登录态耗掉的一种用法。现在一轮封顶 3 个，其余顺延到下一轮（退避照旧生效）。 */
+      if (act.length > W115_ROUND_MAX) {
+        for (const job of act.slice(W115_ROUND_MAX)) if (!job.note) job.note = '排队中（本轮先查前 ' + W115_ROUND_MAX + ' 个）'
+      }
+      for (const job of act.slice(0, W115_ROUND_MAX)) {
         try {
           const matches = await w115FindMatches(job.code)
-          if (!matches.length) { job.rounds = 0; job.seen = {}; continue }
+          /* ★ 网盘侧也要看（2026-10-13 修）：w115FindMatches 只遍历 LIBS（本机媒体库），
+           *   而「推送 115 离线下载 → 等文件落盘」这套流程在纯网盘片源下根本没有本地文件 ——
+           *   于是 rounds 永远是 0，任务干等 24h 才过期，用户以为「自动认领」坏了。
+           *   走 force=false 复用 10 分钟列目录快照，不额外打接口。 */
+          let net = []
+          try { net = await v115FindByCode(bare(job.code), job.code) } catch (_) {}   // 2026-10-14 起 = 搜索接口 1~2 请求，不再整树
+          if (!matches.length && !net.length) {
+            job.rounds = 0; job.seen = {}
+            W115_MISS.set(job.code, (W115_MISS.get(job.code) || 0) + 1)   // 连续没等到 → 下一轮拉长间隔
+            /* 匹配不到时把原因挂到任务上（网盘读不了 / 没登记目录 …），详情页与设置页能直接看到，
+             * 而不是盯着一个永远「等待中」的任务猜 */
+            const why = V115_FIND_NOTE || v115AuthNote()
+            if (why) job.note = why
+            continue
+          }
+          W115_MISS.delete(job.code)   // 一有动静就回到高频，别让退避拖慢真实文件的认领
+          /* 网盘里已经有了 → 直接走重扫入库（网盘文件没有「等大小稳定」这回事：离线下载完成后就是最终大小） */
+          if (net.length) { await w115ClaimNet(job, net); continue }
           /* 稳定性闸门：连续两轮都看到且大小不变才认领（防云盘列表瞬态） */
           const snap = {}
           const stable = []
@@ -8086,7 +14356,7 @@ async function w115Pump() {
       w115Save()
     }
   } finally { W115.running = false }
-  w115Reschedule(120000)
+  w115Reschedule(w115GapMs())
 }
 function w115Reschedule(ms) {
   if (W115.timer || !W115.jobs.some(j => j.status === 'watching')) return
@@ -8213,6 +14483,7 @@ setInterval(autoRescanTick, 10 * 60 * 1000)
 setTimeout(autoRescanTick, 3 * 60 * 1000)   // 启动 3 分钟后先检查一次（补上停机期间错过的时点）
 /* 内置补充名册：项目自带文件（首次运行自动建），随项目一起备份 */
 try { if (!fs.existsSync(EXTRA_ROSTER)) fs.writeFileSync(EXTRA_ROSTER, '[]') } catch (_) {}
+try { if (!fs.existsSync(MERGE_FILE)) fs.writeFileSync(MERGE_FILE, '{}') } catch (_) {}
 
 /* ---------- 女优名册每日自动同步（relay/roster.json → actresses.json） ----------
  * 名册约 16MB，不便随镜像分发，改放公共仓库 ShHEdisonXu/javpaco-relay
@@ -8640,15 +14911,41 @@ const server = http.createServer((req, res) => {
   try {
     const u = new URL(req.url, 'http://x')
     const p = decodeURIComponent(u.pathname)
-    /* 访问口令（可选）：开启后除登录页与本机 localhost 之外都要先验证 */
-    if (ACCESS_CODE() && !/^(localhost|127\.0\.0\.1)$/.test(req.headers.host.split(':')[0] || '')) {
+    /* 访问口令（可选）：开启后除登录页与本机之外都要先验证。
+     * 本机判定走 TCP 对端地址（isLocalReq），不看 Host —— 见该函数上方注释。 */
+    if (ACCESS_CODE() && !isLocalReq(req)) {
       if (p === '/login') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(LOGIN_HTML) }
       if (!hasAccess(req, p)) {
         if (p.startsWith('/api/') || p.startsWith('/media/') || p.startsWith('/cache/') || p.startsWith('/thumb/')) { res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' }); return res.end('{"ok":false,"error":"需要访问口令"}') }
         res.writeHead(302, { Location: '/login' }); return res.end()
       }
     }
+    /* ---------- 海报墙缩略图：/thumb/<番号>/<poster|fanart> ----------
+     * 全尺寸原图（海报可到 1032×1468、大图 2184×1468，单张几百 KB ~ 1MB）直接喂墙会拖慢滚动，
+     * 这里压成墙用小图（海报限高 720 / 大图限宽 960），原图仍留给详情页。
+     * 缩略图缓存 cache/thumbs/，按源图 mtime 失效；生成失败回退原图。
+     * ⚠ 这段必须放在主处理器里：之前它被误写在 handleActorApi 内部，而那个函数只服务
+     *   /api/* 几类路径，/thumb/ 永远 404 → 前端静默回退全尺寸原图，缩略图优化形同虚设。 */
+    if (p.startsWith('/thumb/')) {
+      const MT = /^\/thumb\/([A-Za-z0-9._-]+)\/(poster|fanart)$/.exec(p)
+      if (MT) {
+        movieThumb(MT[1], MT[2]).then(tb => {
+          if (tb) {
+            res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': tb.length, 'Cache-Control': 'public, max-age=604800' })
+            return res.end(tb)
+          }
+          sendFile(req, res, path.join(cacheDir(), 'movies', MT[1], 'images', MT[2] + '.jpg'))
+        }).catch(() => { try { res.writeHead(404); res.end('Not Found') } catch (_) {} })
+        return
+      }
+      res.writeHead(404); return res.end('Not Found')
+    }
     if (p === '/api/library/browse') return json(res, libraryBrowse(u.searchParams.get('path') || ''))
+    /* 前端自动重载用：返回 index.html 的 mtime；前端轮询发现变化就自动刷新页面，
+     * 免去 Mac 版 webview 不认 ⌘R/⌘Q 导致的「改了不生效」。 */
+    if (p === '/api/ui-version') {
+      try { const st = fs.statSync(path.join(__dirname, 'index.html')); return json(res, { ok: true, ts: st.mtimeMs }) } catch (_) { return json(res, { ok: false }) }
+    }
     /* ---------- 进度条缩略图：ffmpeg 按需抽帧（GET，无 body） ----------
      * /api/preview?rel=      → 状态（首次调用会排队后台生成，20~48 帧）
      * /api/preview/img?rel=&i= → 第 i 帧 JPEG（没生成好就 404，前端跳过） */
@@ -8667,15 +14964,109 @@ const server = http.createServer((req, res) => {
       try { if (fs.statSync(fp).isFile()) return sendFile(req, res, fp) } catch (_) {}
       res.writeHead(404); return res.end('Not Found')
     }
+    /* 外部播放器（Mac 原生）：返回视频在宿主机上的绝对路径，原生桥用它调起 IINA/VLC/mpv。
+     * 仅在原生模式（NATIVE=Mac/Win）有意义 —— 浏览器/容器里路径对客户端不可见。
+     * 走 Node 代理经 FUSE 单通道读网盘很慢，原生播放器直接读挂载（或走 HTTP 流）缓冲好得多。*/
+    if (p === '/api/filepath') {
+      if (!NATIVE) return json(res, { ok: false, error: '仅原生版（Mac/Win）支持外部播放器' })
+      const rel = (u.searchParams.get('rel') || '').trim()
+      const fp = safeMediaPath(rel)
+      if (!fp) return json(res, { ok: false, error: 'bad rel' })
+      fs.promises.stat(fp).then(st => {
+        if (!st.isFile()) return json(res, { ok: false, error: '文件不存在' })
+        json(res, { ok: true, path: fp, native: true })
+      }).catch(e => json(res, { ok: false, error: e.code || e.message || String(e) }))
+      return
+    }
     /* 女优头像候选缩略图：外部图床多半防盗链，统一由服务端代取（GET，供 <img src> 直接用） */
     if (p === '/api/actor/thumb') return actorThumb(res, u.searchParams.get('u') || '')
-    /* 海报悬停预览动图（B方案）：返回「已生成预览的番号清单」+ 文件名（前端照 file 拼 URL，
-     * 抽帧参数改版时只需改服务端 PREV_FILE，前端不用跟着改） */
+    /* 海报悬停预览动图：只回「本地抽帧短片」的清单（codes + file）。
+     * 线上动图（JavDB 预览片）走 /api/preview/online，按番号现查（正负都有缓存）。
+     * 抽帧参数改版时只需改服务端 PREV_FILE，前端不用跟着改。 */
     if (p === '/api/previews') {
       if (!previewEnabled()) return json(res, { ok: true, on: false, codes: [], file: PREV_FILE })
       const codes = previewScanCodes()
       for (const c of PREV_SET) if (codes.indexOf(c) < 0) codes.push(c)
       return json(res, { ok: true, on: true, codes, file: PREV_FILE })
+    }
+    /* 悬停预览·线上动图（JavDB 官方预览片，真 HLS 视频，浏览器端 hls.js 直连拉流）：
+     *   /api/preview/online           → JSON { ok, url, marks, total, slices }
+     *                                   marks = 每个切片起始秒数，前端按「每片 1 秒」跳着播；
+     *                                   url 指下面的播放列表，由前端交给 hls.js.loadSource。
+     *   /api/preview/online/playlist  → 裁好的 HLS 播放列表文本（6 个切片）。
+     * 注：本回调不是 async，凡是要 await 的路由都包一层内层 async IIFE（与既有 ;(async () => { 风格一致） */
+    if (p === '/api/preview/online') {
+      if (!previewEnabled()) return json(res, { ok: false, error: '悬停预览已关闭' })
+      const code = String(u.searchParams.get('code') || '').trim()
+      if (!code) return json(res, { ok: false, error: '缺少番号' })
+      const n = Math.max(1, Math.min(12, parseInt(u.searchParams.get('n') || '', 10) || PREV_SEGS))
+      ;(async () => {
+        const key = bare(code)
+        const warmed = pvOnlineCached(key)
+        /* 还没预热到这部 → 立刻插到预热队首（下一轮一定轮到），本轮最多只等 2.5s。
+         * 不能让前端一直干等：它那边 hover 只停一两秒，等 1.8s 以上等于没有预览；
+         * 而且前端会把「慢」误当成「没有」把这个番号冻住 10~15 分钟
+         *（那一边已改成 warming 响应不落缓存，见 index.html 的 fetchOnline）。 */
+        if (!warmed) pvWarmStart([code])
+        let pl = null
+        try {
+          pl = await Promise.race([
+            previewOnlinePlaylist(code, n),
+            new Promise(r => setTimeout(() => r(null), 2500))
+          ])
+        } catch (e) {
+          /* 服务端明确查到「线上没这部片 / 没预览片」→ 如实回报，让前端缓存住别反复问 */
+          if (e && e.pvMiss) return json(res, { ok: false, error: (e && e.message) || '这部片线上没有预览片' })
+          if (!warmed) return json(res, { ok: true, warming: true, code, url: '', marks: [] })
+          return json(res, { ok: false, error: (e && e.message) || '取线上预览片失败' })
+        }
+        /* 2.5s 没回来 = 还在查（或在排队）→ 回 warming：前端这次不出画面，但**不记成没有**，
+         * 下次 hover 直接命中（那时预热已把它查好了）。 */
+        if (!pl) return json(res, { ok: true, warming: true, code, url: '', marks: [] })
+        return json(res, {
+          ok: true, code, id: pl.id, slices: n, marks: pl.marks, total: pl.total,
+          url: '/api/preview/online/playlist?code=' + encodeURIComponent(code) + '&n=' + n
+        })
+      })().catch(e => { try { json(res, { ok: false, error: (e && e.message) || '取线上预览片失败' }) } catch (_) {} })
+      return
+    }
+    /* 前端把「当前这一屏」的番号报过来，让预热先照顾用户马上要 hover 的那些。
+     * 只要番号、不要结果：服务端查完写进自己的缓存，前端下一次 hover 就是毫秒级命中。
+     * 所以这一路即使失败也完全不影响页面（前端 fire-and-forget）。 */
+    if (p === '/api/preview/warm') {
+      if (!previewEnabled()) return json(res, { ok: false, error: '悬停预览已关闭' })
+      ;(async () => {
+        let body = ''
+        try { body = await readBody(req) } catch (_) {}
+        let codes = []
+        try { codes = (JSON.parse(String(body || '{}')).codes || []) } catch (_) {}
+        /* 上限 60：一屏卡片通常十几张，设大了等于被一个请求拖着预热整库 */
+        codes = codes.map(c => String(c || '').trim()).filter(Boolean).slice(0, 60)
+          if (codes.length) pvWarmStart(codes)
+          /* codes 为空 = 「重排一次队列」。前端切换「用 115 云盘片源生成预览」开关后靠它立刻生效
+             —— 否则服务端要等到下次启动或重扫才会把 115 那批排进去。 */
+          else { try { schedulePreviews() } catch (_) {} }
+          return json(res, { ok: true, queued: codes.length, running: PVWARM.on })
+      })().catch(() => { try { json(res, { ok: false }) } catch (_) {} })
+      return
+    }
+    if (p === '/api/preview/online/playlist') {
+      if (!previewEnabled()) { res.writeHead(403); return res.end('preview off') }
+      const code = String(u.searchParams.get('code') || '').trim()
+      const n = Math.max(1, Math.min(12, parseInt(u.searchParams.get('n') || '', 10) || PREV_SEGS))
+      if (!code) { res.writeHead(400); return res.end('missing code') }
+      ;(async () => {
+        const pl = await previewOnlinePlaylist(code, n)
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
+          'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*'
+        })
+        return res.end(pl.list)
+      })().catch(e => {
+        console.log('[preview] 线上预览片失败 ' + code + '：' + ((e && e.message) || e))
+        try { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('preview unavailable') } catch (_) {}
+      })
+      return
     }
     /* ---------- MissAV 在线播放：解析（GET）+ HLS 中转（GET） ---------- */
     if (p === '/api/missav/play') return handleMissavPlay(req, res, u)
@@ -8687,9 +15078,15 @@ const server = http.createServer((req, res) => {
       return json(res, { ok: true, sources: sd.sources.map(x => ({ id: x.id, name: x.name, enabled: !!x.enabled })), priorities: sd.priorities })
     }
     if (p === '/api/config' || p === '/api/config/test' || p === '/api/prefs' || p === '/api/rank/update' || p === '/api/rank/status' || p === '/api/roster/sync' ||
+        p === '/api/audit/deadlink' ||
+        p === '/api/gap/actor' || p === '/api/disk' ||
         p === '/api/actor/scrape' || p === '/api/actor/save' || p === '/api/actor/sync' ||
+        p === '/api/actor/merge' ||
         p === '/api/actor/probe' || p === '/api/actor/pick-avatar' ||
         p === '/api/library' || p === '/api/library/add' || p === '/api/library/remove' || p === '/api/library/rescan' ||
+        p === '/api/sources/media' || p === '/api/srchealth' || p === '/api/srchealth/probe' ||
+        p === '/api/sites' || p === '/api/sites/save' || p === '/api/sites/del' || p === '/api/sites/hit' || p === '/api/sites/icon' || p === '/api/sites/probe' ||
+        p === '/api/sites/icons/refresh' || p === '/api/sites/icons/candidates' || p === '/api/sites/img' ||
         p === '/api/library/matchCode' || p === '/api/library/bindCode' || p === '/api/lib/hide' ||
         p === '/api/watch' || p === '/api/watch/del' || p === '/api/watch/done' ||
         p === '/api/userdata' ||
@@ -8702,11 +15099,18 @@ const server = http.createServer((req, res) => {
         p === '/api/online/actor_movies' ||
         p === '/api/online/dirs' || p === '/api/online/entity' ||
         p === '/api/115/config' || p === '/api/115/test' || p === '/api/115/push' || p === '/api/115/tasks' || p === '/api/115/dirs' || p === '/api/115/watch' ||
+        p.startsWith('/api/115/lib') ||
+        /* WebDAV / 光鸭网盘（config 是 GET+POST，lib 同；test/lib/add/lib/remove 只 POST） */
+        p === '/api/webdav/config' || p.startsWith('/api/webdav/') ||
+        p === '/api/guangya/config' || p.startsWith('/api/guangya/') ||
         p === '/api/subs' || p === '/api/subs/get') {
       if (req.method !== 'POST' &&
         !(p === '/api/config' && req.method === 'GET') && !(p === '/api/prefs' && req.method === 'GET') &&
+        !(p === '/api/actor/merge' && req.method === 'GET') &&
         !(p === '/api/rank/status' && req.method === 'GET') &&
         !(p === '/api/roster/sync' && req.method === 'GET') &&
+        !(p === '/api/audit/deadlink' && req.method === 'GET') &&
+        !(p === '/api/disk' && req.method === 'GET') &&
         !(p === '/api/watch' && req.method === 'GET') &&
         !(p === '/api/userdata' && req.method === 'GET') &&
         !(p === '/api/backup' && req.method === 'GET') &&
@@ -8718,8 +15122,23 @@ const server = http.createServer((req, res) => {
         !(p.startsWith('/api/online/') && req.method === 'GET') &&
         !(p === '/api/115/config' && req.method === 'GET') &&
         !(p === '/api/115/dirs' && req.method === 'GET') &&
+        !(p === '/api/115/lib' && req.method === 'GET') &&
+        !(p === '/api/115/lib/browse' && req.method === 'GET') &&
+        !(p === '/api/115/lib/stream' && req.method === 'GET') &&
+        !(p === '/api/webdav/config' && req.method === 'GET') &&
+        !(p === '/api/guangya/config' && req.method === 'GET') &&
+        !(p === '/api/webdav/lib' && req.method === 'GET') &&
+        !(p === '/api/guangya/lib' && req.method === 'GET') &&
+        !(p === '/api/guangya/acct/next' && req.method === 'GET') &&   // 光鸭「下一个可用账号号」（多账号）
+        !((p.startsWith('/api/webdav/') || p.startsWith('/api/guangya/')) && req.method === 'GET' && /\/lib\/browse$/.test(p)) &&
         !(p === '/api/subs/get' && req.method === 'GET') &&
-        !(p === '/api/library' && req.method === 'GET')) { res.writeHead(405); return res.end() }
+        !(p === '/api/library' && req.method === 'GET') &&
+        !(p === '/api/sources/media' && req.method === 'GET') &&
+        !(p === '/api/srchealth' && req.method === 'GET') &&
+        !(p === '/api/sites' && req.method === 'GET') &&
+        !(p === '/api/sites/icon' && req.method === 'GET') &&
+        !(p === '/api/sites/img' && req.method === 'GET') &&
+        !(p === '/api/sites/probe' && req.method === 'GET')) { res.writeHead(405); return res.end() }
       handleActorApi(req, res, p).catch(e => json(res, { ok: false, error: e.message }))
       return
     }
@@ -8741,10 +15160,56 @@ const server = http.createServer((req, res) => {
     if (p === '/api/scan') {
       return json(res, Object.assign({ ok: true }, SCAN, { hasData: !!DATA }))
     }
-    if (p === '/api/movie' || p === '/api/cache' || p === '/api/cache/clean') {
+    /* 取消扫描：POST /api/scan/cancel —— 幂等，不在扫描中也返回 ok。
+     * 前端「停止」按钮用；服务端在每个可中断点检查 SCAN.cancel 真正停下来（不是前端假装的）。 */
+    if (p === '/api/scan/cancel') {
+      if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+      return json(res, scScanCancel())
+    }
+    /* 定向扫描：POST /api/scan/scope { kind:'115'|'guangya'|'webdav', acct:<账号号>, key:<cid|path> }
+     * 「已收录目录」列表里每个目录旁的 ⟳ 按钮 → 只重扫这一个根，其它来源不碰。
+     * key 按来源查 roots（115 按 cid、dav/光鸭 按 path），查不到就明确报错。
+     * ⚠ 2026-10-14：**用户点名动作优先** —— 有扫描在跑时先把它取消掉再跑定向，
+     *   否则定向请求只能挂在 pendingScope 后面干等（全量扫 115 整树要十几分钟，
+     *   用户点了 ⟳ 半天没反应，看起来就是「按钮点不了」）。 */
+    if (p === '/api/scan/scope') {
+      if (req.method !== 'POST') { res.writeHead(405); return res.end() }
+      ;(async () => {
+        let body = ''
+        try { body = await readBody(req) } catch (_) {}
+        let kind = '', key = '', acct = 1
+        try {
+          const b = JSON.parse(String(body || '{}'))
+          kind = String(b.kind || ''); key = String(b.key || '')
+          acct = Math.max(1, parseInt(b.acct, 10) || 1)
+        } catch (_) {}
+        let root = null
+        if (kind === '115') root = v115Roots(acct).find(r => String(r.cid) === key.replace(/[^\d]/g, '')) || null
+        else if (kind === 'guangya' || kind === 'webdav') {
+          const np = s => String(s || '').replace(/^\/+|\/+$/g, '')
+          root = davRoots(kind, acct).find(r => np(r.path) === np(key)) || null
+        }
+        if (!root) return json(res, { ok: false, error: '找不到这个已收录目录（可能刚被移出，刷新一下列表）' })
+        root = Object.assign({}, root, { acct })
+        /* 抢占：取消正在跑的那一轮，等它真正停下（每个可中断点最多 10s 收手）再起定向扫描 */
+        let preempted = false
+        if (SCAN.running) {
+          preempted = true
+          scScanCancel()
+          for (let i = 0; i < 200 && SCAN.running; i++) await new Promise(r => setTimeout(r, 100))
+          if (SCAN.running) return json(res, { ok: false, error: '当前扫描停不下来（可能卡在网盘读取），稍后再点一次' })
+        }
+        SCAN.pending = false; SCAN.pendingScope = null
+        rescan({ roots: [{ kind: kind === '115' ? 'v115' : kind, root }] })
+        return json(res, { ok: true, acct, scanning: SCAN.running, preempted, name: root.name || root.path || root.cid })
+      })().catch(e => { try { json(res, { ok: false, error: e.message }) } catch (_) {} })
+      return
+    }
+    if (p === '/api/movie' || p === '/api/cache' || p === '/api/cache/clean' ||
+        p === '/api/cache/migrate' || p === '/api/cache/migrate/cleanup') {
       const okM = (p === '/api/movie' && req.method === 'POST') ||
         (p === '/api/cache' && req.method === 'GET') ||
-        (p === '/api/cache/clean' && req.method === 'POST')
+        ((p === '/api/cache/clean' || p === '/api/cache/migrate' || p === '/api/cache/migrate/cleanup') && req.method === 'POST')
       if (!okM) { res.writeHead(405); return res.end() }
       handleActorApi(req, res, p).catch(e => json(res, { ok: false, error: e.message }))
       return
@@ -8833,7 +15298,7 @@ const server = http.createServer((req, res) => {
      * 容器 bind mount 是逐文件挂的，只有 /vol4/1000/pako 整个目录进了 /app/cache，
      * 放 UI_ROOT 下容器读不到（新增目录不会自动进挂载点）。 */
     if (/^\/(covers\/|actresses\/|favicon\.ico|manifest\.webmanifest|sw\.js|hls\.light\.min\.js|icon-192\.png|icon-512\.png|apple-touch-icon\.png)/.test(p) ||
-        ['/actresses.json', '/name-map.json', '/name-alias.json', '/rankings.json', '/tags-zh.json'].includes(p)) {
+        ['/actresses.json', '/name-map.json', '/name-alias.json', '/actor-merge.json', '/rankings.json', '/tags-zh.json'].includes(p)) {
       /* 白名单只是前缀，还得挡住 ../ 目录穿越（/covers/../server-config.json 之类） */
       if (p.split('/').includes('..')) { res.writeHead(403); return res.end('Forbidden') }
       const fp = path.join(UI_ROOT, p)
@@ -8849,13 +15314,26 @@ const server = http.createServer((req, res) => {
       res.writeHead(404); return res.end('Not Found')
     }
     if (p.startsWith('/media/')) {
-      const fp = safeMediaPath(p.slice('/media/'.length))
+      const rel = p.slice('/media/'.length)
+      /* 115 网盘条目：磁盘上不存在，交给代理去取 302 直链后转发（支持 Range 拖动） */
+      if (v115Rel(rel)) return v115Serve(req, res, rel)
+      /* WebDAV / 光鸭条目：标准协议，GET + Range 原样转发 */
+      if (davRel(rel)) return davServe(req, res, rel)
+      const fp = safeMediaPath(rel)
       if (fp) return sendFile(req, res, fp)
       res.writeHead(403); return res.end('Forbidden')
     }
     res.writeHead(404); res.end('Not Found')
   } catch (e) {
-    res.writeHead(500); res.end('Error: ' + e.message)
+    /* ⚠ 这里必须判 headersSent：异常完全可能发生在响应已经发出去之后（例如 json() 之后又抛），
+     * 那时再 writeHead 会抛 ERR_HTTP_HEADERS_SENT —— 而这个抛错发生在 catch 块里没人接，
+     * 会升级成未捕获异常，结果是这个连接既没关也没回内容，一直挂到超时。
+     * 另外错误详情只写日志：e.message 里常带服务器绝对路径，不该回给客户端。 */
+    console.error('[http] ' + ((e && e.stack) || e))
+    try {
+      if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('Internal Error') }
+      else res.end()
+    } catch (_) {}
   }
 })
 
@@ -8894,6 +15372,8 @@ server.listen(PORT, '0.0.0.0', () => {
   w115Load()
   /* 悬停预览：清单版本对不上（旧版单段 5s）→ 先清旧文件，再让 schedulePreviews 整批重排 */
   if (previewLoad()) { try { previewCleanupOld() } catch (e) { console.log('[preview] 旧版清理出错：' + e.message) } }
+  /* 先读回上次预热好的线上预览地址（不然 schedulePreviews 里的预热会以为「一条都没有」把整库重查一遍） */
+  try { pvWarmLoad() } catch (_) {}
   schedulePreviews()   // 重排必须走 schedulePreviews（enqueuePreview 单独调只覆盖首次入库的场景）
   if (W115.jobs.some(j => j.status === 'watching')) setTimeout(w115Pump, 30000)
   /* 订阅/扫描自动入库队列：恢复上次没跑完的（服务重启不丢） */
@@ -8910,3 +15390,6 @@ server.listen(PORT, '0.0.0.0', () => {
 })
 
 process.on('SIGINT', () => { console.log('\n已停止'); process.exit(0) })
+/* 退出前把预热结果落盘（macOS/Linux 有效；Windows 上 main.js 用 TerminateProcess 杀子进程，
+ * 收不到信号，那种情况靠 pvWarmPump 里的定期落盘兜住） */
+process.on('SIGTERM', () => { try { pvWarmSave() } catch (_) {}; process.exit(0) })

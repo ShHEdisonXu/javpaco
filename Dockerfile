@@ -10,6 +10,8 @@ WORKDIR /app
 
 # 只拷贝需要的文件（媒体目录通过卷挂载，不进镜像）
 COPY index.html server.js mdcng.js hls.light.min.js package.json package-lock.json ./
+# v0.5.0 新增：内置站点库（137 站，server.js 启动必读）+ 女优重名合并表（可选，缺失有兜底）
+COPY sites-builtin.json actor-merge.json ./
 COPY rules ./rules
 COPY covers ./covers
 COPY manifest.webmanifest sw.js icon-192.png icon-512.png apple-touch-icon.png favicon.ico ./
