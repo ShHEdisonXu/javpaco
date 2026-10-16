@@ -49,6 +49,20 @@ final class ServerManager: ObservableObject {
         try fm.createDirectory(at: ServerManager.appSupportDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: ServerManager.logDir, withIntermediateDirectories: true)
 
+        /* ⚠️ 防降级（2026-10-16 血泪教训）：version.txt 形如 dev-YYYYMMDD-HHMMSS，可按字典序比新旧。
+         * 同 BundleID（local.javpaco.mac）的**旧版** App —— 比如 DMG 暂存目录 / dist 目录里那份 ——
+         * 一旦被 LaunchServices 拉起来，就会把已装的 runtime 整个降级替换：server-config.json 被
+         * 旧空配置盖掉（115 Cookie、订阅、媒体库、偏好全没）、cache/scan-result.json 丢失，
+         * 只能从 runtime.old-* 手工抢救。所以：包内版本比已装版本旧 → 直接拒绝安装，原样保留。 */
+        func isDatedVersion(_ v: String) -> Bool {
+            return v.count == 19 && v.hasPrefix("dev-")
+                && v.dropFirst(4).allSatisfy { $0.isNumber || $0 == "-" }
+        }
+        if isDatedVersion(bundledVer), isDatedVersion(installedVer), bundledVer < installedVer {
+            NSLog("[javpaco] 拒绝降级：包内运行时 %@ 比已安装的 %@ 旧。多半是 LaunchServices 把 DMG 暂存/旧目录里的同 BundleID 副本拉起来了 —— 请从 /Applications/JavPaco.app 启动。", bundledVer, installedVer)
+            return
+        }
+
         if !fm.fileExists(atPath: ServerManager.runtimeDir.path) {
             try fm.copyItem(at: bundled, to: ServerManager.runtimeDir)          // 首次安装：整份拷
         } else if bundledVer != installedVer {

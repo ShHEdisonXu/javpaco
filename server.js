@@ -2623,7 +2623,15 @@ async function v115Proxy(req, res, url, pick, rel, depth, ck) {
   res.on('close', stop)
   body.on('end', () => { finished = true })
   body.on('error', stop)
-  body.pipe(res)
+  /* HEVC hev1 → hvc1（说明见 streamWith 下方）。探测只读 moov 区段（几 MB），
+   * 失败/超时一律原样透传 —— 绝不能因为这一步让本来能播的片子播不了。 */
+  let patch = null
+  if (HEV1_RETAG && isMp4Rel(rel)) {
+    try { patch = await hev1PatchFor115(pick, url, ck, hev1TotalOf(rs.headers)) } catch (_) { patch = null }
+  }
+  if (finished || res.destroyed) { stop(); return }     // 探测期间客户端可能已经断开
+  if (patch) body.pipe(hev1Transform(patch, hev1AbsStart(rs.headers))).pipe(res)
+  else body.pipe(res)
 }
 
 /* 播放取流失败该说什么（2026-10-13）：直链是**现取**的（缓存 4 分钟），Cookie 一失效就断在半路，
@@ -6285,15 +6293,21 @@ function mediaHead(res, rel) {
   }
 }
 
-function sendFile(req, res, fp) {
-  fs.promises.stat(fp).then(st => {
-    try { sendFileWithStat(req, res, fp, st) } catch (e) {
+/* retag = true 时会对 mp4 先做一次 HEVC 探测（hev1 → hvc1），探测失败原样透传。
+ * 探测结果带缓存，同一文件只探一次，正常播放路径上没有额外开销。 */
+function sendFile(req, res, fp, retag) {
+  fs.promises.stat(fp).then(async st => {
+    let patch = null
+    if (retag && HEV1_RETAG) {
+      try { patch = await hev1PatchForLocal(fp, st.size, st.mtimeMs) } catch (_) { patch = null }
+    }
+    try { sendFileWithStat(req, res, fp, st, patch) } catch (e) {
       try { res.writeHead(500) } catch (_) {}
       res.end('Error: ' + e.message)
     }
   }).catch(() => { res.writeHead(404); res.end('Not Found') })
 }
-function sendFileWithStat(req, res, fp, st) {
+function sendFileWithStat(req, res, fp, st, patch) {
   if (!st.isFile()) { res.writeHead(404); return res.end('Not Found') }
   const type = MIME[path.extname(fp).toLowerCase()] || 'application/octet-stream'
   /* 协商缓存：ETag = 大小 + mtime，内容没变直接回 304
@@ -6351,19 +6365,19 @@ function sendFileWithStat(req, res, fp, st) {
       'Content-Length': end - start + 1,
       'ETag': etag, 'Last-Modified': lastMod, 'Cache-Control': cache
     })
-    streamWith(res, fs.createReadStream(fp, { start, end }))
+    streamWith(res, fs.createReadStream(fp, { start, end }), patch, start)
   } else {
     res.writeHead(200, {
       'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Length': st.size,
       'ETag': etag, 'Last-Modified': lastMod, 'Cache-Control': cache
     })
-    streamWith(res, fs.createReadStream(fp))
+    streamWith(res, fs.createReadStream(fp), patch, 0)
   }
 }
 
 /* 云盘挂载（115/CloudDrive）里未缓存的占位文件读取会抛 ENXIO，
  * 流上不挂 error 监听的话未捕获异常会直接打挂整个进程 —— 统一经这里 pipe */
-function streamWith(res, rs) {
+function streamWith(res, rs, patch, absStart) {
   rs.on('error', err => {
     console.error(`[stream] 读取失败: ${err.code || ''} ${err.message}`)
     try { if (!res.headersSent) res.writeHead(500) } catch (_) {}
@@ -6387,7 +6401,267 @@ function streamWith(res, rs) {
   rs.on('end', () => { if (idle) { clearTimeout(idle); idle = null } })
   rs.on('close', () => { if (idle) { clearTimeout(idle); idle = null } })
   arm()
-  rs.pipe(res)
+  /* HEVC 重打标：在管道中间插一层改写器（只动 4 个字节，其余原样过）。patch 为 null 时零开销。 */
+  if (!patch) { rs.pipe(res); return }
+  rs.pipe(hev1Transform(patch, absStart)).pipe(res)
+}
+
+/* 造一个「边过边改」的变换流。 */
+function hev1Transform(patch, absStart) {
+  const { Transform } = require('stream')
+  let abs = absStart || 0
+  const t = new Transform({
+    transform(chunk, enc, cb) {
+      try { patch.apply(chunk, abs) } catch (_) {}
+      abs += chunk.length
+      cb(null, chunk)
+    }
+  })
+  t.on('error', err => console.error('[hev1] 改写流出错：' + err.message))
+  return t
+}
+
+/* ---------- HEVC hev1 → hvc1 透明重打标（2026-10-16） ----------
+ * 症状：某些片子在 Apple 系播放器里「有声音、没画面」（同一个文件 Chrome/VLC 却正常）。
+ * 根因：mp4 视频轨的 sample entry 写的是 `hev1`，而 Apple 的 AVFoundation / WKWebView 只认 `hvc1`。
+ *       两者都是 HEVC/H.265，差别只在容器里那 4 个字节：`hvc1` 要求参数集(VPS/SPS/PPS)放在 hvcC 盒里，
+ *       `hev1` 允许参数集漂在码流里 → Apple 直接拒收视频轨（音轨照放，于是「有声无画」）。
+ * 做法：只把流经的那 4 个字节换成 hvc1。视频数据不动、文件长度不变、所有 box 偏移不变
+ *       → Content-Length / Range / 断点续传 / moov 定位全部不受影响。
+ * 前提：hvcC 里参数集完整（本机实测库内 hev1 文件均满足；AVFoundation 改后实测解出 1920x1080）。
+ * 开关：环境变量 HEV1_RETAG=0 可整块关掉（回滚用，改完无需动代码）。
+ * 降级：探测失败/超时一律按原样透传，绝不影响播放；结果带缓存，同一文件只探一次。
+ * ------------------------------------------------------------------------- */
+const HEV1_RETAG = process.env.HEV1_RETAG !== '0'
+const HEV1_BAD_TAGS = ['hev1', 'dvhe']          // 需要改成 hvc1 的 sample entry（dvhe = Dolby Vision 的 HEVC）
+const HEV1_PROBE_MS = 5000                      // 单次探测总超时，超了就当没有
+const HEV1_TTL_OK = 6 * 3600 * 1000             // 探测成功缓存 6 小时
+const HEV1_TTL_FAIL = 60 * 1000                 // 探测失败只记 1 分钟（别把网络抖动长期记住）
+const HEV1_MAX_MOOV = 96 << 20                  // 单次拉取 moov 的上限，防呆
+const HEV1_PROBE_HEAD = 1 << 20                 // 先读 moov 的前 1MB 试解（stsd 基本都在这段里）
+const hev1Cache = new Map()
+
+/** 只对 mp4 家族做探测；mkv/avi 的 HEVC 是另一码事，不在本开关范围内 */
+const isMp4Rel = rel => /\.(mp4|m4v|mov)$/i.test(String(rel || ''))
+
+function hev1CacheGet(k) {
+  const c = hev1Cache.get(k)
+  if (!c) return null
+  if (Date.now() - c.ts > (c.fail ? HEV1_TTL_FAIL : HEV1_TTL_OK)) { hev1Cache.delete(k); return null }
+  return c
+}
+function hev1CachePut(k, v) {
+  if (hev1Cache.size > 400) { let i = 0; for (const kk of hev1Cache.keys()) { hev1Cache.delete(kk); if (++i > 100) break } }
+  hev1Cache.set(k, Object.assign({ ts: Date.now() }, v))
+}
+
+/** 按 box 结构遍历 [start, end)。允许最后一个 box 越界 —— 探头部时只给 64KB，moov 本体可能有几 MB；
+ *  也允许 end 超出 buf（渐进读：只拿了 moov 的前一段，但子盒 size 字段仍指向整块 moov 的边界）。 */
+function mp4ListBoxes(buf, start, end) {
+  const out = []
+  const lim = Math.min(end, buf.length)     // ⚠ 必须收口到 buf 长度，否则 readUInt32BE 会越界抛错
+  let pos = start
+  while (pos + 8 <= lim) {
+    let size = buf.readUInt32BE(pos)
+    const type = buf.toString('latin1', pos + 4, pos + 8)
+    let hdr = 8
+    if (size === 1) {
+      if (pos + 16 > lim) break
+      size = Number(buf.readBigUInt64BE(pos + 8))
+      hdr = 16
+    } else if (size === 0) {
+      size = lim - pos
+    }
+    if (size < hdr) break
+    out.push({ pos, size, type, hdr })
+    if (pos + size > lim) break
+    pos += size
+  }
+  return out
+}
+
+/** 在「整块 moov」的 Buffer 里找出视频轨 sample entry 的 fourcc（返回相对 moov 的偏移） */
+function mp4VideoEntries(buf) {
+  const out = []
+  const top = mp4ListBoxes(buf, 0, buf.length)[0]
+  if (!top || top.type !== 'moov') return out
+  for (const trak of mp4ListBoxes(buf, top.pos + top.hdr, top.pos + top.size)) {
+    if (trak.type !== 'trak') continue
+    const mdia = mp4ListBoxes(buf, trak.pos + trak.hdr, trak.pos + trak.size).find(k => k.type === 'mdia')
+    if (!mdia) continue
+    const mdiaKids = mp4ListBoxes(buf, mdia.pos + mdia.hdr, mdia.pos + mdia.size)
+    const hdlr = mdiaKids.find(k => k.type === 'hdlr')
+    const handler = hdlr ? buf.toString('latin1', hdlr.pos + hdlr.hdr + 8, hdlr.pos + hdlr.hdr + 12) : null
+    if (handler !== 'vide') continue                       // 音频轨的 mp4a 不动
+    const minf = mdiaKids.find(k => k.type === 'minf')
+    if (!minf) continue
+    const stbl = mp4ListBoxes(buf, minf.pos + minf.hdr, minf.pos + minf.size).find(k => k.type === 'stbl')
+    if (!stbl) continue
+    const stsd = mp4ListBoxes(buf, stbl.pos + stbl.hdr, stbl.pos + stbl.size).find(k => k.type === 'stsd')
+    if (!stsd) continue
+    const entry = stsd.pos + stsd.hdr + 8                  // stsd: version/flags(4) + entry_count(4) + entry
+    if (entry + 8 > buf.length) continue
+    out.push({ off: entry + 4, tag: buf.toString('latin1', entry + 4, entry + 8) })
+  }
+  return out
+}
+
+/**
+ * 通用探测：read(start, len) → Promise<Buffer>。
+ * moov 可能在文件头（faststart）也可能在文件尾（用户库里多数如此），两条路都走一遍。
+ */
+async function hev1ProbeVia(read, total) {
+  let moov = null, moovAt = 'head', mdatEnd = -1
+  const head = await read(0, Math.min(65536, total))
+  for (const b of mp4ListBoxes(head, 0, head.length)) {
+    /* ⚠ 这里必须转成 {off,size}：mp4ListBoxes 给的是 pos，两者混用会让下面 read() 静默读错位置 */
+    if (b.type === 'moov') { moov = { off: b.pos, size: b.size }; break }
+    if (b.type === 'mdat') {
+      /* 「mdat 紧邻 moov」是绝大多数压制片的形态：读到 mdat 的 size 就能直接算出 moov 落在哪，
+       * 省掉「扫文件尾找 moov」那笔动辄十几 MB 的读 —— 在网盘挂载上这笔就是几秒的起播延迟。 */
+      if (b.size > 0 && b.pos + b.size < total) mdatEnd = b.pos + b.size
+      break
+    }
+  }
+  if (!moov && mdatEnd >= 0) {
+    try {
+      const p = await read(mdatEnd, 16)
+      if (p.length >= 8 && p.toString('latin1', 4, 8) === 'moov') {
+        let sz = p.readUInt32BE(0), hdr = 8
+        if (sz === 1 && p.length >= 16) { sz = Number(p.readBigUInt64BE(8)); hdr = 16 }
+        if (sz >= hdr && mdatEnd + sz <= total) { moov = { off: mdatEnd, size: sz }; moovAt = 'tail' }
+      }
+    } catch (_) {}
+  }
+  if (!moov) {
+    moovAt = 'tail'
+    const cands = []
+    let win = Math.min(4 << 20, total)
+    while (win <= Math.min(64 << 20, total)) {
+      const buf = await read(total - win, win)
+      const base = total - win
+      let i = buf.lastIndexOf('moov', buf.length, 'latin1')
+      while (i >= 4) {
+        const off = base + i - 4
+        const size = buf.readUInt32BE(i - 4)
+        /* 强校验：offset + size 恰好落在文件末尾的才是真 moov */
+        if (size >= 8 && off >= 0 && off + size <= total && !cands.some(c => c.off === off)) {
+          cands.push({ off, size, exact: off + size === total })
+        }
+        i = buf.lastIndexOf('moov', i - 1, 'latin1')
+      }
+      const hit = cands.find(c => c.exact)
+      if (hit) { moov = hit; break }
+      win *= 2
+    }
+    if (!moov) { cands.sort((a, b) => b.size - a.size); moov = cands[0] || null }
+  }
+  if (!moov) return { offsets: [], vtag: null, moovAt: 'missing' }
+  if (!Number.isFinite(moov.off) || moov.off < 0) return { offsets: [], vtag: null, moovAt: 'bad' }
+  if (moov.size > HEV1_MAX_MOOV) return { offsets: [], vtag: null, moovAt: 'too-big' }
+  /* 视频轨的 stsd 通常落在 moov 很靠前的位置 —— 先读前 1MB 试解，解出来就不必把整个 moov
+   * （动辄十几 MB）读一遍。网盘挂载上这一笔就是 1~2 秒的起播延迟差；解不出再老实读全量。 */
+  let entries = []
+  if (moov.size > HEV1_PROBE_HEAD) entries = mp4VideoEntries(await read(moov.off, HEV1_PROBE_HEAD))
+  if (!entries.length) entries = mp4VideoEntries(await read(moov.off, moov.size))
+  return {
+    offsets: entries.filter(e => HEV1_BAD_TAGS.includes(e.tag)).map(e => moov.off + e.off),
+    vtag: entries.length ? entries[0].tag : null,
+    moovAt
+  }
+}
+
+/** 本地文件探测（pread，不动文件指针） */
+async function hev1ProbeLocal(fp, size) {
+  const fh = await fs.promises.open(fp, 'r')
+  try {
+    const read = async (start, len) => {
+      const b = Buffer.allocUnsafe(len)
+      const r = await fh.read(b, 0, len, start)
+      return b.subarray(0, r.bytesRead)
+    }
+    return await hev1ProbeVia(read, size)
+  } finally { try { await fh.close() } catch (_) {} }
+}
+
+/** 115 直链探测（一串 Range 请求，只读 moov 区段，几 MB 级别） */
+async function hev1ProbeRemote(url, ck, total) {
+  const base = { 'User-Agent': V115_UA, 'Referer': V115_ORIGIN + '/', 'Accept': '*/*' }
+  if (ck) base.Cookie = ck
+  const read = async (start, len) => {
+    const rs = await fetch(url, {
+      headers: Object.assign({}, base, { Range: 'bytes=' + start + '-' + (start + len - 1) }),
+      redirect: 'follow'
+    })
+    try {
+      if (rs.status !== 200 && rs.status !== 206) throw new Error('HTTP ' + rs.status)
+      return Buffer.from(await rs.arrayBuffer())
+    } finally { try { if (rs.body && !rs.bodyUsed) rs.body.cancel() } catch (_) {} }
+  }
+  return await hev1ProbeVia(read, total)
+}
+
+/** 造改写器：offsets 是文件里的绝对偏移 */
+function hev1MakePatch(offsets) {
+  const offs = offsets.slice().sort((a, b) => a - b)
+  return {
+    offsets: offs,
+    apply(buf, abs) {
+      for (let i = 0; i < offs.length; i++) {
+        const j = offs[i] - abs
+        if (j < 0 || j + 4 > buf.length) continue
+        if (HEV1_BAD_TAGS.includes(buf.toString('latin1', j, j + 4))) buf.write('hvc1', j, 4, 'latin1')
+      }
+    }
+  }
+}
+
+/** 从 115 的响应头取文件总长（206 看 Content-Range 的 /total，200 看 Content-Length） */
+function hev1TotalOf(headers) {
+  const cr = headers.get('content-range')
+  if (cr) { const m = /\/(\d+)\s*$/.exec(cr); if (m) return parseInt(m[1], 10) }
+  const cl = headers.get('content-length')
+  if (cl) return parseInt(cl, 10) || 0
+  return 0
+}
+/** 响应体在文件里的绝对起点 */
+function hev1AbsStart(headers) {
+  const cr = headers.get('content-range')
+  if (cr) { const m = /bytes\s+(\d+)-/i.exec(cr); if (m) return parseInt(m[1], 10) }
+  return 0
+}
+
+function hev1WithTimeout(p, ms) {
+  let t = null
+  return Promise.race([
+    p,
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error('probe timeout')), ms); if (t.unref) t.unref() })
+  ]).finally(() => { if (t) clearTimeout(t) })
+}
+
+/** 本地 /media/ 用：拿这个文件该套的改写器（null = 不用改） */
+async function hev1PatchForLocal(fp, size, mtimeMs) {
+  const key = 'F|' + fp + '|' + size + '|' + Math.round(mtimeMs || 0)
+  let info = hev1CacheGet(key)
+  if (!info) {
+    try { info = await hev1WithTimeout(hev1ProbeLocal(fp, size), HEV1_PROBE_MS) }
+    catch (e) { info = { offsets: [], vtag: null, moovAt: 'err', fail: true } }
+    hev1CachePut(key, info)
+  }
+  return (info.offsets && info.offsets.length) ? hev1MakePatch(info.offsets) : null
+}
+
+/** 115 直链用：同上的缓存版（key 用 pickcode，它在文件内容不变时稳定） */
+async function hev1PatchFor115(pick, url, ck, total) {
+  const key = 'V|' + pick
+  let info = hev1CacheGet(key)
+  if (!info) {
+    if (!(total > 0)) return null
+    try { info = await hev1WithTimeout(hev1ProbeRemote(url, ck, total), HEV1_PROBE_MS) }
+    catch (e) { info = { offsets: [], vtag: null, moovAt: 'err', fail: true } }
+    hev1CachePut(key, info)
+  }
+  return (info.offsets && info.offsets.length) ? hev1MakePatch(info.offsets) : null
 }
 
 /* ---------- 女优刮削/编辑 API（详情页「刮削」按钮用） ----------
@@ -15435,7 +15709,8 @@ const server = http.createServer((req, res) => {
       /* WebDAV / 光鸭条目：标准协议，GET + Range 原样转发 */
       if (davRel(rel)) return davServe(req, res, rel)
       const fp = safeMediaPath(rel)
-      if (fp) return sendFile(req, res, fp)
+      /* mp4 家族额外做一道 HEVC hev1→hvc1 探测（详情见 streamWith 下方那块注释） */
+      if (fp) return sendFile(req, res, fp, isMp4Rel(rel))
       res.writeHead(403); return res.end('Forbidden')
     }
     res.writeHead(404); res.end('Not Found')

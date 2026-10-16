@@ -4104,7 +4104,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localh
         <h2>关于</h2>
         <div class="sp-card">
           <div class="sp-row"><div class="l">JAVぱこ</div></div>
-          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.5.0</small></div></div>
+          <div class="sp-row" style="border-bottom:none"><div class="l">版本<small>v0.5.2</small></div></div>
         </div>
         <!-- 声明块：与主页页脚 <footer> 同一份内容 / 同一套 .ft-* 样式（改文案记得两边同步） -->
         <div class="sp-card sp-foot">
@@ -15494,6 +15494,42 @@ function mountPlayer(src, key, nextQueue, embedEl) {
       const why = code === 2 ? '网络/线路出错' : code === 3 ? '解码失败（格式不支持或文件损坏）' : code === 4 ? '找不到这个视频（网盘文件可能已被删除或分享失效）' : '读取失败'
       playToast(why + '<button onclick="playerRetry()">重试</button><button onclick="window.dlOpen()">去检测死链</button>', 9000)
     })
+  }
+  /* ===== 视频轨健康检查（2026-10-16）：兜住「有声音、没画面」=====
+   * 这类故障 <video> **不会触发 error** —— 容器合法、音频轨正常解码，只有视频轨被拒，
+   * 表现为「进度条在走 / 能听见声音 / 屏幕全黑」，用户完全无从判断是网盘、线路还是应用坏了。
+   * 已知两种成因：
+   *   ① Mac（WKWebView / AVFoundation）：HEVC 若写成 hev1（参数集在流内）会被拒 —— Apple 只认 hvc1。
+   *      服务端已按此做 hev1→hvc1 流式重打标（server.js 的 HEV1_RETAG）；这里是它**没覆盖到**时的
+   *      最后一道防线（服务端版本旧 / 参数集不全没法重打标 / 走了不经该链路的源）。
+   *   ② Windows（Electron/Chromium）：系统没装「HEVC 视频扩展」时同样有音无画。
+   * 判据：元数据已就绪(readyState>=2) 但尺寸仍是 0 → 视频轨没解出来。
+   *   ⚠ 不能用 v.paused 判「在播」：WKWebView 里它会卡在 true（见文件顶部 PLAYING 说明），
+   *     所以改用事件驱动的 PLAYING —— 视频轨坏了音频仍会推进，play/playing 事件照样派发。 */
+  {
+    const vhAlive = () => PLAYER && PLAYER.v === v
+    const vhNoPicture = () => !!(v.readyState >= 2 && !v.videoWidth && !v.videoHeight)
+    let vhT = null
+    const armVideoHealth = () => {
+      if (vhT) clearTimeout(vhT)
+      vhT = setTimeout(() => {
+        vhT = null
+        if (!vhAlive() || !vhNoPicture()) return
+        if (PLAYER.online) return                     // 在线流(hls://)没有本地文件，交付外部播放器无意义
+        if (!PLAYING && v.currentTime < 0.2) return    // 还没真正开播（停在首帧）就不打扰
+        /* 文案按实际支持度分两档：canPlayType 探测系统级 HEVC 支持，能分清「这台机器不支持 H.265」
+         * 与「这条片子格式本机解不了」，比笼统的「解码失败」有用得多。 */
+        let hint = '这条视频的画面格式本机解不了'
+        try { if (v.canPlayType && !v.canPlayType('video/mp4; codecs="hvc1"')) hint = '本机不支持 HEVC(H.265) 视频' } catch (_) {}
+        playToast(hint + '，所以<b>有声音、没画面</b>。<br>交给本机播放器就能正常看：' +
+          '<button onclick="openInExternalPlayer()">用外部播放器打开</button>' +
+          '<button onclick="playerRetry()">重试</button>', 15000)
+      }, 2500)
+    }
+    v.addEventListener('playing', armVideoHealth)
+    v.addEventListener('loadedmetadata', armVideoHealth)
+    /* 换片/换画质/重连时（video.load() 会派发 emptied）撤掉上一轮待判的计时器，免得对新片误判 */
+    v.addEventListener('emptied', () => { if (vhT) { clearTimeout(vhT); vhT = null } })
   }
   /* 重新连接：把当前片源从头拉一次，尽量回到刚才的位置。
    * 网盘直链过期 / 挂载抖动这类「卡住不报错」的情况靠它自救。 */
