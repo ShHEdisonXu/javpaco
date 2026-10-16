@@ -1,0 +1,6 @@
+.build/
+.dmg-stage/
+dist*/
+staging/
+test-media/
+.DS_Store
