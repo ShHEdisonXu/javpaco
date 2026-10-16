@@ -10370,10 +10370,13 @@ function renderMovie(codeEnc) {
   /* 只认**真有视频文件**的版本：离线入库的番号 relVideo 是空的，服务端并组时会把它算进 files，
    * 不过滤就会出现「影片文件 2 个版本」但两行都没名字、播放键点下去没反应（2026-10-06 IPX-497）。 */
   const vfiles = (x.files || []).filter(f => f && f.relVideo)
+  /* 115 直链预热（2026-10-16）：详情页一打开就先把主文件的播放直链取回来（服务端缓存 4 分钟），
+   * 点「播放」直接命中缓存 —— 否则取直链那条请求要排在扫描/刮削后面（实测最坏 25s+）。 */
+  try { warmPlay115((vfiles.find(f => f.relVideo === x.relPath) || vfiles[0] || {}).relVideo) } catch (_) {}
   const filesHtml = (!x.virtual && vfiles.length > 1) ? `
     <div class="mv-sec" data-mod="mvfiles" data-st="mvfiles"><h3>影片文件 <em>${vfiles.length} 个版本 · 同番号的破解 / 中字 / 无码等文件已归入本条，点「播放」选择版本</em></h3>
         <div class="mv-files">${vfiles.map((f, i) => `
-        <div class="mv-filerow${f.relVideo === x.relPath ? ' cur' : ''}">
+        <div class="mv-filerow${f.relVideo === x.relPath ? ' cur' : ''}" onmouseenter="warmPlay115('${libAttrEsc(f.relVideo || '')}')">
           ${mvSrcBadgeHtml(f.relVideo)}
           <span class="mf-name" title="${libEsc(f.relVideo)}">${libEsc(f.name)}${f.relVideo === x.relPath ? '<em class="mf-def">主文件</em>' : ''}</span>
           <span class="mf-meta">${f.size ? fmtSize(f.size) : ''}</span>
@@ -16456,6 +16459,26 @@ window.playEmbedUrl = (url, rel) => {
   if (!url) return
   const x = LIB.find(v => v.relPath === rel || (v.files || []).some(f => f.relVideo === rel)) || null
   movieModalPlay(url, rel || url, x ? nextQueueFor(x, rel || url) : [], x)
+}
+
+/* ================= 115 播放直链预热（2026-10-16）=================
+ * 播放前要先跟 115 要一条直链；扫描/刮削在跑时这条请求要长时间排队
+ * （实测并发 10 个 115 请求时首字节 0.34s → 25.7s），表现就是「点播放，播放器一直加载不出来」。
+ * 详情页打开 = 用户大概率马上就要播 → 先把直链取回来塞进服务端缓存（V115_URL，4 分钟有效），
+ * 点「播放」时服务端直接用缓存，只剩本地一跳。
+ * 只在详情页触发（不是悬停/列表，避免翻页时白白增加 115 请求）；同一路径 4 分钟只发一次；
+ * 服务端还有 2.5s 全局限流 + 风控冷却判断兜底（见 server.js 的 /api/115/lib/prefetch）。 */
+function warmPlay115(rel) {
+  try {
+    rel = String(rel || '')
+    if (rel.indexOf('115:') !== 0) return                 // 本地 / WebDAV / 光鸭：没有「取直链」这一步
+    if (!warmPlay115._seen) warmPlay115._seen = Object.create(null)
+    const t = warmPlay115._seen[rel] || 0
+    if (Date.now() - t < 240000) return                    // 与服务端缓存 TTL 对齐
+    if (Object.keys(warmPlay115._seen).length > 300) warmPlay115._seen = Object.create(null)
+    warmPlay115._seen[rel] = Date.now()
+    fetch('/api/115/lib/prefetch?rel=' + encodeURIComponent(rel)).catch(() => {})
+  } catch (_) {}
 }
 
 /* ================= 同番号多版本选择器（2026-10-13）=================

@@ -1555,6 +1555,7 @@ const V115_SNAP_TTL = 10 * 60 * 1000
 let V115_SNAP = new Map()
 let V115_FIND_NOTE = ''           // 上一次按番号找网盘文件失败的原因（回给 /api/library/matchCode 提示用户）
 let V115_URL = new Map()          // pick -> { url, exp } 直链缓存（直链有时效，过期即重取）
+let V115_PREF_LAST = 0            // 上次「直链预热」发起时刻（/api/115/lib/prefetch 的全局节流，见该路由）
 
 /* ===== 115 取直链：网页版内部协议（RSA + XOR），只用 Node 内置 crypto，不引入依赖 =====
  * 为什么非做不可：GET webapi.115.com/files/download 对**大文件**只回
@@ -1660,12 +1661,12 @@ function v115Decode(b64, key) {
  *   A) HTTP 302 → https://dl.115cdn.net/files/dl302?t=…&f=pro → 再取一次，body 是 { state:true, data:"…" }
  *   B) HTTP 200 + { state:true, data:"…" }  → 直接就是密文
  * 密文都用**本次请求我们自己生成的 key** 解开（115 用请求方的 key 加密响应，不是 URL 里那个 t）。 */
-async function v115DownURLByApi(pick, n) {
+async function v115DownURLByApi(pick, n, prio) {
   const key = crypto.randomBytes(16)
   const data = v115Encode(Buffer.from(JSON.stringify({ pickcode: pick }), 'utf8'), key)
   const url = V115_PRO + '/app/chrome/downurl?t=' + Math.floor(Date.now() / 1000)
   const rs = await v115FetchRaw(url, {
-    method: 'POST', timeout: 20000,
+    method: 'POST', timeout: 20000, prio: prio,
     body: new URLSearchParams({ data }).toString(),
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }
   }, n)
@@ -1696,7 +1697,7 @@ async function v115DownURLByApi(pick, n) {
   if ([301, 302, 303, 307, 308].includes(rs.status) && loc) {
     try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
     const next = new URL(loc, url).href
-    const r2 = await v115FetchRaw(next, { timeout: 20000, headers: { 'Accept': '*/*' } }, n)
+    const r2 = await v115FetchRaw(next, { timeout: 20000, prio: prio, headers: { 'Accept': '*/*' } }, n)
     payload = await pickPayload(r2, 'dl302')
   } else {
     payload = await pickPayload(rs, 'downurl')
@@ -1859,30 +1860,71 @@ let V115_PENALTY = 1              // 自适应惩罚倍率（1 = 无惩罚）
 let V115_OK_STREAK = 0            // 连续成功请求数（用于惩罚回落）
 let V115_LAST_BAD = 0             // 最近一次被拦的时刻
 let V115_REQ_TOTAL = 0            // 本进程累计请求数（诊断用）
-let V115_QUEUE = Promise.resolve()   // 串行闸门：同一时刻只允许一个 115 请求在飞
+/* 2026-10-16 播放优先（用户诉求：「点播放，播放器半天加载不出来」）
+ * 老实现只维护一条 Promise 链 —— 所有 115 请求（含**播放取直链**）挤在同一队列里，
+ * 播放要排在全量扫描 / 刮削后面。实测并发 10 个 115 流请求，首字节 0.34s → 25.7s 线性累加，
+ * 刮削一轮几十上百个请求时点播放要等几分钟，观感就是「加载不出来」。
+ * 现在分两条车道：
+ *   high   = 用户点播放 / 取直链 / 直链预热（等不起，且一次只有 1~2 个请求）
+ *   normal = 扫描 / 刮削 / 回填 / 离线推送（后台批量，慢一点没关系）
+ * 调度器在每个「时间片」开始前**重新判优先级** —— 播放请求一到，下一个时间片就是它，
+ * 最多只等一个间隔（≈1.5s）而不是几十个请求。长停顿（每 20 次那 3~8 秒）也允许被播放请求提前结束。
+ * ⚠ 只改**排队顺序**：基础间隔、0.65~1.35 抖动、每 20 次的翻页停顿、风控惩罚倍率全部照旧，
+ *    不削弱任何风控节奏（播放请求本身照样只占一个时间片，密度不变）。 */
+const V115_LANE = { high: [], normal: [] }
+let V115_RUNNING = false          // 同一时刻只有一个时间片在跑
+let V115_REST_WAKE = null         // 「翻页停顿」的唤醒句柄（播放请求可提前结束停顿）
+let V115_QUEUE_DEPTH = 0          // 诊断用：当前排队请求数
 const v115GapNow = () => Math.min(v115GapMax(), Math.round(v115GapBase() * V115_PENALTY))
-async function v115Throttle() {
-  const prev = V115_QUEUE
-  let release = null
-  V115_QUEUE = new Promise(r => { release = r })
-  try {
-    await prev                                        // 排队：等上一个请求彻底走完
-    const gap = v115GapNow()
-    const jitter = 0.65 + Math.random() * 0.7         // 0.65 ~ 1.35
-    const wait = V115_LAST + Math.round(gap * jitter) - Date.now()
-    if (wait > 0) await new Promise(r => setTimeout(r, wait))
-    V115_LAST = Date.now()
-    V115_REQ_TOTAL++
-    /* 长停顿：一口气翻太多页不是人的行为 */
-    V115_BURST_N++
-    if (V115_BURST_N >= V115_BURST) {
-      V115_BURST_N = 0
-      const rest = Math.round((3000 + Math.random() * 5000) * Math.min(2, V115_PENALTY))
-      console.log('[115] 节流：连续 ' + V115_BURST + ' 次请求，休息 ' + (rest / 1000).toFixed(1) + 's')
-      await new Promise(r => setTimeout(r, rest))
-      V115_LAST = Date.now()
+/* 排队取号。prio='high' 走优先车道 —— 只有播放链路（v115Serve / 直链预热）会这么传。 */
+function v115Throttle(prio) {
+  const lane = prio === 'high' ? V115_LANE.high : V115_LANE.normal
+  return new Promise(resolve => {
+    lane.push(resolve)
+    V115_QUEUE_DEPTH = V115_LANE.high.length + V115_LANE.normal.length
+    /* 正在「翻页停顿」时来了播放请求 → 提前结束停顿（基础间隔仍然保留，见 v115Slot） */
+    if (prio === 'high' && V115_REST_WAKE) {
+      const w = V115_REST_WAKE; V115_REST_WAKE = null
+      console.log('[115] 节流：播放优先，提前结束翻页停顿')
+      try { w() } catch (_) {}
     }
-  } finally { if (release) release() }
+    v115Pump()
+  })
+}
+/* 一个「时间片」= 等够基础间隔（带抖动）+ 每 20 次的翻页停顿。与原实现逐行等价，
+ * 只有一处例外：prio='high'（用户点播放那一两下）**不吃翻页停顿** —— 那是给「连续爬页面」
+ * 设计的模拟停顿，用户点一次播放在里面干等 3~8 秒没有意义。基础间隔照旧（密度不变）。 */
+async function v115Slot(prio) {
+  const gap = v115GapNow()
+  const jitter = 0.65 + Math.random() * 0.7         // 0.65 ~ 1.35
+  const wait = V115_LAST + Math.round(gap * jitter) - Date.now()
+  if (wait > 0) await new Promise(r => setTimeout(r, wait))
+  V115_LAST = Date.now()
+  V115_REQ_TOTAL++
+  /* 长停顿：一口气翻太多页不是人的行为 */
+  V115_BURST_N++
+  if (V115_BURST_N >= V115_BURST) {
+    V115_BURST_N = 0
+    if (prio === 'high') { console.log('[115] 节流：播放请求，跳过一次翻页停顿'); return }
+    const rest = Math.round((3000 + Math.random() * 5000) * Math.min(2, V115_PENALTY))
+    console.log('[115] 节流：连续 ' + V115_BURST + ' 次请求，休息 ' + (rest / 1000).toFixed(1) + 's')
+    await new Promise(r => { V115_REST_WAKE = r; setTimeout(() => { if (V115_REST_WAKE === r) V115_REST_WAKE = null; r() }, rest) })
+    V115_LAST = Date.now()
+  }
+}
+/* 车道调度：每个时间片取「当前」优先级最高的那条车道（每轮重新判，所以能插队） */
+async function v115Pump() {
+  if (V115_RUNNING) return
+  V115_RUNNING = true
+  try {
+    while (V115_LANE.high.length || V115_LANE.normal.length) {
+      const isHigh = !!V115_LANE.high.length
+      const next = isHigh ? V115_LANE.high.shift() : V115_LANE.normal.shift()
+      V115_QUEUE_DEPTH = V115_LANE.high.length + V115_LANE.normal.length
+      try { await v115Slot(isHigh ? 'high' : 'normal') } catch (e) { console.log('[115] 节流异常：' + ((e && e.message) || e)) }
+      try { next() } catch (_) {}
+    }
+  } finally { V115_RUNNING = false; V115_QUEUE_DEPTH = 0; V115_REST_WAKE = null }
 }
 /* 惩罚升级（被拦 / 明确限流时调用） */
 function v115PenaltyUp(why) {
@@ -1911,6 +1953,8 @@ function v115ThrottleState() {
     gapMs: v115GapNow(), pace: v115PaceOf(), penalty: Math.round(V115_PENALTY * 100) / 100,
     requests: V115_REQ_TOTAL, blocked: v115BlockedNow(), remainMin: v115BlockRemain(),
     blockCount: V115_BLOCK_COUNT,
+    /* 队列深度（两条车道合计）：播放请求会插到 normal 前面，这里能看出后台积压了多少 */
+    queued: V115_QUEUE_DEPTH,
     /* 登录失效冷却（分通道：web = 网盘列目录/搜索，push = 离线推送） */
     authCd: { web: v115AuthCdRemain('web', 1), push: v115AuthCdRemain('push', 1) }
   }
@@ -2031,7 +2075,7 @@ async function v115FetchRaw(url, opts, n) {
   /* 登录失效冷却：一个字节都不发。⚠ 健康自检（probe）例外 —— 自检的唯一目的就是判断
    * 「Cookie 到底活了没有」，被自己的冷却挡住就永远等不到「自动恢复」那一刻（2026-10-15）。 */
   if (v115AuthCdOn('web', n) && !opts.probe) throw v115AuthCdErr('web', n)
-  if (opts.throttle !== false) await v115Throttle()
+  if (opts.throttle !== false) await v115Throttle(opts.prio)   // prio='high' = 播放取直链，插到扫描/刮削前面
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), opts.timeout || 20000)
   try {
@@ -2460,8 +2504,8 @@ async function v115FindByCode(ccode, origCode) {
 }
 
 /* 跟随重定向取最终地址；返回 '' 表示这个接口没给直链（交给下一个候选接口） */
-async function v115Follow(url, n) {
-  const rs = await v115FetchRaw(url, { timeout: 20000, headers: { 'Accept': '*/*' } }, n)
+async function v115Follow(url, n, prio) {
+  const rs = await v115FetchRaw(url, { timeout: 20000, headers: { 'Accept': '*/*' }, prio: prio }, n)
   const loc = rs.headers.get('location')
   if ([301, 302, 303, 307, 308].includes(rs.status) && loc) {
     try { if (rs.body) rs.body.cancel().catch(() => {}) } catch (_) {}
@@ -2489,8 +2533,9 @@ function v115CacheURL(pick, info, n) {
 }
 
 /* pickcode → 302 直链。先试用户在设置里填的自建服务，再走官方加密协议；
- * 都失败时给出明确指引。 */
-async function v115DownURL(pick, n) {
+ * 都失败时给出明确指引。
+ * prio='high'：播放链路专用（插到扫描/刮削前面，见 v115Throttle）。 */
+async function v115DownURL(pick, n, prio) {
   n = Math.max(1, parseInt(n, 10) || 1)
   const key = String(pick || '')
   if (!key) throw new Error('缺少 pickcode（115 条目没有识别到文件标识）')
@@ -2504,7 +2549,7 @@ async function v115DownURL(pick, n) {
   if (tpl) {
     const u = tpl.replace(/\{\{?pick(code)?\}?\}/gi, encodeURIComponent(key)).replace(/\{\{?uid\}?\}/gi, uid)
     try {
-      const got = await v115Follow(u, n)
+      const got = await v115Follow(u, n, prio)
       if (got) return v115CacheURL(key, { url: got, cookie: '' }, n)
       last = '自定义接口未返回直链'
     } catch (e) { last = e.message }
@@ -2513,7 +2558,7 @@ async function v115DownURL(pick, n) {
    *    这是**大文件唯一可行**的一条 —— GET webapi/files/download 对几 GB 的片子
    *    一律回「文件大小超出限制，请使用115电脑端下载」(50028)，所以不再拿它当候选。 */
   try {
-    const got = await v115DownURLByApi(key, n)
+    const got = await v115DownURLByApi(key, n, prio)
     if (got && got.url) return v115CacheURL(key, got, n)
     last = '官方接口未返回直链'
   } catch (e) { last = e.message }
@@ -2550,7 +2595,7 @@ async function v115Proxy(req, res, url, pick, rel, depth, ck) {
     if (depth < 2) {
       const pn = (v115RelParse(rel) || { n: 1 }).n
       V115_URL.delete(pn + '|' + pick)               // 直链多半过期了 → 重取再试
-      const next = await v115DownURL(pick, pn).catch(() => null)
+      const next = await v115DownURL(pick, pn, 'high').catch(() => null)
       if (next && next.url) return v115Proxy(req, res, next.url, pick, rel, depth + 1, next.cookie)
     }
   }
@@ -2602,7 +2647,7 @@ async function v115Serve(req, res, rel) {
     return res.end('115 条目缺少文件标识（pickcode）。请在「添加影片 → 全部重新扫描」后再试')
   }
   let down = null
-  try { down = await v115DownURL(pick, pn) }
+  try { down = await v115DownURL(pick, pn, 'high') }
   catch (e) {
     res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
     return res.end(v115PlayErrText(e, pn))
@@ -6208,6 +6253,38 @@ async function movieThumb(code, kind) {
  * 播放器并发发多个 Range 时实测：单线程 0.29s，10 并发最慢 11.57s（慢 40 倍），
  * 期间整个服务（含其他响应）全部停摆 → 表现为「播放器卡住不动」。
  * 改成 fs.promises.stat 后事件循环不被占住，并发立刻恢复。 */
+/* HEAD /media/<rel>：只回元信息（类型 / 大小 / 支持 Range），一个字节都不读上游（2026-10-16）。
+ * 播放器起播前常先探一下；老实现会顺着 GET 那条路把整个文件拉下来 → 永远等不到响应。
+ * ⚠ 这里刻意不用 await（外层请求处理函数不是 async）：本地文件走 fs.promises.stat 的回调式写法，
+ *   避免对 CloudDrive/FUSE 用 statSync（那会阻塞整个事件循环，见 sendFile 上方的注释）。 */
+function mediaHead(res, rel) {
+  try {
+    const type = MIME['.' + extOf(rel).toLowerCase()] || 'application/octet-stream'
+    const h = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' }
+    const done = () => { try { res.writeHead(200, h); res.end() } catch (_) {} }
+    if (v115Rel(rel)) {                              // 115：大小取扫描时记下的（拿不到就不给 Content-Length）
+      const sz = (V115_MAP.get(rel) || {}).size || 0
+      if (sz > 0) h['Content-Length'] = String(sz)
+      return done()
+    }
+    if (davRel(rel)) {                               // WebDAV / 光鸭：同上
+      const sz = (DAV_MAP.get(rel) || {}).size || 0
+      if (sz > 0) h['Content-Length'] = String(sz)
+      return done()
+    }
+    const fp = safeMediaPath(rel)
+    if (!fp) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Forbidden') }
+    return fs.promises.stat(fp).then(st => {
+      if (!st.isFile()) { res.writeHead(404); return res.end('Not Found') }
+      h['Content-Length'] = String(st.size)
+      done()
+    }).catch(() => { res.writeHead(404); res.end('Not Found') })
+  } catch (e) {
+    try { if (!res.headersSent) res.writeHead(500) } catch (_) {}
+    try { res.end() } catch (_) {}
+  }
+}
+
 function sendFile(req, res, fp) {
   fs.promises.stat(fp).then(st => {
     try { sendFileWithStat(req, res, fp, st) } catch (e) {
@@ -6240,6 +6317,14 @@ function sendFileWithStat(req, res, fp, st) {
   const inm = req.headers['if-none-match']
   if (!range && inm && String(inm).split(',').map(s => s.trim()).includes(etag)) {
     res.writeHead(304, { 'ETag': etag, 'Last-Modified': lastMod, 'Cache-Control': cache, 'Vary': 'Accept-Encoding' })
+    return res.end()
+  }
+  /* HEAD：只回头部，别去读文件（图/视频都可能被先探一下；大文件白读一遍纯浪费） */
+  if (req.method === 'HEAD') {
+    res.writeHead(200, {
+      'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Length': st.size,
+      'ETag': etag, 'Last-Modified': lastMod, 'Cache-Control': cache
+    })
     return res.end()
   }
   /* 文本预压缩回传：名册 10MB+、index.html 600KB 都能省下 70~90% 传输 */
@@ -11885,9 +11970,33 @@ async function handleActorApi(req, res, p) {
     const acct = Math.max(1, parseInt(q.searchParams.get('acct'), 10) || 1)
     if (!pick) { res.writeHead(400); return res.end('缺少 pick') }
     let down = null
-    try { down = await v115DownURL(pick, acct) }
+    try { down = await v115DownURL(pick, acct, 'high') }
     catch (e) { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(v115PlayErrText(e, acct)) }
     return v115Proxy(req, res, down.url, pick, '115:/x.mp4', 0, down.cookie)
+  }
+  if (p === '/api/115/lib/prefetch') {   // 播放直链预热（2026-10-16）
+    /* 详情页一打开就先取一次直链、塞进 V115_URL 缓存（4 分钟有效），点「播放」时 /media 直接用缓存 → 秒开。
+     * 为什么需要：取直链要过 115 节流闸门，扫描/刮削在跑时本来要排队（实测最坏 25s+）；
+     * 预热把这段等待挪到「用户还在看详情页」的时候，点播放只剩本地一跳。
+     * 节流控制（不额外增加风控压力）：① 已有新鲜缓存 → 一个请求都不发；② 全局最快 2.5s 一次；
+     * ③ 风控冷却中直接跳过；④ 只预热 115 条目。失败不报错（真播的时候还会再取一次）。 */
+    const q = new URL(req.url, 'http://x')
+    const rel = String(q.searchParams.get('rel') || '')
+    if (!v115Rel(rel)) return json(res, { ok: false, why: 'not115' })
+    const pn = (v115RelParse(rel) || { n: 1 }).n
+    const pick = v115PickOf(rel)
+    if (!pick) return json(res, { ok: false, why: 'nopick' })
+    const hit = V115_URL.get(pn + '|' + pick)
+    if (hit && hit.exp > Date.now()) return json(res, { ok: true, cached: true })
+    if (v115BlockedNow()) return json(res, { ok: false, why: 'blocked' })
+    const now = Date.now()
+    if (now - V115_PREF_LAST < 2500) return json(res, { ok: false, why: 'rate' })
+    V115_PREF_LAST = now
+    /* 后台预热：不等它 —— 用户可能只在详情页停 1 秒；失败就算了（真播时会再取一次并给出完整错误） */
+    v115DownURL(pick, pn, 'high')
+      .then(u => { if (u && u.url) console.log('[115] 直链预热就绪：' + rel.slice(0, 90)) })
+      .catch(e => console.log('[115] 直链预热失败：' + ((e && e.message) || e)))
+    return json(res, { ok: true, warming: true })
   }
   /* ---------- WebDAV / 光鸭网盘「媒体库来源」----------
    * 两个来源共用 davApiRoute()：区别只有 CFG 键名（webdav/guangya）与 relVideo 前缀（dav:/ gy:/）。 */
@@ -15125,6 +15234,7 @@ const server = http.createServer((req, res) => {
         !(p === '/api/115/lib' && req.method === 'GET') &&
         !(p === '/api/115/lib/browse' && req.method === 'GET') &&
         !(p === '/api/115/lib/stream' && req.method === 'GET') &&
+        !(p === '/api/115/lib/prefetch' && req.method === 'GET') &&
         !(p === '/api/webdav/config' && req.method === 'GET') &&
         !(p === '/api/guangya/config' && req.method === 'GET') &&
         !(p === '/api/webdav/lib' && req.method === 'GET') &&
@@ -15315,6 +15425,11 @@ const server = http.createServer((req, res) => {
     }
     if (p.startsWith('/media/')) {
       const rel = p.slice('/media/'.length)
+      /* HEAD 只问元信息，绝不能去流整个文件（2026-10-16）：
+       * 原来 HEAD 一律走 GET 那条路 —— 115 会去取直链、再把整个 14GB 拉回来（客户端永远等不到响应，
+       * 实测 curl -I 12 秒零返回）；WebDAV / 本地大文件同理（Node 会照样把文件读完，只是不回 body）。
+       * 播放器起播前常先发一个 HEAD 探大小/类型，卡在这里就等于「播放器加载不出来」。 */
+      if (req.method === 'HEAD') return mediaHead(res, rel)
       /* 115 网盘条目：磁盘上不存在，交给代理去取 302 直链后转发（支持 Range 拖动） */
       if (v115Rel(rel)) return v115Serve(req, res, rel)
       /* WebDAV / 光鸭条目：标准协议，GET + Range 原样转发 */
